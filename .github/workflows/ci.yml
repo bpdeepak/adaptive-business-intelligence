@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  phase0:
+    name: Phase 0 pipeline (dbt + Go + smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: abi
+          POSTGRES_PASSWORD: abi
+          POSTGRES_DB: abi
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U abi -d abi"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      minio:
+        image: quay.io/minio/minio:RELEASE.2025-05-24T17-08-30Z
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/ready || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps (locked)
+        run: uv sync --frozen
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache-dependency-path: api/go.sum
+
+      - name: Download Olist dataset
+        run: uv run python scripts/download_olist.py
+
+      - name: Load bronze (MinIO + Postgres)
+        run: uv run python loader/loader.py
+
+      - name: dbt build (silver + gold + tests)
+        run: uv run dbt build --project-dir dbt --profiles-dir dbt
+
+      - name: dbt docs generate
+        run: uv run dbt docs generate --project-dir dbt --profiles-dir dbt
+
+      - name: Go vet + unit + Postgres integration tests
+        env:
+          # The integration tests connect to the containerized Postgres and
+          # verify the real SQL (parameter binding, window filters, ranking).
+          ABI_TEST_DATABASE_URL: postgres://abi:abi@localhost:5432/abi?sslmode=disable
+        run: |
+          cd api
+          go vet ./...
+          go test -v ./...
+
+      - name: Build API + end-to-end smoke test
+        run: |
+          make api
+          bash scripts/smoke_check.sh

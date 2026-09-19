@@ -11,7 +11,7 @@ metrics API, and a browser dashboard — all built, tested, and running end to e
 | Bronze | Olist (9 CSVs, ~126 MB) → immutable objects in MinIO `bronze` bucket **and** verbatim raw tables in Postgres `bronze.*` |
 | Silver | 8 typed, cleaned staging views (`silver.stg_*`), dedup of duplicate reviews, NULL handling |
 | Gold | `gold.fct_orders`, 4 dims, and metric tables (`daily_revenue`, `daily_orders`, `daily_aov`, `top_categories`) — 95 dbt checks green |
-| Serving | Go 1.27 REST API (`/healthz`, `/api/v1/summary`, `/revenue/daily`, `/orders/daily`, `/categories/top`) with embedded dashboard |
+| Serving | Go 1.27 REST API (`/healthz`, `/api/v1/summary`, `/api/v1/metrics`, `/revenue/daily`, `/orders/daily`, `/categories/top`) with embedded dashboard |
 | Dashboard | Vanilla JS + Chart.js: KPI cards, daily revenue/orders charts, top categories, 7D/30D/90D/All windows |
 
 ## Architecture
@@ -33,7 +33,7 @@ metrics API, and a browser dashboard — all built, tested, and running end to e
                                            │ SQL (pgx)
                     ┌──────────────────────▼────────────────────────────┐
                     │  Go REST API (abi/api) → JSON envelopes            │
-                    │   GET /api/v1/summary | /revenue/daily |            │
+                    │   GET /api/v1/summary | /metrics | /revenue/daily | │
                     │   /orders/daily | /categories/top                   │
                     └──────────────────────┬────────────────────────────┘
                                            │ same-origin (embedded assets)
@@ -48,14 +48,17 @@ metrics API, and a browser dashboard — all built, tested, and running end to e
 ```
 ├── docker-compose.yml        # Postgres + MinIO + Redpanda, healthchecked
 ├── pyproject.toml            # uv project: dbt-core, dbt-postgres, boto3, psycopg
+├── .github/workflows/ci.yml  # CI: Postgres+MinIO services, dbt build, Go tests, smoke
 ├── scripts/
-│   ├── bootstrap.ps1         # infra → data → bronze → dbt → docs → API build
-│   ├── smoke_test.ps1        # starts API, validates every endpoint, stops it
+│   ├── bootstrap.ps1         # infra → data → bronze → dbt → docs → API build (Windows)
+│   ├── bootstrap.sh          # same pipeline for Linux/macOS (make bootstrap)
+│   ├── smoke_test.ps1        # starts API, validates every endpoint, stops it (Windows)
+│   ├── smoke_check.sh        # portable smoke test (Linux/macOS/CI)
 │   ├── run_api.ps1           # run the API in the foreground (dev)
 │   └── download_olist.py     # stdlib downloader with byte-size verification
-├── loader/loader.py          # CSV → MinIO bronze → Postgres bronze.* (COPY)
+├── loader/loader.py          # CSV → MinIO bronze → Postgres bronze.* (COPY + lineage cols)
 ├── dbt/                      # dbt project (profile, macros, sources, models, tests)
-├── api/                      # Go module: cmd/api + internal/{config,http,model,store}
+├── api/                      # Go module: cmd/api + internal/{config,http,metrics,model,store}
 └── docs/phase0.md            # decisions, schema dictionary, metric definitions
 ```
 
@@ -77,7 +80,18 @@ uv sync
 ./scripts/smoke_test.ps1
 ```
 
-Linux/CI equivalents live in the `Makefile` (`make infra-up data load dbt api test smoke`).
+Linux/CI equivalents:
+
+```bash
+# 1. Full pipeline (infra up → download → bronze load → dbt build + docs → API build)
+make bootstrap            # or: bash scripts/bootstrap.sh
+
+# 2. Serve + verify
+cd api && go run ./cmd/api          # http://localhost:8080
+bash scripts/smoke_check.sh         # portable end-to-end smoke test
+```
+
+Every push/PR to `main` also runs the full pipeline in CI (`.github/workflows/ci.yml`).
 
 ## Verified Phase 0 results
 
@@ -86,9 +100,14 @@ Linux/CI equivalents live in the `Makefile` (`make infra-up data load dbt api te
   `geolocation` 1,000,163, …).
 - **dbt:** `dbt build` → **95/95 pass** (17 models + 78 data tests incl. FK,
   uniqueness, accepted-value, and 5 singular tests), 0 warnings.
+- **Go tests:** unit handler tests (fake store) **plus** Postgres integration
+  tests that run the real SQL against the containerized DB — windowed summary
+  cross-checked against the underlying gold rows, series + ranking + parameter
+  binding verified, injection-shaped inputs rejected.
 - **API smoke test:** revenue R$15,739,137.01 · orders 98,206 · AOV R$160.27 ·
   top category `bed_bath_table`; daily series return the full observed range
   (`2016-09-04 → 2018-09-03`).
+- **Lineage:** every bronze row carries `_loaded_at`, `_source_file`, `_batch_id`.
 
 ## Metric definitions (Phase 0)
 
@@ -100,14 +119,21 @@ Linux/CI equivalents live in the `Makefile` (`make infra-up data load dbt api te
 | Active customers | Distinct `customer_unique_id` with a non-lost order |
 | Top category | Category rank by revenue (order-level payment attributed per line-item category) |
 
+This dictionary is served **programmatically** at `GET /api/v1/metrics`
+(`api/internal/metrics/catalog.go`, versioned) — the machine-readable semantic
+layer that agents should fetch before answering metric questions.
+
 ## Roadmap
 
 - **Phase 1** — Redpanda topics: order events → Go streaming consumers → real-time
   metrics (the Redpanda node is already running healthy and client-reachable).
+  Agreed groundwork: `gold.daily_summary` rollup (windowed summaries become a
+  ranged aggregation over a small table) and streaming writes landing in an `rt.*`
+  hot-path schema so dashboard reads never contend with stream writes.
 - **Phase 2** — Semantic layer + natural-language queries (LLM → metric DSL → SQL).
 - **Phase 3** — Anomaly detection, forecasting, root-cause explanations.
 - **Phase 4** — Conversational agents, subscriptions, alerting.
 - **Phase 5** — Deployment: Docker image (already provided in `api/Dockerfile`),
-  observability, CI.
+  observability. CI already runs from Phase 0.
 
 See `docs/phase0.md` for full detail.

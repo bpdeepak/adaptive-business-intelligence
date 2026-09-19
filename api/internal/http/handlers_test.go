@@ -161,6 +161,42 @@ func TestTopCategoriesValidation(t *testing.T) {
 	}
 }
 
+func TestMetrics(t *testing.T) {
+	srv := testServer(t)
+	rec, env := doReq(t, srv, http.MethodGet, "/api/v1/metrics")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	data, ok := env.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("metrics data is not an object: %T", env.Data)
+	}
+	cats, ok := data["metrics"].([]any)
+	if !ok {
+		t.Fatalf("metrics list missing: %v", data)
+	}
+	if len(cats) < 8 {
+		t.Errorf("expected at least 8 metrics, got %d", len(cats))
+	}
+	byName := map[string]map[string]any{}
+	for _, c := range cats {
+		m := c.(map[string]any)
+		byName[m["name"].(string)] = m
+	}
+	for _, name := range []string{"revenue", "orders", "aov", "active_customers"} {
+		if _, ok := byName[name]; !ok {
+			t.Errorf("metric %q missing", name)
+		}
+	}
+	rev := byName["revenue"]
+	if !strings.Contains(rev["population"].(string), "canceled") {
+		t.Errorf("revenue population should mention excluded statuses, got %q", rev["population"])
+	}
+	if data["version"] == "" {
+		t.Error("catalog version missing")
+	}
+}
+
 func TestUnknownMethod(t *testing.T) {
 	srv := testServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/summary", strings.NewReader(""))

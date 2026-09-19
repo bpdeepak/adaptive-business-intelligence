@@ -7,11 +7,17 @@ import (
 	"strconv"
 	"time"
 
+	"abi/internal/metrics"
 	"abi/internal/model"
 )
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, model.Envelope{Data: model.Health{Status: "ok"}, Meta: newMeta(s.now)})
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	writeJSON(w, http.StatusOK, envelope(metrics.Default(), start, s.now))
 }
 
 func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {

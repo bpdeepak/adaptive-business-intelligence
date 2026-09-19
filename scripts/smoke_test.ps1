@@ -58,6 +58,11 @@ try {
     if (@($cats.data).Count -eq 0)    { throw "categories/top returned no categories" }
     Write-Host ("  categories/top ok top5: {0}" -f (($cats.data | ForEach-Object { $_.category }) -join ", "))
 
+    $metrics = Invoke-RestMethod "$BaseUrl/api/v1/metrics" -TimeoutSec 10
+    if (@($metrics.data.metrics).Count -lt 8) { throw "metrics catalog too small" }
+    if (-not ($metrics.data.metrics | Where-Object { $_.name -eq "revenue" })) { throw "revenue metric missing" }
+    Write-Host ("  metrics ok  {0} definitions (v{1})" -f @($metrics.data.metrics).Count, $metrics.data.version)
+
     Write-Host ""
     Write-Host "SMOKE TEST PASSED"
 } finally {

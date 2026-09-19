@@ -47,6 +47,19 @@ at this layer, so bronze mirrors the raw source byte-for-byte.
 | bronze.product_category_name_translation | product_category_name_translation.csv | 71 |
 | bronze.geolocation | olist_geolocation_dataset.csv | 1,000,163 |
 
+Every bronze table additionally carries **ingestion lineage** columns so "when
+was this landed, from which file, in which pipeline run" is always answerable —
+a question that gets real once Phase 1 adds a second (streaming) ingestion path:
+
+| Column | Meaning |
+|---|---|
+| `_loaded_at` | `timestamptz`, stamp time of the loader run (`now()` default) |
+| `_source_file` | original CSV file name |
+| `_batch_id` | run identifier (`YYYYMMDD-HHMMSS-<hex>`, one per loader run) |
+
+`loaded_at_field: _loaded_at` is declared on every dbt source, so source
+freshness can be asserted later without code changes.
+
 Source data quirks handled:
 - **BOM:** `product_category_name_translation.csv` carries a UTF-8 BOM on its
   first header cell; the loader strips it when deriving column names.
@@ -91,6 +104,11 @@ customer decided to buy" timestamp).
 Note: the summary's revenue/orders pool is the "paying non-lost" population, so
 `summary.orders` (98,206) differs slightly from total order count (99,441).
 
+This dictionary is **served programmatically** as structured JSON at
+`GET /api/v1/metrics` (the machine-readable semantic layer, defined in
+`api/internal/metrics/catalog.go`, version `1.0.0`). It is the object an agent
+should fetch before answering metric questions — never hand-coded into a prompt.
+
 ## 5. API contract
 
 Base URL `http://localhost:8080`. Every response uses an envelope:
@@ -109,6 +127,7 @@ or 500 (store failure).
 |---|---|---|
 | `GET /healthz` | — | `{status:"ok"}` |
 | `GET /api/v1/summary` | `from`,`to` (YYYY-MM-DD, optional) | revenue, orders, aov, customers, top_category, data_start, data_end |
+| `GET /api/v1/metrics` | — | metrics catalog: `{version, metrics[], notes[]}` — the machine-readable semantic dictionary (§4) |
 | `GET /api/v1/revenue/daily` | `from`,`to` | `[{date, value}]` |
 | `GET /api/v1/orders/daily` | `from`,`to` | `[{date, orders, delivered, lost}]` |
 | `GET /api/v1/categories/top` | `metric=revenue\|orders` (default revenue), `limit=1..50` (default 10) | `[{category, orders, revenue, revenue_rank, order_rank}]` |
@@ -123,8 +142,17 @@ binary (`api/internal/http/static/`).
   singular tests: no future orders, non-negative payments/item counts/revenue,
   review scores 1–5).
 - `go build ./...` / `go vet ./...` / `go test ./...` — all green (handler tests
-  against an in-memory fake store: health, summary, range validation, series,
-  category validation, 405 handling).
+  against an in-memory fake store: health, summary, metrics catalog, range
+  validation, series, category validation, 405 handling).
+- **Postgres integration tests** (`api/internal/store/pg_integration_test.go`)
+  run the real `PostgresStore` SQL against the containerized Postgres: windowed
+  summary agrees exactly with the underlying `gold.daily_revenue` rows, daily
+  series are ascending and window-filtered, top-categories results are ordered
+  per metric, and injection-shaped `metric` strings are rejected (the metric
+  column comes from a fixed whitelist, never from the query string). They are
+  env-gated (`ABI_TEST_DATABASE_URL`, else the localhost default) and skip
+  automatically when Postgres or the gold layer is unavailable, so plain
+  `go test ./...` stays green everywhere; CI runs them for real.
 - Smoke test (starts a freshly built `api.exe`, polls, checks, stops it):
   - revenue **R$15,739,137.01** · orders **98,206** · AOV **R$160.27** · top **bed_bath_table**
   - revenue/daily 613 points · orders/daily 634 points · top-5 categories correct
@@ -138,12 +166,34 @@ uv sync                      # recreate Python env if needed
 ./scripts/smoke_test.ps1     # verify
 ```
 
+Linux / macOS / CI:
+
+```bash
+make bootstrap               # bash scripts/bootstrap.sh: same pipeline
+bash scripts/smoke_check.sh  # portable end-to-end smoke test
+```
+
+`scripts/bootstrap.sh` and `scripts/smoke_check.sh` are the platform-neutral
+equivalents of the PowerShell scripts above (`make bootstrap` / `make smoke-check`).
+
 Known operational notes:
 - API test runs build a temporary `api/bin/api.exe` so killing the process is
   clean (`go run` would leave an orphaned child binary).
-- The summary query runs a few correlated subqueries; if the metric tables get
-  large, precompute a `gold.daily_*summary*` rollup. Not needed at this scale.
-- Chart.js loads from a CDN; an offline machine needs the module vendored.
+- **Summary latency / streaming contention (roadmap item).** `/summary` runs
+  windowed aggregations over `gold.daily_revenue` plus a few correlated
+  subqueries (customers / data range / top category). At this scale it answers
+  in ~120 ms, but Phase 1 will write streaming rows into the same gold plumbing
+  the dashboard polls. Plan: materialize **`gold.daily_summary`** (one row per
+  date: revenue, orders, aov, customers) so a windowed summary becomes a simple
+  ranged aggregation over a small table, and land streaming writes in a separate
+  hot-path schema (`rt.*`) that folds into gold atomically — dashboard reads and
+  stream writes then never contend on the same query pattern.
+- Chart.js loads from a CDN; an offline machine needs the module vendored
+  (agreed as a Phase 1 detail).
+- **CI** (`.github/workflows/ci.yml`) runs the full Phase 0 pipeline on every
+  push/PR to `main`: compose-equivalent Postgres + MinIO services, uv-locked
+  Python, download → bronze load → `dbt build` → `dbt docs` → `go vet` +
+  unit/integration tests against the live DB → end-to-end smoke check.
 
 ## 8. Phase 1 hooks
 
@@ -152,3 +202,9 @@ Redpanda is already healthy and advertised to the host
 single node, overprovisioned). Phase 1 will add order-events topics, a Go
 producer on the bronze path, streaming consumers feeding the same gold metrics,
 and gRPC streaming on the API.
+
+Groundwork already landed for Phase 1:
+- Ingestion lineage columns on bronze (`_batch_id`, `_source_file`, `_loaded_at`)
+  make "which pipeline wrote this row" answerable when streaming joins batch.
+- The `gold.daily_summary` rollup decision above is the agreed reply to streaming
+  writes contending with dashboard reads.

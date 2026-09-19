@@ -39,6 +39,7 @@ func (s *Server) routes() *http.ServeMux {
 	mux.Handle("GET /", http.FileServer(http.FS(static)))
 	mux.Handle("GET /healthz", s.middleware(s.handleHealth))
 	mux.Handle("GET /api/v1/summary", s.middleware(s.handleSummary))
+	mux.Handle("GET /api/v1/metrics", s.middleware(s.handleMetrics))
 	mux.Handle("GET /api/v1/revenue/daily", s.middleware(s.handleRevenueDaily))
 	mux.Handle("GET /api/v1/orders/daily", s.middleware(s.handleOrdersDaily))
 	mux.Handle("GET /api/v1/categories/top", s.middleware(s.handleTopCategories))
