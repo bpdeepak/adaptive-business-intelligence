@@ -1,0 +1,26 @@
+name: abi
+version: 1.0.0
+config-version: 2
+
+# Profile resolved from dbt/profiles.yml (which reads ABI_PG_* env vars).
+profile: abi
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+docs-paths: ["docs"]
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+require-dbt-version: [">=1.8.0", "<2.0.0"]
+
+models:
+  abi:
+    staging:
+      +materialized: view
+      +schema: silver
+    marts:
+      +materialized: table
+      +schema: gold

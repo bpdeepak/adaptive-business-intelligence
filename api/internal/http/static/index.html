@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ABI · Phase 0 — Foundations</title>
+  <link rel="stylesheet" href="/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">ABI</span>
+      <div>
+        <h1>Adaptive Business Intelligence</h1>
+        <p class="subtitle">Phase 0 · Foundations — Olist e-commerce 2016–2018</p>
+      </div>
+    </div>
+    <div class="controls">
+      <div class="range" id="range">
+        <button data-range="7">7D</button>
+        <button data-range="30">30D</button>
+        <button data-range="90">90D</button>
+        <button data-range="all" class="active">All</button>
+      </div>
+      <button class="refresh" id="refresh" title="Refresh">↻ Refresh</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="kpis" id="kpis" aria-live="polite"></section>
+
+    <section class="charts">
+      <div class="card span2">
+        <h2>Daily revenue <span class="hint">(<span data-range-label>all time</span>)</span></h2>
+        <canvas id="chartRevenue" height="90"></canvas>
+      </div>
+      <div class="card span2">
+        <h2>Daily orders <span class="hint">(<span data-range-label>all time</span>)</span></h2>
+        <canvas id="chartOrders" height="90"></canvas>
+      </div>
+      <div class="card">
+        <h2>Top categories by revenue</h2>
+        <canvas id="chartCategories" height="110"></canvas>
+      </div>
+      <div class="card meta-card">
+        <h2>Pipeline status</h2>
+        <ul id="metaList">
+          <li>Loading…</li>
+        </ul>
+        <p class="hint" id="refreshTime"></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>
+      Data: <a href="https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce">Olist Brazilian E-Commerce</a>
+      · Pipeline: MinIO (bronze) → dbt (silver/gold) → Go API → dashboard
+    </p>
+  </footer>
+</body>
+</html>

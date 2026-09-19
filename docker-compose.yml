@@ -1,0 +1,84 @@
+name: abi
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: abi-postgres
+    environment:
+      POSTGRES_DB: ${ABI_PG_DB:-abi}
+      POSTGRES_USER: ${ABI_PG_USER:-abi}
+      POSTGRES_PASSWORD: ${ABI_PG_PASSWORD:-abi}
+    ports:
+      - "${ABI_PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ABI_PG_USER:-abi} -d ${ABI_PG_DB:-abi}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    # quay.io build: ships curl, so the /minio/health/ready healthcheck works.
+    image: quay.io/minio/minio:RELEASE.2025-05-24T17-08-30Z
+    container_name: abi-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redpanda:
+    # Single-node Redpanda, Kafka-compatible. Advertised to localhost so clients
+    # on the Windows host (Phase 1 producer/consumer) can connect.
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.3
+    container_name: abi-redpanda
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - 768M
+      - --reserve-memory
+      - 0M
+      - --node-id
+      - "0"
+      - --kafka-addr
+      - PLAIN://0.0.0.0:29092
+      - --advertise-kafka-addr
+      - PLAIN://localhost:29092
+      - --pandaproxy-addr
+      - PLAIN://0.0.0.0:28082
+      - --advertise-pandaproxy-addr
+      - PLAIN://localhost:28082
+      - --rpc-addr
+      - 0.0.0.0:33145
+      - --advertise-rpc-addr
+      - redpanda:33145
+    ports:
+      - "29092:29092"
+      - "28082:28082"
+      - "${REDPANDA_ADMIN_PORT:-9644}:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "info"]
+      interval: 10s
+      timeout: 15s
+      retries: 20
+
+volumes:
+  pgdata:
+  minio-data:
+  redpanda-data:

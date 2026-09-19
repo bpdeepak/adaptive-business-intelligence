@@ -1,0 +1,20 @@
+[project]
+name = "abi"
+version = "0.1.0"
+description = "Adaptive Business Intelligence — real-time, explainable, agentic BI platform for e-commerce."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "dbt-core>=1.9,<2",
+    "dbt-postgres>=1.9,<2",
+    "boto3>=1.35,<2",
+    "psycopg[binary]>=3.2,<4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,88 @@
+version: 2
+
+models:
+  - name: fct_orders
+    description: >
+      One row per order with item/payment/review aggregates and business status
+      flags. The core grain for Phase 0 metrics.
+    columns:
+      - name: order_id
+        tests: [unique, not_null]
+      - name: customer_id
+        tests: [not_null]
+      - name: customer_unique_id
+        tests: [not_null]
+      - name: order_status
+        tests: [not_null]
+      - name: order_purchase_date
+        tests: [not_null]
+      - name: item_count
+        tests: [not_null]
+      - name: payment_value_total
+        tests: [not_null]
+      - name: is_lost
+        tests: [not_null]
+      - name: is_delivered
+        tests: [not_null]
+
+  - name: dim_customers
+    description: One row per customer_unique_id (business entity).
+    columns:
+      - name: customer_unique_id
+        tests: [unique, not_null]
+
+  - name: dim_products
+    description: One row per product with English category name.
+    columns:
+      - name: product_id
+        tests: [unique, not_null]
+      - name: product_category
+        tests: [not_null]
+
+  - name: dim_sellers
+    description: One row per seller.
+    columns:
+      - name: seller_id
+        tests: [unique, not_null]
+
+  - name: dim_dates
+    description: Day spine over the observed purchase-date range.
+    columns:
+      - name: date
+        tests: [unique, not_null]
+
+  - name: daily_revenue
+    description: Revenue and contributing order count per purchase date.
+    columns:
+      - name: date
+        tests: [unique, not_null]
+      - name: order_count
+        tests: [not_null]
+      - name: revenue
+        tests: [not_null]
+
+  - name: daily_orders
+    description: Total/delivered/lost order counts per purchase date.
+    columns:
+      - name: date
+        tests: [unique, not_null]
+      - name: total_orders
+        tests: [not_null]
+
+  - name: daily_aov
+    description: Average order value per purchase date.
+    columns:
+      - name: date
+        tests: [unique, not_null]
+      - name: aov
+        tests: [not_null]
+
+  - name: top_categories
+    description: Category aggregates ranked by revenue and orders.
+    columns:
+      - name: product_category
+        tests: [unique, not_null]
+      - name: revenue_rank
+        tests: [not_null]
+      - name: order_rank
+        tests: [not_null]

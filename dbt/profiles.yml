@@ -1,0 +1,15 @@
+abi:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('ABI_PG_HOST', 'localhost') }}"
+      port: "{{ env_var('ABI_PG_PORT', '5432') | as_number }}"
+      user: "{{ env_var('ABI_PG_USER', 'abi') }}"
+      password: "{{ env_var('ABI_PG_PASSWORD', 'abi') }}"
+      dbname: "{{ env_var('ABI_PG_DB', 'abi') }}"
+      schema: "{{ env_var('ABI_PG_SCHEMA', 'public') }}"
+      threads: 4
+      keepalives_idle: 0
+      connect_timeout: 10
+      sslmode: disable

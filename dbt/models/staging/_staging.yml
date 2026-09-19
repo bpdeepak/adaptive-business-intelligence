@@ -1,0 +1,138 @@
+version: 2
+
+models:
+  - name: stg_customers
+    description: Typed, cleaned customers (one row per customer_id).
+    columns:
+      - name: customer_id
+        description: Surrogate customer key, one per order account.
+        tests: [unique, not_null]
+      - name: customer_unique_id
+        description: Business customer key, one per person across orders.
+        tests: [not_null]
+      - name: customer_city
+        tests: [not_null]
+      - name: customer_state
+        tests: [not_null]
+      - name: is_identified
+        tests: [not_null]
+
+  - name: stg_sellers
+    description: Typed, cleaned sellers.
+    columns:
+      - name: seller_id
+        tests: [unique, not_null]
+
+  - name: stg_products
+    description: Typed, cleaned products.
+    columns:
+      - name: product_id
+        tests: [unique, not_null]
+
+  - name: stg_category_translation
+    description: Portuguese -> English product category names.
+    columns:
+      - name: category_name_pt
+        tests: [unique, not_null]
+      - name: category_name
+        tests: [not_null]
+
+  - name: stg_orders
+    description: Typed, cleaned order headers.
+    columns:
+      - name: order_id
+        tests: [unique, not_null]
+      - name: customer_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_customers')
+                field: customer_id
+      - name: order_status
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - created
+                  - approved
+                  - invoiced
+                  - processing
+                  - shipped
+                  - delivered
+                  - canceled
+                  - unavailable
+      - name: order_purchase_timestamp
+        tests: [not_null]
+
+  - name: stg_order_items
+    description: Typed order line items. PK is (order_id, order_item_id).
+    columns:
+      - name: order_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_orders')
+                field: order_id
+      - name: order_item_id
+        tests: [not_null]
+      - name: product_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_products')
+                field: product_id
+      - name: seller_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_sellers')
+                field: seller_id
+      - name: price
+        tests: [not_null]
+      - name: freight_value
+        tests: [not_null]
+
+  - name: stg_order_payments
+    description: Typed payments per order. PK is (order_id, payment_sequential).
+    columns:
+      - name: order_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_orders')
+                field: order_id
+      - name: payment_sequential
+        tests: [not_null]
+      - name: payment_type
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [credit_card, boleto, voucher, debit_card, not_defined]
+      - name: payment_value
+        tests: [not_null]
+
+  - name: stg_order_reviews
+    description: Deduplicated reviews (exact duplicates removed).
+    columns:
+      - name: review_id
+        tests: [not_null]
+      - name: order_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_orders')
+                field: order_id
+      - name: review_score
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [1, 2, 3, 4, 5]

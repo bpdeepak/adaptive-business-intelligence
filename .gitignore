@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*/
+*.egg-info/
+.pytest_cache/
+
+# dbt
+dbt/target/
+dbt/logs/
+dbt/packages/
+dbt/dbt_packages/
+
+# Data (downloaded, large)
+data/raw/
+
+# Env / secrets
+.env
+
+# Go
+api/bin/
+api/*.test
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

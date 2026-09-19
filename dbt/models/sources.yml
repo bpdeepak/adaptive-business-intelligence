@@ -1,0 +1,28 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: >
+      Immutable raw landing layer. One Postgres table per source CSV, every column
+      kept verbatim as TEXT. Loaded by loader/loader.py from MinIO (bucket `bronze`).
+    database: "{{ target.database }}"
+    schema: bronze
+    tables:
+      - name: orders
+        description: Olist orders dataset (raw text).
+      - name: order_items
+        description: Olist order items dataset (raw text).
+      - name: order_payments
+        description: Olist order payments dataset (raw text).
+      - name: order_reviews
+        description: Olist order reviews dataset (raw text).
+      - name: customers
+        description: Olist customers dataset (raw text).
+      - name: sellers
+        description: Olist sellers dataset (raw text).
+      - name: products
+        description: Olist products dataset (raw text).
+      - name: product_category_name_translation
+        description: Portuguese -> English product category translation (raw text).
+      - name: geolocation
+        description: Olist geolocation dataset (raw text). Not staged in Phase 0.
