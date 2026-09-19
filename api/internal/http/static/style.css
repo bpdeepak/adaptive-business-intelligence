@@ -105,6 +105,11 @@ main { padding: 24px 28px; }
 .card h2 { font-size: 14px; font-weight: 600; color: var(--text); margin-bottom: 12px; }
 .hint { color: var(--muted); font-weight: 400; font-size: 12px; }
 
+/* Fixed-height chart wrappers: with maintainAspectRatio:false Chart.js fills
+   its parent, so a fixed parent height is what keeps the page height stable. */
+.chart-box { position: relative; width: 100%; height: 300px; }
+.chart-box.chart-box-tall { height: 340px; }
+
 .meta-card ul { list-style: none; font-size: 13px; }
 .meta-card li { padding: 4px 0; border-bottom: 1px dashed var(--border); color: var(--muted); }
 .meta-card li b { color: var(--text); font-weight: 600; }
