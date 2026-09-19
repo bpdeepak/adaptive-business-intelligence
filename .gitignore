@@ -27,3 +27,5 @@ api/*.test
 Thumbs.db
 .idea/
 .vscode/
+# dbt user config (machine-local)
+dbt/.user.yml
