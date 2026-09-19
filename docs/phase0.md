@@ -106,8 +106,11 @@ Note: the summary's revenue/orders pool is the "paying non-lost" population, so
 
 This dictionary is **served programmatically** as structured JSON at
 `GET /api/v1/metrics` (the machine-readable semantic layer, defined in
-`api/internal/metrics/catalog.go`, version `1.0.0`). It is the object an agent
-should fetch before answering metric questions — never hand-coded into a prompt.
+`api/internal/metrics/catalog.go`, version `1.2.0`). Every metric carries a
+required `source` field — `batch` or `live_replay` — and Phase 1's realtime
+buckets live in `gold.realtime_metrics`, never additive with these batch
+totals. It is the object an agent should fetch before answering metric
+questions — never hand-coded into a prompt.
 
 ## 5. API contract
 

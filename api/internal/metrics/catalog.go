@@ -6,9 +6,14 @@ package metrics
 
 // Metric is one canonical business metric.
 type Metric struct {
-	Name        string   `json:"name"`
-	Label       string   `json:"label"`
-	Description string   `json:"description"`
+	Name        string `json:"name"`
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	// Source is the required provenance tag: "batch" (complete historical
+	// aggregates over gold.daily_*) or "live_replay" (compressed 1-minute
+	// streaming buckets over gold.realtime_metrics). Values of the two sources
+	// are never additive; agents must handle the split explicitly.
+	Source      string   `json:"source"`
 	Population  string   `json:"population"`
 	Grain       string   `json:"grain"`
 	DateField   string   `json:"date_field,omitempty"`
@@ -26,9 +31,16 @@ type Catalog struct {
 	Notes   []string `json:"notes,omitempty"`
 }
 
+// Source provenance tags (mirrors model.SourceBatch/SourceLiveReplay without
+// importing the model package into the definitions).
+const (
+	SourceBatch      = "batch"
+	SourceLiveReplay = "live_replay"
+)
+
 // Version is bumped whenever a definition changes. Keep it in sync with the
 // `Metric definitions` table in docs/phase0.md (section 4) and docs/phase1.md.
-const Version = "1.1.0"
+const Version = "1.2.0"
 
 // Default returns the Phase 0 catalog.
 func Default() Catalog {
@@ -38,6 +50,7 @@ func Default() Catalog {
 			{
 				Name:        "revenue",
 				Label:       "Revenue",
+				Source:      SourceBatch,
 				Description: "Total captured payments from non-lost orders.",
 				Population:  "orders with order_status NOT IN ('canceled','unavailable') AND payment_value_total > 0",
 				Grain:       "order",
@@ -55,6 +68,7 @@ func Default() Catalog {
 			{
 				Name:        "orders",
 				Label:       "Orders",
+				Source:      SourceBatch,
 				Description: "Distinct orders.",
 				Population:  "summary endpoint: paying, non-lost population (same as revenue). daily_orders: all orders.",
 				Grain:       "order",
@@ -71,6 +85,7 @@ func Default() Catalog {
 			{
 				Name:        "aov",
 				Label:       "Average order value",
+				Source:      SourceBatch,
 				Description: "Revenue per order of the same population.",
 				Population:  "paying, non-lost orders with payment_value_total > 0",
 				Grain:       "day",
@@ -87,6 +102,7 @@ func Default() Catalog {
 			{
 				Name:        "active_customers",
 				Label:       "Active customers",
+				Source:      SourceBatch,
 				Description: "Distinct business customers with at least one non-lost order.",
 				Population:  "customer_unique_id with an order in order_status NOT IN ('canceled','unavailable')",
 				Grain:       "customer",
@@ -101,6 +117,7 @@ func Default() Catalog {
 			{
 				Name:        "delivered_orders",
 				Label:       "Delivered orders",
+				Source:      SourceBatch,
 				Description: "Orders whose final status is 'delivered'.",
 				Population:  "all orders",
 				Grain:       "order",
@@ -113,6 +130,7 @@ func Default() Catalog {
 			{
 				Name:        "lost_orders",
 				Label:       "Lost orders",
+				Source:      SourceBatch,
 				Description: "Orders whose final status is 'canceled' or 'unavailable'.",
 				Population:  "all orders",
 				Grain:       "order",
@@ -128,6 +146,7 @@ func Default() Catalog {
 			{
 				Name:        "top_categories",
 				Label:       "Top categories",
+				Source:      SourceBatch,
 				Description: "Product categories ranked by revenue or order count.",
 				Population:  "paying, non-lost orders with payment_value_total > 0",
 				Grain:       "product category (per order line item)",
@@ -145,6 +164,7 @@ func Default() Catalog {
 			{
 				Name:        "review_score",
 				Label:       "Review score",
+				Source:      SourceBatch,
 				Description: "Customer satisfaction score per order (1–5).",
 				Population:  "orders with at least one review",
 				Grain:       "order",
@@ -160,6 +180,7 @@ func Default() Catalog {
 			{
 				Name:        "revenue_realtime",
 				Label:       "Revenue — live (1-min bucket)",
+				Source:      SourceLiveReplay,
 				Description: "Revenue in the current 1-minute streaming bucket; identical population to `revenue` but bucketed by event time.",
 				Population:  "orders with order_status NOT IN ('canceled','unavailable') AND payment_value_total > 0 (replayed)",
 				Grain:       "1-minute bucket (bucket_start)",
@@ -170,13 +191,14 @@ func Default() Catalog {
 				Tags:        []string{"kpi", "money", "realtime"},
 				Notes: []string{
 					"Same revenue filter as the batch metric — but computed on replayed order events, bucketed by the event's occurred_at minute.",
-					"Live means compressed replay: the whole dataset is replayed ~1 day per 30 seconds (SPEED_MULTIPLIER)," + " so a \"minute\" of data is a fraction of a wall second. Do NOT add realtime values to batch totals.",
+					"Live means compressed replay: the whole dataset is replayed ~1 day per 30 seconds (SPEED_MULTIPLIER), so a \"minute\" of data is a fraction of a wall second. Do NOT add realtime values to batch totals.",
 					"Buckets are upserted every 5 seconds; a bucket may still grow within its minute window.",
 				},
 			},
 			{
 				Name:        "orders_realtime",
 				Label:       "Orders — live (1-min bucket)",
+				Source:      SourceLiveReplay,
 				Description: "Distinct non-lost orders in the current 1-minute streaming bucket.",
 				Population:  "orders with order_status NOT IN ('canceled','unavailable') AND payment_value_total > 0 (replayed)",
 				Grain:       "1-minute bucket (bucket_start)",
@@ -193,6 +215,7 @@ func Default() Catalog {
 			{
 				Name:        "active_sessions",
 				Label:       "Active sessions — live (1-min bucket)",
+				Source:      SourceLiveReplay,
 				Description: "Distinct browsing sessions with at least one click event in the bucket.",
 				Population:  "sessions with ≥1 page.view/cart.abandoned event (replayed, includes synthetic bot traffic)",
 				Grain:       "1-minute bucket (bucket_start)",
@@ -214,6 +237,7 @@ func Default() Catalog {
 			"Geo data (bronze.geolocation, 1,000,163 rows) is landed but not staged in Phase 0.",
 			"Errata: summary's aov/counts describe the paying, non-lost population; daily_orders.total describes all orders. Always check the population field of a metric before combining metrics.",
 			"Realtime metrics (Phase 1) describe a compressed REPLAY of the same orders; they are bounded to their own gold.realtime_metrics table and are never added to the batch gold.daily_* totals.",
+			"Every metric carries a required `source` field: \"batch\" vs \"live_replay\". Never add or compare figures across the two sources; treat the split as part of the contract.",
 		},
 	}
 }

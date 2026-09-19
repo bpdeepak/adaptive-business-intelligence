@@ -15,10 +15,13 @@ type Config struct {
 	HTTPAddr string
 	// GRPCAddr is the listen address of the gRPC live-metrics server.
 	GRPCAddr string
+	// MetricsAddr is the listen address of the producer's Prometheus text
+	// endpoint (the server exposes /metrics on its own HTTP listener).
+	MetricsAddr string
 	// DatabaseURL is the Postgres DSN for the gold/semantic layer.
 	DatabaseURL string
 
-	// KafkaSeedBrokers is the list of Redpanda/Kafka brokers.
+	// KafkaSeedBrokers is the list of Kafka/Redpanda brokers.
 	KafkaSeedBrokers []string
 	// ConsumerGroupBronze is the consumer group of the bronze-writer.
 	ConsumerGroupBronze string
@@ -37,6 +40,11 @@ type Config struct {
 	RetentionKeep string
 	// RetentionBucketKeep is how long realtime_metrics buckets survive.
 	RetentionBucketKeep string
+	// RetentionAnomalies keeps gold.anomalies rows this long.
+	RetentionAnomalies string
+	// ReconcileEvery is how often gold.realtime_metrics is reconciled from the
+	// idempotent bronze layer (self-healing against redelivery double-counts).
+	ReconcileEvery string
 }
 
 // FromEnv builds a Config from environment variables with sane defaults.
@@ -54,6 +62,9 @@ func FromEnv() Config {
 		RingCapacity:          intenv("ABI_RING_CAPACITY", 4096),
 		RetentionKeep:         getenv("ABI_RETENTION_STREAM_EVENTS", "12h"),
 		RetentionBucketKeep:   getenv("ABI_RETENTION_METRICS_BUCKETS", "3h"),
+		RetentionAnomalies:    getenv("ABI_RETENTION_ANOMALIES", "720h"),
+		ReconcileEvery:        getenv("ABI_RECONCILE_EVERY", "60s"),
+		MetricsAddr:           getenv("ABI_METRICS_ADDR", ":8092"),
 	}
 }
 

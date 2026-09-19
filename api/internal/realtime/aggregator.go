@@ -15,6 +15,7 @@ import (
 
 	"abi/internal/model"
 	"abi/internal/stream"
+	"abi/internal/telemetry"
 )
 
 // Aggregator consumes the order + clickstream topics and maintains hot,
@@ -34,6 +35,8 @@ type Aggregator struct {
 
 	detector   *Detector
 	flushEvery time.Duration
+
+	tel *telemetry.Registry // optional Prometheus sink (nil-safe)
 
 	mu           sync.Mutex
 	buckets      map[time.Time]*bucket
@@ -67,9 +70,29 @@ func NewAggregator(pool *pgxpool.Pool, cl, anomPub *kgo.Client, bc *Broadcaster,
 	}
 }
 
+// Instrument attaches the optional Prometheus registry the aggregator reports
+// into. Nil-safe: without a registry every counter is a no-op.
+func (a *Aggregator) Instrument(reg *telemetry.Registry) {
+	a.tel = reg
+}
+
+// Baseline returns the detector's current accumulator states (for observability
+// of warm-up progress and for snapshot persistence).
+func (a *Aggregator) Baseline() []MetricState {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.detector.Snapshot()
+}
+
 // Run consumes until ctx is cancelled, flushing buckets every flushEvery and on
 // shutdown. It returns nil on graceful cancellation.
 func (a *Aggregator) Run(ctx context.Context) error {
+	// Resume the anomaly baseline from the last persisted snapshot so a restart
+	// skips the 20-bucket warm-up instead of re-learning from zero (and firing a
+	// false-positive burst while it does).
+	if err := a.restoreBaseline(ctx); err != nil {
+		a.log.Warn("aggregator: detector baseline not restored", "error", err)
+	}
 	consumeDone := make(chan struct{})
 	go func() {
 		defer close(consumeDone)
@@ -101,9 +124,44 @@ func (a *Aggregator) Run(ctx context.Context) error {
 		case <-ticker.C:
 			if err := a.flushAndDetect(ctx); err != nil {
 				a.log.Error("aggregator flush failed", "error", err)
+				a.flushErrors().Inc()
 			}
 		}
 	}
+}
+
+func (a *Aggregator) restoreBaseline(ctx context.Context) error {
+	states, err := LoadDetectorState(ctx, a.pool)
+	if err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.detector.Restore(states)
+	a.mu.Unlock()
+	if len(states) > 0 {
+		a.log.Info("aggregator: detector baseline restored", "metrics", len(states))
+	}
+	return nil
+}
+
+// saveBaseline persists the current accumulators so the next start resumes
+// here. Called after every flush (a few rows) — cheap insurance against any
+// crash, not just a clean shutdown.
+func (a *Aggregator) saveBaseline(ctx context.Context) {
+	a.mu.Lock()
+	states := a.detector.Snapshot()
+	a.mu.Unlock()
+	if err := SaveDetectorState(ctx, a.pool, states); err != nil {
+		a.log.Debug("aggregator: save detector state", "error", err)
+	}
+}
+
+func (a *Aggregator) flushErrors() *telemetry.Series {
+	return a.tel.Counter("abi_aggregator_flush_errors_total", "Flush/detect cycles that could not be persisted.")
+}
+
+func (a *Aggregator) anomaliesDetected() *telemetry.Series {
+	return a.tel.Counter("abi_anomalies_detected_total", "Anomalies persisted to gold.anomalies.")
 }
 
 // ingest folds one raw record into its minute bucket.
@@ -222,11 +280,15 @@ func (a *Aggregator) flushAndDetect(ctx context.Context) error {
 			a.log.Error("aggregator: persist anomaly", "error", err)
 			continue
 		}
+		a.anomaliesDetected().Inc()
 		lastAnom = anom
 		if err := a.publishAnomaly(ctx, anom); err != nil {
 			a.log.Error("aggregator: publish anomaly", "error", err)
 		}
 	}
+
+	// Keep the persisted anomaly baseline fresh (crash-safe resume).
+	a.saveBaseline(ctx)
 
 	// Broadcast the most recent bucket.
 	var current model.RealtimeBucket
@@ -250,6 +312,7 @@ func (a *Aggregator) flushAndDetect(ctx context.Context) error {
 			Anomaly:         lastAnom,
 			SpeedMultiplier: a.speed,
 			Status:          a.status,
+			Source:          model.SourceLiveReplay,
 		})
 	}
 	return nil
@@ -382,9 +445,10 @@ func (a *Aggregator) publishAnomaly(ctx context.Context, anom *model.Anomaly) er
 	return nil
 }
 
-// round2 rounds to 2 decimal places. A constant baseline yields a z-score of
-// ±Inf; clamp non-finite values so the score survives JSON broadcast and
-// compares above the severe threshold while remaining database-safe.
+// round2 rounds to 2 decimal places. The detector's variance floor keeps
+// z-scores finite even on flat baselines, but an unexpected non-finite value
+// (NaN creeping in from undecodable input) must still survive JSON broadcast
+// and DB persistence — clamp to ±1e15 as a backstop only.
 func round2(v float64) float64 {
 	if math.IsInf(v, 0) || math.IsNaN(v) {
 		if v > 0 {

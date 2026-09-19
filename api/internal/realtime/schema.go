@@ -80,11 +80,23 @@ var schemaDDL = []string{
 		dismissed_at timestamptz
 	)`,
 
+	// Online detector accumulators, snapshotted so a server restart resumes the
+	// Welford/anomaly baseline instead of re-warming (a fresh 20-bucket warm-up
+	// would otherwise ride a false-positive burst right after a deploy).
+	`CREATE TABLE IF NOT EXISTS gold.detector_state (
+		metric      text PRIMARY KEY,
+		n           bigint NOT NULL,
+		mean        double precision NOT NULL,
+		m2          double precision NOT NULL,
+		updated_at  timestamptz NOT NULL DEFAULT now()
+	)`,
+
 	// Supporting indexes for queries and retention purges.
 	`CREATE INDEX IF NOT EXISTS idx_stream_events_loaded ON bronze.stream_events (_loaded_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_stream_events_occurred ON bronze.stream_events (occurred_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_rt_metrics_bucket ON gold.realtime_metrics (bucket_start)`,
 	`CREATE INDEX IF NOT EXISTS idx_anomalies_status ON gold.anomalies (status)`,
+	`CREATE INDEX IF NOT EXISTS idx_anomalies_detected ON gold.anomalies (detected_at)`,
 }
 
 // EnsureSchema creates all realtime tables and indexes. Safe to call on every
@@ -98,11 +110,14 @@ func EnsureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
-// Retention keeps the streaming tables bounded: raw events for `keep` duration
-// and one-minute buckets for `bucketKeep`. The replay loop is ~6h at default
-// speed, so 12h of raw events preserves ~2 loops and 3h of buckets gives the
-// dashboard a comfortable look-back window.
-func Retention(ctx context.Context, pool *pgxpool.Pool, keep, bucketKeep time.Duration) error {
+// Retention keeps the streaming tables bounded: raw events for `keep` duration,
+// one-minute buckets for `bucketKeep`, and the anomaly log for `anomalyKeep`.
+// The replay loop is ~6h at default speed, so 12h of raw events preserves ~2
+// loops and 3h of buckets gives the dashboard a comfortable look-back window.
+// bronze.training_ground_truth is deliberately NOT pruned: it is the Phase 2
+// training corpus and grows only with the number of synthetic sessions per
+// loop (hundreds), not with event volume.
+func Retention(ctx context.Context, pool *pgxpool.Pool, keep, bucketKeep, anomalyKeep time.Duration) error {
 	if _, err := pool.Exec(ctx,
 		`DELETE FROM bronze.stream_events WHERE _loaded_at < now() - $1::interval`, keep.String()); err != nil {
 		return fmt.Errorf("purge stream_events: %w", err)
@@ -110,6 +125,10 @@ func Retention(ctx context.Context, pool *pgxpool.Pool, keep, bucketKeep time.Du
 	if _, err := pool.Exec(ctx,
 		`DELETE FROM gold.realtime_metrics WHERE bucket_start < now() - $1::interval`, bucketKeep.String()); err != nil {
 		return fmt.Errorf("purge realtime_metrics: %w", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`DELETE FROM gold.anomalies WHERE detected_at < now() - $1::interval`, anomalyKeep.String()); err != nil {
+		return fmt.Errorf("purge anomalies: %w", err)
 	}
 	return nil
 }

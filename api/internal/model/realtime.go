@@ -55,11 +55,14 @@ type Anomaly struct {
 
 // MetricsUpdate is one push on the SSE/gRPC live stream. The first update after
 // a subscriber connects carries a recent Snapshot; subsequent updates carry the
-// Current bucket and any new Anomaly.
+// Current bucket and any new Anomaly. Source is always "live_replay" on this
+// stream — included explicitly so an LLM tool layer cannot mistake the numbers
+// for batch truth.
 type MetricsUpdate struct {
 	Snapshot        []RealtimeBucket `json:"snapshot,omitempty"`
 	Current         RealtimeBucket   `json:"current"`
 	Anomaly         *Anomaly         `json:"anomaly,omitempty"`
 	SpeedMultiplier float64          `json:"speed_multiplier"`
 	Status          string           `json:"status"` // "live" | "replay"
+	Source          string           `json:"source,omitempty"`
 }

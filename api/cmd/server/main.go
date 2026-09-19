@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"abi/internal/realtime"
 	"abi/internal/store"
 	"abi/internal/stream"
+	"abi/internal/telemetry"
 )
 
 func main() {
@@ -93,12 +95,21 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	writer := realtime.NewBronzeWriter(pool, bronzeCl, "server-uuid-"+time.Now().Format("20060102-150405"), logger)
 	aggregator := realtime.NewAggregator(pool, rtCl, anomPub, bc, cfg.SpeedMultiplier, "replay", logger)
 
-	// 5. HTTP (REST + SSE + dashboard).
+	// 4b. Observability: the pipeline's own health (consumer lag, flush errors,
+	// anomaly counts, baseline progress) is exposed at GET /metrics on the main
+	// HTTP listener in Prometheus text format.
+	reg := telemetry.NewRegistry()
+	aggregator.Instrument(reg)
+
+	// 5. HTTP (REST + SSE + dashboard + /metrics).
 	srv := httpapi.New(st, logger)
 	srv.AttachLive(feed)
+	rootMux := http.NewServeMux()
+	rootMux.Handle("/", srv)
+	rootMux.Handle("GET /metrics", reg.Handler())
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           srv,
+		Handler:           rootMux,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -113,10 +124,18 @@ func run(logger *slog.Logger, cfg config.Config) error {
 		return fmt.Errorf("grpc listen: %w", err)
 	}
 
-	// 7. Retention janitor.
+	// 7. Retention janitor + self-healing reconciliation loop.
 	retentionCtx, retentionCancel := context.WithCancel(ctx)
 	defer retentionCancel()
 	go retentionLoop(retentionCtx, logger, pool, cfg)
+
+	reconcileCtx, reconcileCancel := context.WithCancel(ctx)
+	defer reconcileCancel()
+	go reconcileLoop(reconcileCtx, logger, pool, cfg)
+
+	metricsCtx, metricsCancel := context.WithCancel(ctx)
+	defer metricsCancel()
+	go metricsLoop(metricsCtx, logger, reg, cfg, aggregator, bc)
 
 	errCh := make(chan error, 4)
 	go func() {
@@ -177,16 +196,19 @@ func seedBroadcaster(ctx context.Context, bc *realtime.Broadcaster, feed *realti
 		Current:         last,
 		SpeedMultiplier: feed.SpeedMultiplier(),
 		Status:          feed.Status(),
+		Source:          model.SourceLiveReplay,
 	})
 }
 
-// retentionLoop periodically trims the streaming tables back to their budgets.
+// retentionLoop periodically trims the streaming tables back to their budgets:
+// raw events, minute buckets, and the anomaly log.
 func retentionLoop(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, cfg config.Config) {
 	keep, err1 := time.ParseDuration(cfg.RetentionKeep)
 	bucketKeep, err2 := time.ParseDuration(cfg.RetentionBucketKeep)
-	if err1 != nil || err2 != nil {
-		logger.Warn("retention durations invalid; using defaults", "err1", err1, "err2", err2)
-		keep, bucketKeep = 12*time.Hour, 3*time.Hour
+	anomalyKeep, err3 := time.ParseDuration(cfg.RetentionAnomalies)
+	if err1 != nil || err2 != nil || err3 != nil {
+		logger.Warn("retention durations invalid; using defaults", "err1", err1, "err2", err2, "err3", err3)
+		keep, bucketKeep, anomalyKeep = 12*time.Hour, 3*time.Hour, 720*time.Hour
 	}
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -195,9 +217,88 @@ func retentionLoop(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool,
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := realtime.Retention(ctx, pool, keep, bucketKeep); err != nil {
+			if err := realtime.Retention(ctx, pool, keep, bucketKeep, anomalyKeep); err != nil {
 				logger.Warn("retention purge failed", "error", err)
 			}
+		}
+	}
+}
+
+// reconcileLoop recomputes the visible realtime_metrics window from the
+// idempotent bronze layer on a schedule. This is the self-healing counterpart
+// to at-least-once delivery: if a consumer restart redelivered a batch and
+// double-counted revenue/orders, the next pass clamps the served buckets back
+// to bronze's deduplicated truth.
+func reconcileLoop(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, cfg config.Config) {
+	every, err1 := time.ParseDuration(cfg.ReconcileEvery)
+	window, err2 := time.ParseDuration(cfg.RetentionBucketKeep)
+	if err1 != nil || err2 != nil || every <= 0 || window <= 0 {
+		logger.Warn("reconcile settings invalid; using defaults", "every", err1, "window", err2)
+		every, window = time.Minute, 3*time.Hour
+	}
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := realtime.Reconcile(ctx, pool, window); err != nil {
+				logger.Warn("realtime reconcile failed", "error", err)
+			}
+		}
+	}
+}
+
+// metricsLoop refreshes the pipeline's own operational gauges: consumer lag for
+// both groups, anomaly-baseline progress, and fan-out health.
+func metricsLoop(ctx context.Context, logger *slog.Logger, reg *telemetry.Registry,
+	cfg config.Config, aggregator *realtime.Aggregator, bc *realtime.Broadcaster) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refreshConsumerLag(ctx, logger, reg, cfg)
+			for _, st := range aggregator.Baseline() {
+				reg.GaugeLabel("abi_detector_baseline_buckets", "Closed buckets folded into the per-metric anomaly baseline.",
+					map[string]string{"metric": st.Metric}).Set(float64(st.N))
+			}
+			reg.Gauge("abi_sse_subscribers", "Live SSE/gRPC subscribers currently attached.").
+				Set(float64(bc.Subscribers()))
+			reg.Counter("abi_broadcast_updates_total", "MetricsUpdate pushes published.").
+				Set(float64(bc.Pushes()))
+			reg.Counter("abi_broadcast_dropped_updates_total", "Pushes dropped for slow subscribers.").
+				Set(float64(bc.Drops()))
+		}
+	}
+}
+
+// refreshConsumerLag probes both consumer groups and publishes per-partition
+// lag gauges (end offset − committed offset).
+func refreshConsumerLag(ctx context.Context, logger *slog.Logger, reg *telemetry.Registry, cfg config.Config) {
+	groups := []struct {
+		name   string
+		topics []string
+	}{
+		{cfg.ConsumerGroupBronze, stream.AllTopics},
+		{cfg.ConsumerGroupRT, []string{stream.TopicOrders, stream.TopicClicks}},
+	}
+	for _, g := range groups {
+		lags, err := kafka.Lag(ctx, cfg.KafkaSeedBrokers, g.name, g.topics)
+		if err != nil {
+			logger.Warn("consumer lag probe", "group", g.name, "error", err)
+			continue
+		}
+		for _, l := range lags {
+			reg.GaugeLabel("abi_consumer_lag", "Unread records for a group/topic/partition.",
+				map[string]string{
+					"group":     l.Group,
+					"topic":     l.Topic,
+					"partition": strconv.Itoa(int(l.Partition)),
+				}).Set(float64(l.Lag))
 		}
 	}
 }

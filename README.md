@@ -13,8 +13,8 @@ tiles — all built, tested, and running end to end.
 | Infrastructure | Docker Compose: Postgres 17, MinIO, Redpanda 26.2 (all healthy-checked) |
 | Bronze | Olist (9 CSVs, ~126 MB) → immutable objects in MinIO `bronze` bucket **and** verbatim raw tables in Postgres `bronze.*`; streaming events + bot ground truth in `bronze.stream_events` / `bronze.training_ground_truth` (with lineage) |
 | Silver | 8 typed, cleaned staging views (`silver.stg_*`), dedup of duplicate reviews, NULL handling |
-| Gold | `gold.fct_orders` + `gold.fct_order_items`, 4 dims, metric tables (`daily_revenue`, `daily_orders`, `daily_aov`, `top_categories`) — plus **hot-path** `gold.realtime_metrics` (1-min buckets) and `gold.anomalies` written by the Go realtime stack |
-| Streaming | `cmd/producer` replays history (virtual clock, 3-source merge, infinite loops); `cmd/server` runs the bronze-writer + realtime aggregator (Welford/z-score anomaly detection) |
+| Gold | `gold.fct_orders` + `gold.fct_order_items`, 4 dims, metric tables (`daily_revenue`, `daily_orders`, `daily_aov`, `top_categories`) — plus **hot-path** `gold.realtime_metrics` (1-min buckets, reconciled from bronze), `gold.anomalies`, and `gold.detector_state` (restart-resumable baseline) written by the Go realtime stack |
+| Streaming | `cmd/producer` replays history (virtual clock, 3-source merge, infinite loops); `cmd/server` runs the bronze-writer + realtime aggregator (Welford/z-score + sigma floor), a retention janitor (enforces 12 h bronze / 3 h bucket budgets), a bronze→realtime reconcile (self-heals redelivery double-counts), and Prometheus `/metrics` |
 | Serving | Go REST API + SSE live stream + gRPC :8090 (live metrics), embedded dashboard with live tiles + anomaly banner |
 | Dashboard | Vanilla JS + Chart.js: KPI cards, daily charts, top categories, 7D/30D/90D/All windows, **live revenue/orders/sessions tiles, anomaly banner, replay-speed badge** |
 
@@ -73,7 +73,7 @@ tiles — all built, tested, and running end to end.
 ├── loader/loader.py          # CSV → MinIO bronze → Postgres bronze.* (COPY + lineage cols)
 ├── dbt/                      # dbt project (profile, macros, sources incl. realtime gold tables)
 ├── api/                      # Go module: cmd/{server,producer,api} + internal/{stream,realtime,
-│                            #   kafka,grpcapi,config,http,metrics,model,store}
+│                            #   kafka,grpcapi,config,http,metrics,model,store,telemetry}
 └── docs/
     ├── phase0.md             # Phase 0 decisions, schema dictionary, metric definitions
     └── phase1.md             # Phase 1 event contract, realtime schema, anomaly detection, ops
@@ -134,8 +134,9 @@ Every push/PR to `main` also runs the full pipeline in CI: `docker compose up -d
 - **Realtime integration tests (`-tags=integration`, live Redpanda + Postgres):**
   a controlled 24-bucket baseline + 15× spike verifies bronze lineage columns,
   exact bucket revenue/orders (canceled orders excluded), `gold.anomalies` spike
-  at `severe` (z ≥ 5) on the exact spike minute, and active-session counts — all
-  through the real producer path.
+  at `severe` (z ≥ 5) on the exact spike minute, active-session counts,
+  `gold.detector_state` snapshot/restore round-trip, and the bronze→realtime
+  reconcile clamping a double-counted bucket — all through the real producer path.
 - **API smoke test:** revenue R$15,739,137.01 · orders 98,206 · AOV R$160.27 ·
   top category `bed_bath_table`; daily series return the full observed range
   (`2016-09-04 → 2018-09-03`); live SSE frames + realtime buckets + anomalies
@@ -156,8 +157,12 @@ Every push/PR to `main` also runs the full pipeline in CI: `docker compose up -d
 | Orders (realtime) | Distinct orders per 1-minute bucket, batch filter |
 | Active sessions | Distinct sessions with a click/cart event in the 1-minute bucket |
 
+Every metric carries a **required `source` field** — `batch` vs `live_replay` —
+so the split is structural, not a prose caveat; the realtime rows above are
+`live_replay` and are **never additive** with the batch totals.
+
 This dictionary is served **programmatically** at `GET /api/v1/metrics`
-(`api/internal/metrics/catalog.go`, versioned — currently **v1.1.0**) — the
+(`api/internal/metrics/catalog.go`, versioned — currently **v1.2.0**) — the
 machine-readable semantic layer that agents should fetch before answering metric
 questions.
 

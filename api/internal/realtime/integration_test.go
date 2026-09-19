@@ -406,6 +406,101 @@ func TestRealtimePipelineEndToEnd(t *testing.T) {
 	if bucketStart != wantSpike {
 		t.Errorf("spike bucket = %s, want %s", bucketStart, wantSpike)
 	}
+
+	// 7. Detector-state persistence: the aggregator saves its online baseline to
+	// gold.detector_state on every flush, so a crash/restart resumes from the
+	// accumulated Welford accumulators instead of re-warming from zero. One row
+	// per realtime metric (revenue / orders) with the raw n/mean/m2 folded in.
+	waitFor(t, 30*time.Second, "detector baseline in gold.detector_state",
+		func() (bool, error) {
+			var n int
+			err := st.pool.QueryRow(ctx, `
+				SELECT count(*) FROM gold.detector_state`).Scan(&n)
+			if err != nil {
+				return false, err
+			}
+			return n >= 1, nil
+		})
+	var dsOrders, dsRevenue float64
+	var dsOrdersN int64
+	if err := st.pool.QueryRow(ctx, `
+		SELECT n, mean FROM gold.detector_state
+		WHERE metric = 'orders'`).Scan(&dsOrdersN, &dsOrders); err != nil {
+		t.Errorf("detector_state orders row: %v", err)
+	} else if dsOrdersN < int64(baselineBuckets) {
+		t.Errorf("orders baseline n = %d, want >= %d buckets folded", dsOrdersN, baselineBuckets)
+	}
+	// The revenue mean is the deterministic grand mean over every closed bucket,
+	// because the aggregator folds the spike bucket into the baseline as soon as
+	// it closes: (baselineBuckets*bucketOrders + spikeOrders)*orderValue / (baselineBuckets+1).
+	wantMean := float64(baselineBuckets*bucketOrders+spikeOrders) * orderValue / float64(baselineBuckets+1)
+	if err := st.pool.QueryRow(ctx, `
+		SELECT mean FROM gold.detector_state WHERE metric = 'revenue'`).
+		Scan(&dsRevenue); err != nil {
+		t.Errorf("detector_state revenue row: %v", err)
+	} else if abs(dsRevenue-wantMean) > wantMean*0.05 {
+		t.Errorf("revenue baseline mean = %.2f, want ~%.2f", dsRevenue, wantMean)
+	}
+
+	// 8. Snapshot → Restore roundtrip: the persisted accumulator state must
+	// round-trip losslessly so Detector.Restore resumes detection at the exact
+	// moment the process left off (the crash-safe resume contract).
+	{
+		states, err := LoadDetectorState(ctx, st.pool)
+		if err != nil {
+			t.Fatalf("load detector state: %v", err)
+		}
+		var d2 Detector
+		d2.Restore(states)
+		if got := d2.Snapshot(); len(got) != len(states) {
+			t.Errorf("restore roundtrip: %d metrics, want %d", len(got), len(states))
+		} else {
+			for i := range got {
+				a, b := got[i], states[i]
+				if a.Metric != b.Metric || a.N != b.N || a.Mean != b.Mean || a.M2 != b.M2 {
+					t.Errorf("restore roundtrip drift on %s: %+v vs %+v", a.Metric, a, b)
+				}
+			}
+		}
+	}
+
+	// 9. Reconcile self-correction is idempotent and preserves anomaly state:
+	// inject a duplicate-counted revenue row (simulating a consumer restart that
+	// folded a redelivered record twice), run Reconcile from bronze, and assert
+	// the gold bucket is recomputed back to bronze's deduplicated truth while the
+	// anomaly_flag on every bucket — including the spike — survives untouched.
+	if _, err := st.pool.Exec(ctx, `
+		UPDATE gold.realtime_metrics SET revenue = revenue + 9876.54
+		WHERE bucket_start = (
+			SELECT min(bucket_start) FROM gold.realtime_metrics
+			WHERE bucket_start >= $1)`, st.markerFrom); err != nil {
+		t.Fatalf("inject duplicate-counted revenue: %v", err)
+	}
+	if err := Reconcile(ctx, st.pool, 60*time.Minute); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	waitFor(t, 30*time.Second, "reconcile self-correction",
+		func() (bool, error) {
+			var bad int
+			err := st.pool.QueryRow(ctx, `
+				SELECT count(*) FROM gold.realtime_metrics
+				WHERE bucket_start >= $1
+				  AND revenue > (orders::numeric * $2::numeric) + 1.0`, st.markerFrom, orderValue).
+				Scan(&bad)
+			if err != nil {
+				return false, err
+			}
+			return bad == 0, nil
+		})
+	// The spike bucket must keep its anomaly_flag after the correction pass.
+	var flagKept bool
+	if err := st.pool.QueryRow(ctx, `
+		SELECT anomaly_flag FROM gold.realtime_metrics
+		WHERE bucket_start = $1`, wantSpike).Scan(&flagKept); err != nil {
+		t.Errorf("spike bucket anomaly_flag read: %v", err)
+	} else if !flagKept {
+		t.Errorf("reconcile dropped anomaly_flag on the spike bucket")
+	}
 }
 
 func abs(v float64) float64 {

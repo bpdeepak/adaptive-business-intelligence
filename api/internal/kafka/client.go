@@ -108,3 +108,56 @@ func TrimTopics(ctx context.Context, seeds []string, topics []string, partitions
 	}
 	return nil
 }
+
+// PartitionLag reports how many records of one topic partition remain unread
+// (end offset − committed offset) for a consumer group.
+type PartitionLag struct {
+	Group     string `json:"group"`
+	Topic     string `json:"topic"`
+	Partition int32  `json:"partition"`
+	Lag       int64  `json:"lag"`
+}
+
+// Lag probes consumer lag for `group` over `topics`: records that exist on the
+// leader but whose offsets the group has not yet committed as processed. A
+// group with no committed offsets reports the full partition as lag. Best
+// effort: partitions that error (unknown topic, no leader) are skipped rather
+// than reported as nonsense, and only a complete probe failure returns an
+// error. This backs the Prometheus abi_consumer_lag gauge.
+func Lag(ctx context.Context, seeds []string, group string, topics []string) ([]PartitionLag, error) {
+	// The admin client carries the group so kadm's OffsetFetch targets the
+	// same coordinator the real consumers use.
+	adminCl, err := kgo.NewClient(kgo.SeedBrokers(seeds...), kgo.ConsumerGroup(group))
+	if err != nil {
+		return nil, fmt.Errorf("kafka admin client: %w", err)
+	}
+	defer adminCl.Close()
+	adm := kadm.NewClient(adminCl)
+
+	committed, err := adm.ListCommittedOffsets(ctx, topics...)
+	if err != nil {
+		return nil, fmt.Errorf("committed offsets (%s): %w", group, err)
+	}
+	end, err := adm.ListEndOffsets(ctx, topics...)
+	if err != nil {
+		return nil, fmt.Errorf("end offsets (%s): %w", group, err)
+	}
+
+	var out []PartitionLag
+	for topic, parts := range end {
+		for p, e := range parts {
+			if e.Err != nil {
+				continue // partition unavailable: skip instead of lying about lag
+			}
+			lag := e.Offset // nothing committed yet → whole partition looks unread
+			if c, ok := committed[topic][p]; ok && c.Err == nil && c.Offset >= 0 {
+				lag = e.Offset - c.Offset
+			}
+			if lag < 0 {
+				lag = 0
+			}
+			out = append(out, PartitionLag{Group: group, Topic: topic, Partition: p, Lag: lag})
+		}
+	}
+	return out, nil
+}

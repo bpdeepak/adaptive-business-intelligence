@@ -108,6 +108,7 @@ func (s *Server) handleRealtimeMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, envelope(map[string]any{
+		"source":  model.SourceLiveReplay, // never additive with batch figures
 		"buckets": buckets,
 	}, start, s.now))
 }

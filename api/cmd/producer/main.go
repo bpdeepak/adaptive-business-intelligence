@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync/atomic"
@@ -26,6 +27,7 @@ import (
 	"abi/internal/kafka"
 	"abi/internal/model"
 	"abi/internal/stream"
+	"abi/internal/telemetry"
 )
 
 // emitted counts successfully produced records (updated from callbacks).
@@ -100,7 +102,28 @@ func run(logger *slog.Logger, cfg config.Config) error {
 
 	go writeLoop(ctx, logger, producer, ring)
 
-	// 4. Periodic stats.
+	// 4. Periodic stats + Prometheus instrumentation. The producer is the only
+	// place that knows how much the ring is shedding, so its /metrics endpoint
+	// is the first stop when dashboards show a data gap.
+	reg := telemetry.NewRegistry()
+	metricsDone := make(chan struct{})
+	go func() {
+		defer close(metricsDone)
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", reg.Handler())
+		msrv := &http.Server{Addr: cfg.MetricsAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = msrv.Shutdown(shutdownCtx)
+		}()
+		logger.Info("metrics listening", "addr", cfg.MetricsAddr)
+		if err := msrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Warn("metrics server failed", "error", err)
+		}
+	}()
+
 	statsDone := make(chan struct{})
 	go func() {
 		defer close(statsDone)
@@ -125,6 +148,33 @@ func run(logger *slog.Logger, cfg config.Config) error {
 		}
 	}()
 
+	// Prometheus deltas are computed against the last sample so the counters
+	// stay monotonic even though the underlying atomics are snapshot reads.
+	go func() {
+		events := reg.Counter("abi_producer_events_total", "Records acknowledged by the broker.")
+		dropped := reg.Counter("abi_producer_dropped_records_total", "Records shed by the ring buffer (drop-oldest backpressure).")
+		buffered := reg.Gauge("abi_producer_buffered_records", "Envelopes currently queued in the ring.")
+		speed := reg.Gauge("abi_replay_speed_multiplier", "Simulated seconds per wall second.")
+		loop := reg.Gauge("abi_replay_loop", "Current replay loop number.")
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		var lastE, lastD uint64
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				e, d := emitted.Load(), ring.Dropped()
+				events.Add(float64(e - lastE))
+				dropped.Add(float64(d - lastD))
+				lastE, lastD = e, d
+				buffered.Set(float64(ring.Len()))
+				speed.Set(cfg.SpeedMultiplier)
+				loop.Set(float64(sim.LoopIndex()))
+			}
+		}
+	}()
+
 	// 5. Replay forever.
 	logger.Info("replay started",
 		"speed_multiplier", cfg.SpeedMultiplier,
@@ -143,6 +193,7 @@ func run(logger *slog.Logger, cfg config.Config) error {
 		logger.Warn("final flush incomplete", "error", err)
 	}
 	<-statsDone
+	<-metricsDone
 	logger.Info("producer stopped",
 		"emitted", emitted.Load(),
 		"dropped", ring.Dropped())

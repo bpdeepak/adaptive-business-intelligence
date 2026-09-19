@@ -33,6 +33,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal error", s.now)
 		return
 	}
+	sum.Source = model.SourceBatch // batch complete-layer totals; never mix with live buckets
 	writeJSON(w, http.StatusOK, envelope(sum, start, s.now))
 }
 

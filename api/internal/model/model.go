@@ -3,6 +3,19 @@ package model
 
 import "time"
 
+// Source labels distinguish batch (historical, complete) totals from the
+// compressed live replay's running 1-minute buckets. They are required on
+// every number-bearing payload so an agent tool layer must deal with the split
+// explicitly instead of relying on prose caveats — adding a live number to a
+// batch total is a category error the contract makes visible.
+const (
+	// SourceBatch marks complete batch-layer aggregates (gold.daily_*).
+	SourceBatch = "batch"
+	// SourceLiveReplay marks the compressed realtime replay buckets
+	// (gold.realtime_metrics). Never additive with batch figures.
+	SourceLiveReplay = "live_replay"
+)
+
 // Summary is the headline set of business metrics for a period.
 type Summary struct {
 	Revenue     float64 `json:"revenue"`
@@ -10,6 +23,8 @@ type Summary struct {
 	AOV         float64 `json:"aov"`
 	Customers   int     `json:"customers"`
 	TopCategory string  `json:"top_category"`
+	// Source is always "batch" on the summary endpoint.
+	Source string `json:"source,omitempty"`
 	// DataStart / DataEnd bound the observed dailies (data range of the dataset).
 	DataStart string `json:"data_start"`
 	DataEnd   string `json:"data_end"`

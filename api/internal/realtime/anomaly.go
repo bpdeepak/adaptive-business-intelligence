@@ -1,6 +1,9 @@
 package realtime
 
-import "math"
+import (
+	"math"
+	"sort"
+)
 
 // Severity levels for detected anomalies.
 const (
@@ -8,9 +11,28 @@ const (
 	SeveritySevere  = "severe"
 )
 
-// Welford is an online mean/variance accumulator (Welford's algorithm). It lets
-// the aggregator classify each new closed bucket against the distribution seen
-// so far without keeping the whole series in memory.
+// Severity escalation is driven by a "sigma floor" applied inside the z-score
+// computation (not clamped post-hoc): the sample sigma floored to the larger of
+// an absolute floor and a relative fraction of the baseline magnitude. A quiet,
+// zero-variance baseline (repeated identical closed buckets) then yields
+// large-but-finite z-scores for real divergence instead of ±Inf, which the old
+// code turned into a false "severe" on literally every quiet stretch.
+const (
+	sigmaFloorAbs = 1e-2 // absolute floor in the metric's own units
+	sigmaFloorRel = 5e-2 // relative floor: 5% of the baseline magnitude
+)
+
+// MetricState is a serialisable snapshot of one metric's accumulator.
+type MetricState struct {
+	Metric string  `json:"metric"`
+	N      int64   `json:"n"`
+	Mean   float64 `json:"mean"`
+	M2     float64 `json:"m2"`
+}
+
+// Welford is an online accumulator of mean/variance via Welford's algorithm. It
+// classifies each new closed bucket against the distribution seen so far
+// without keeping the series in memory.
 type Welford struct {
 	n        int
 	mean, m2 float64
@@ -28,52 +50,68 @@ func (w *Welford) Add(x float64) {
 	w.m2 += delta * (x - w.mean)
 }
 
-// N returns the number of observations fed so far.
+// N returns the number of observations folded in.
 func (w *Welford) N() int { return w.n }
 
-// Mean returns the running mean (0 when nothing observed yet).
+// Mean returns the running mean.
 func (w *Welford) Mean() float64 { return w.mean }
 
 // Sigma returns the sample standard deviation and whether it is computable
-// (requires at least 2 observations).
+// (n >= 2). The z-score floor lives in Z, never here, so the accumulator's raw
+// statistics stay exact online (mean/variance) for persistence round-trips.
 func (w *Welford) Sigma() (float64, bool) {
 	if w.n < 2 {
 		return 0, false
 	}
+	// Sample variance: m2/(n-1). Welford's dais (not the test) wants sample.
 	return math.Sqrt(w.m2 / float64(w.n-1)), true
 }
 
-// Z returns the z-score of x against the running distribution. ok is false
-// until a stable baseline exists (n >= 2). A zero-variance baseline yields
-// ±Inf for any difference from the mean (a constant series never shifts).
+// Z returns the z-score of observed against the running baseline. ok is false
+// until a stable baseline exists (n >= 2). The baseline's sample sigma is
+// floored (sigmaFloorAbs/Rel) inside the score so a zero-variance baseline
+// yields a large-but-finite score for real divergence instead of ±Inf for
+// literally any divergence (which old code escalated to a false "severe" on
+// every quiet stretch). The floor is applied pre-scoring, never post-hoc.
 func (w *Welford) Z(x float64) (float64, bool) {
 	if w.n < 2 {
 		return 0, false
 	}
-	s := math.Sqrt(w.m2 / float64(w.n-1))
-	if s == 0 {
-		if x == w.mean {
-			return 0, false
-		}
-		if x > w.mean {
-			return math.Inf(1), true
-		}
-		return math.Inf(-1), true
+	s, _ := w.Sigma()
+	floor := math.Max(sigmaFloorAbs, math.Abs(w.mean)*sigmaFloorRel)
+	if s < floor {
+		s = floor
 	}
 	return (x - w.mean) / s, true
 }
 
-// Detector evaluates a metric's newest closed bucket against its online
-// baseline. It never flags the warm-up window, so the first loop doesn't spam
-// anomalies before a baseline exists.
+// Snapshot captures the persistent state of this accumulator. The metric is
+// carried on the state so it round-trips through storage on its own.
+func (w *Welford) Snapshot(metric string) MetricState {
+	return MetricState{
+		Metric: metric,
+		N:      int64(w.n),
+		Mean:   w.mean,
+		M2:     w.m2,
+	}
+}
+
+// Result of one detector evaluation.
+type Result struct {
+	Triggered bool
+	Z         float64
+	Expected  float64
+	Count     int
+	Severity  string
+}
+
+// Detector flags each new closed bucket that deviates from its online baseline
+// by more than Threshold standard deviations, escalating severity with the
+// magnitude of the deviation.
 type Detector struct {
-	// Warmup is the minimum number of closed buckets required before any
-	// anomaly can be raised.
-	Warmup int
-	// Threshold is the |z| above which an anomaly is raised.
+	Warmup    int
 	Threshold float64
-	// SevereZ is the |z| at which severity escalates to "severe".
-	SevereZ float64
+	SevereZ   float64
 
 	stats map[string]*Welford
 }
@@ -81,56 +119,72 @@ type Detector struct {
 // NewDetector builds a detector with sensible defaults.
 func NewDetector() *Detector {
 	return &Detector{
-		Warmup:    20, // 20 minutes of baseline before flagging
+		Warmup:    20,
 		Threshold: 3.0,
 		SevereZ:   5.0,
 		stats:     make(map[string]*Welford),
 	}
 }
 
-// Result is whether an observation triggered, and with what severity.
-type Result struct {
-	Triggered bool
-	Z         float64
-	Expected  float64
-	Severity  string
-	Count     int // baseline count used
-}
-
-// Evaluate scores `observed` for `metric` against the baseline accumulated so
-// far (the observation is NOT allowed to dilute its own outlier score — z is
-// computed before it is folded in). The observation is then added to the
-// baseline so the detector stays adaptive to trend shifts; a sustained shift
-// will keep firing until the baseline catches up.
+// Evaluate folds a closed bucket's observed value into the running baseline and
+// reports whether it deviates. During warm-up (fewer than Warmup observations)
+// the detector accumulates but never flags; the observed value is only ever
+// classified against the baseline *seen before* that observation so a spike
+// cannot dilute itself.
 func (d *Detector) Evaluate(metric string, observed float64) Result {
 	w := d.stats[metric]
 	if w == nil {
 		w = &Welford{}
 		d.stats[metric] = w
 	}
-	expected := w.Mean()
-	z, zok := w.Z(observed) // pre-add: baseline cannot dilute this observation
+	res := Result{Expected: w.Mean(), Count: w.N()}
+	if z, ok := w.Z(observed); ok && w.N() >= d.Warmup {
+		res.Z = z
+		if math.Abs(z) >= d.Threshold && math.Abs(z) >= d.SevereZ {
+			res.Triggered = true
+			res.Severity = SeveritySevere
+		} else if math.Abs(z) >= d.Threshold {
+			res.Triggered = true
+			res.Severity = SeverityWarning
+		}
+	}
 	w.Add(observed)
+	return res
+}
 
-	if w.N() <= d.Warmup {
-		return Result{Expected: expected, Count: w.N()}
+// Snapshot serialises every metric's accumulator, sorted by metric for
+// determinism. Safe on a zero-value Detector.
+func (d *Detector) Snapshot() []MetricState {
+	if d.stats == nil {
+		return nil
 	}
-	if !zok {
-		return Result{Expected: expected, Count: w.N()}
+	names := make([]string, 0, len(d.stats))
+	for m := range d.stats {
+		names = append(names, m)
 	}
-	abs := math.Abs(z)
-	if abs < d.Threshold {
-		return Result{Expected: expected, Count: w.N()}
+	sort.Strings(names)
+	out := make([]MetricState, 0, len(names))
+	for _, m := range names {
+		out = append(out, d.stats[m].Snapshot(m))
 	}
-	r := Result{
-		Triggered: true,
-		Z:         z,
-		Expected:  expected,
-		Count:     w.N(),
-		Severity:  SeverityWarning,
+	return out
+}
+
+// Restore seeds the accumulators from a saved snapshot. Safe on a zero-value
+// Detector (nil stats map) so a caller that never ran Evaluate can still resume
+// from persisted state — same nil-safe contract as Evaluate.
+func (d *Detector) Restore(states []MetricState) {
+	if d.stats == nil {
+		d.stats = make(map[string]*Welford)
 	}
-	if abs >= d.SevereZ {
-		r.Severity = SeveritySevere
+	for _, st := range states {
+		w := d.stats[st.Metric]
+		if w == nil {
+			w = &Welford{}
+			d.stats[st.Metric] = w
+		}
+		w.n = int(st.N)
+		w.mean = st.Mean
+		w.m2 = st.M2
 	}
-	return r
 }

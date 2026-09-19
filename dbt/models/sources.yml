@@ -42,7 +42,8 @@ sources:
           Verbatim streaming events recorded by the Phase 1 realtime stack
           (bronze-writer consumer). Every row is one Kafka envelope with lineage
           columns (_source_file = 'stream:<topic>', _batch_id = replay loop id)
-          and Kafka coordinates. Written by api/internal/realtime, retained 12h.
+          and Kafka coordinates. Written by api/internal/realtime; retained 12h,
+          enforced by the server's retention janitor (realtime.Retention).
         loaded_at_field: _loaded_at
         freshness:
           warn_after:
@@ -52,7 +53,8 @@ sources:
         description: >-
           Restricted synthetic bot-training labels (ecommerce.internal.training_labels
           topic). Never served to production consumers; Phase 2 trains against it.
-          Written by api/internal/realtime, retained with stream_events.
+          Written by api/internal/realtime; deliberately NEVER pruned (the Phase 2
+          training corpus grows with sessions per loop, not event volume).
         loaded_at_field: recorded_at
 
   - name: gold
@@ -75,3 +77,9 @@ sources:
           process). Status lifecycle: open -> resolved | dismissed. Written by
           api/internal/realtime.
         loaded_at_field: detected_at
+      - name: detector_state
+        description: >-
+          Online Welford accumulators (n, mean, m2 per metric) snapshotted by
+          the aggregator after every flush so a restarted cmd/server resumes the
+          anomaly baseline instead of re-warming. Written by api/internal/realtime.
+        loaded_at_field: updated_at

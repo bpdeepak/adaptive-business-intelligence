@@ -2,6 +2,7 @@ package realtime
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"abi/internal/model"
 )
@@ -14,6 +15,9 @@ type Broadcaster struct {
 	nextID int64
 	subs   map[int64]chan model.MetricsUpdate
 	last   model.MetricsUpdate
+
+	pushes atomic.Uint64
+	drops  atomic.Uint64
 }
 
 // NewBroadcaster creates an empty broadcaster.
@@ -45,6 +49,7 @@ func (b *Broadcaster) Publish(u model.MetricsUpdate) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.last = u
+	b.pushes.Add(1)
 	for id, ch := range b.subs {
 		select {
 		case ch <- u:
@@ -52,6 +57,7 @@ func (b *Broadcaster) Publish(u model.MetricsUpdate) {
 			// Slow consumer: drop this update; it will resync from the
 			// snapshot/DB on the next update or on reconnect.
 			_ = id
+			b.drops.Add(1)
 		}
 	}
 }
@@ -62,3 +68,16 @@ func (b *Broadcaster) Last() model.MetricsUpdate {
 	defer b.mu.Unlock()
 	return b.last
 }
+
+// Subscribers returns the number of live registered subscribers.
+func (b *Broadcaster) Subscribers() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.subs)
+}
+
+// Pushes returns the total number of updates published.
+func (b *Broadcaster) Pushes() uint64 { return b.pushes.Load() }
+
+// Drops returns the total number of updates dropped for slow subscribers.
+func (b *Broadcaster) Drops() uint64 { return b.drops.Load() }

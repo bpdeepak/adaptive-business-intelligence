@@ -222,6 +222,9 @@ func (s *Simulator) allExhausted() bool {
 // Loop returns the current loop id (e.g. "l0").
 func (s *Simulator) Loop() string { return fmt.Sprintf("l%d", s.loopIdx) }
 
+// LoopIndex returns the current zero-based replay loop number.
+func (s *Simulator) LoopIndex() int { return s.loopIdx }
+
 // Rate returns the configured simulated-seconds-per-wall-second.
 func (s *Simulator) Rate() float64 { return s.cfg.Rate }
 
