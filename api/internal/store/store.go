@@ -15,4 +15,9 @@ type Store interface {
 	RevenueDaily(ctx context.Context, from, to *time.Time) ([]model.SeriesPoint, error)
 	OrdersDaily(ctx context.Context, from, to *time.Time) ([]model.OrderSeriesPoint, error)
 	TopCategories(ctx context.Context, metric string, limit int) ([]model.Category, error)
+
+	// Realtime (Phase 1) surface backed by gold.realtime_metrics/anomalies.
+	RecentRealtimeMetrics(ctx context.Context, n int) ([]model.RealtimeBucket, error)
+	OpenAnomalies(ctx context.Context) ([]model.Anomaly, error)
+	DismissAnomaly(ctx context.Context, id int64) error
 }

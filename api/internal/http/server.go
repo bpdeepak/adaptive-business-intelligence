@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"abi/internal/realtime"
 	"abi/internal/store"
 )
 
@@ -20,13 +21,22 @@ type Server struct {
 	log   *slog.Logger
 	now   func() time.Time
 	mux   *http.ServeMux
+	// live is optional: when attached, SSE + realtime endpoints activate.
+	live *realtime.LiveFeed
 }
 
-// New builds a Server around a Store.
+// New builds a Server around a Store. Realtime endpoints register but return
+// 503 until AttachLive is called (kept nil in tests).
 func New(store store.Store, log *slog.Logger) *Server {
 	s := &Server{store: store, log: log, now: time.Now}
 	s.mux = s.routes()
 	return s
+}
+
+// AttachLive activates the SSE / anomalies endpoints for a running realtime
+// stack. Safe to call once, before serving.
+func (s *Server) AttachLive(live *realtime.LiveFeed) {
+	s.live = live
 }
 
 func (s *Server) routes() *http.ServeMux {
@@ -43,6 +53,12 @@ func (s *Server) routes() *http.ServeMux {
 	mux.Handle("GET /api/v1/revenue/daily", s.middleware(s.handleRevenueDaily))
 	mux.Handle("GET /api/v1/orders/daily", s.middleware(s.handleOrdersDaily))
 	mux.Handle("GET /api/v1/categories/top", s.middleware(s.handleTopCategories))
+
+	// Phase 1 realtime surface.
+	mux.Handle("GET /api/v1/stream/metrics", s.middleware(s.handleMetricsStream))
+	mux.Handle("GET /api/v1/realtime/metrics", s.middleware(s.handleRealtimeMetrics))
+	mux.Handle("GET /api/v1/anomalies", s.middleware(s.handleAnomalies))
+	mux.Handle("POST /api/v1/anomalies/{id}/dismiss", s.middleware(s.handleDismissAnomaly))
 	return mux
 }
 

@@ -1,4 +1,4 @@
-/* ABI dashboard — Phase 0 */
+/* ABI dashboard — batch (Phase 0) + live replay (Phase 1) */
 "use strict";
 
 const state = {
@@ -175,5 +175,202 @@ document.querySelectorAll("#range button").forEach((btn) => {
 });
 
 document.getElementById("refresh").addEventListener("click", load);
+
+/* ------------------------------------------------------------------ */
+/* Phase 1 · live replay tiles (SSE)                                  */
+/* ------------------------------------------------------------------ */
+
+const live = {
+  buckets: [], // recent 1-minute buckets (ascending) for the sparkline
+  anomaly: null,
+  es: null,
+  updated: false, // true once the stream pushes data
+};
+
+function liveChart() {
+  return ensureChart("chartLive", {
+    type: "line",
+    data: {
+      labels: [],
+      datasets: [
+        {
+          label: "Revenue (BRL)",
+          data: [],
+          borderColor: PALETTE[1],
+          backgroundColor: "rgba(86,211,100,0.12)",
+          fill: true,
+          tension: 0.3,
+          pointRadius: 0,
+          spanGaps: true,
+        },
+        {
+          label: "Orders",
+          data: [],
+          borderColor: PALETTE[0],
+          borderDash: [4, 4],
+          pointRadius: 0,
+          yAxisID: "y2",
+        },
+      ],
+    },
+    options: {
+      ...chartDefaults(),
+      scales: {
+        ...chartDefaults().scales,
+        y2: {
+          position: "right",
+          grid: { drawOnChartArea: false },
+          ticks: { color: "#8b949e" },
+        },
+      },
+      plugins: { legend: { labels: { color: "#8b949e", boxWidth: 12 } } },
+    },
+  });
+}
+
+function renderLive(u) {
+  const section = document.getElementById("liveSection");
+  if (section && section.hidden) section.hidden = false;
+
+  const cur = u.current || {};
+  const badge = document.getElementById("liveBadge");
+
+  const at = cur.bucket_start ? `${cur.bucket_start} UTC` : "—";
+  document.getElementById("liveRevenue").textContent =
+    cur.bucket_start ? BRL.format(cur.revenue || 0) : "—";
+  document.getElementById("liveRevenueAt").textContent = at;
+  document.getElementById("liveOrders").textContent =
+    cur.bucket_start ? NUM.format(cur.orders || 0) : "—";
+  document.getElementById("liveOrdersAt").textContent = at;
+  document.getElementById("liveSessions").textContent =
+    cur.bucket_start ? NUM.format(cur.active_sessions || 0) : "—";
+  document.getElementById("liveSpeed").textContent =
+    `speed ×${NUM.format(u.speed_multiplier || 0)} · ${u.status || "replay"}`;
+  document.getElementById("liveState").textContent = `(${u.status || "replay"})`;
+
+  badge.textContent = cur.bucket_start ? "live" : "warming up";
+  badge.classList.toggle("offline", !cur.bucket_start);
+  badge.classList.toggle("ok", !!cur.bucket_start);
+
+  // Snapshots arrive on the first push; afterwards only `current` streams.
+  if (u.snapshot && u.snapshot.length) {
+    live.buckets = u.snapshot.slice(-60);
+  } else if (cur.bucket_start) {
+    const last = live.buckets[live.buckets.length - 1];
+    const curStart = new Date(cur.bucket_start).getTime();
+    const lastStart = last ? new Date(last.bucket_start).getTime() : null;
+    if (lastStart === curStart) {
+      live.buckets[live.buckets.length - 1] = cur;
+    } else {
+      live.buckets.push(cur);
+      if (live.buckets.length > 60) live.buckets.shift();
+    }
+  }
+
+  const chart = liveChart();
+  if (chart) {
+    chart.data.labels = live.buckets.map((b) => b.bucket_start.slice(11, 16));
+    chart.data.datasets[0].data = live.buckets.map((b) => b.revenue);
+    chart.data.datasets[1].data = live.buckets.map((b) => b.orders);
+    chart.update();
+  }
+
+  if (u.anomaly) {
+    showAnomaly(u.anomaly);
+  }
+}
+
+function showAnomaly(a) {
+  live.anomaly = a;
+  const banner = document.getElementById("anomalyBanner");
+  banner.hidden = false;
+  document.getElementById("anomalyTitle").textContent =
+    `${a.metric} anomaly (${a.severity})`;
+  document.getElementById("anomalyDetail").textContent =
+    `bucket ${a.bucket_start} · observed ${BRL.format(a.observed)} vs expected ${BRL.format(a.expected)} · z=${a.z_score.toFixed(2)}`;
+}
+
+async function refreshOpenAnomalies() {
+  try {
+    const res = await fetch("/api/v1/anomalies");
+    if (!res.ok) return;
+    const env = await res.json();
+    const list = env.data || [];
+    if (list.length) showAnomaly(list[0]);
+  } catch {
+    /* offline — banner stays hidden */
+  }
+}
+
+async function connectLive() {
+  const section = document.getElementById("liveSection");
+  const badge = document.getElementById("liveBadge");
+
+  // First paint from the REST read surface (no SSE dependency).
+  try {
+    const res = await fetch("/api/v1/realtime/metrics?limit=60");
+    if (res.ok) {
+      const env = await res.json();
+      const buckets = (env.data && env.data.buckets) || [];
+      if (buckets.length) {
+        section.hidden = false;
+        live.buckets = buckets;
+        renderLive({
+          current: buckets[buckets.length - 1],
+          snapshot: buckets,
+          speed_multiplier: 0,
+          status: "replay",
+        });
+      }
+    }
+  } catch {
+    /* server not up yet */
+  }
+
+  // Then subscribe to the SSE stream for continuous updates.
+  if (live.es) {
+    live.es.close();
+    live.es = null;
+  }
+  badge.textContent = "connecting…";
+  badge.classList.add("offline");
+  badge.classList.remove("ok");
+
+  const es = new EventSource("/api/v1/stream/metrics");
+  live.es = es;
+
+  es.addEventListener("metrics", (ev) => {
+    try {
+      renderLive(JSON.parse(ev.data));
+    } catch (err) {
+      console.warn("bad live frame", err);
+    }
+  });
+  es.addEventListener("open", () => {
+    badge.textContent = "connected";
+    badge.classList.remove("offline");
+  });
+  es.onerror = () => {
+    badge.textContent = "offline";
+    badge.classList.add("offline");
+    badge.classList.remove("ok");
+  };
+}
+
+document.getElementById("dismissAnomaly").addEventListener("click", async () => {
+  if (!live.anomaly || !live.anomaly.id) return;
+  try {
+    const res = await fetch(`/api/v1/anomalies/${live.anomaly.id}/dismiss`, { method: "POST" });
+    if (res.ok) {
+      live.anomaly = null;
+      document.getElementById("anomalyBanner").hidden = true;
+    }
+  } catch {
+    /* keep banner on failure */
+  }
+});
+
+connectLive();
+refreshOpenAnomalies();
 
 load();

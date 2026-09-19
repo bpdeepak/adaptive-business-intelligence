@@ -43,15 +43,18 @@ Write-Host "==> Generating dbt docs"
 uv run dbt docs generate --project-dir dbt --profiles-dir dbt
 if ($LASTEXITCODE -ne 0) { throw "dbt docs failed" }
 
-Write-Host "==> Building Go API"
+Write-Host "==> Building Go binaries (server + producer)"
 Push-Location api
-go build -o bin/api ./cmd/api
-if ($LASTEXITCODE -ne 0) { Pop-Location; throw "go build failed" }
+go build -o bin/server.exe ./cmd/server
+if ($LASTEXITCODE -ne 0) { Pop-Location; throw "server build failed" }
+go build -o bin/producer.exe ./cmd/producer
+if ($LASTEXITCODE -ne 0) { Pop-Location; throw "producer build failed" }
 Pop-Location
 
 Write-Host ""
-Write-Host "Phase 0 pipeline ready."
-Write-Host "  Dashboard/API : scripts/run_api.ps1  -> http://localhost:8080"
+Write-Host "Phase 1 pipeline ready."
+Write-Host "  Dashboard/API : scripts/run_api.ps1  -> http://localhost:8080 (SSE live + gRPC :8090)"
+Write-Host "  Replay        : scripts/run_producer.ps1  (SPEED_MULTIPLIER=2880 -> 1 day ~= 30s)"
 Write-Host "  Smoke test    : scripts/smoke_test.ps1"
 Write-Host "  MinIO console : http://localhost:9001  (minioadmin / minioadmin)"
 Write-Host "  dbt docs      : dbt/target/index.html"

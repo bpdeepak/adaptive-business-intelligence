@@ -45,15 +45,17 @@ uv run dbt build --project-dir dbt --profiles-dir dbt
 echo "==> Generating dbt docs"
 uv run dbt docs generate --project-dir dbt --profiles-dir dbt
 
-echo "==> Building Go API"
+echo "==> Building Go binaries (server + producer)"
 (
   cd api
-  go build -o bin/api ./cmd/api
+  go build -o bin/server ./cmd/server
+  go build -o bin/producer ./cmd/producer
 )
 
 echo ""
-echo "Phase 0 pipeline ready."
-echo "  Dashboard/API : (cd api && go run ./cmd/api) -> http://localhost:8080"
+echo "Phase 1 pipeline ready."
+echo "  Dashboard/API : bin/server -> http://localhost:8080 (SSE live + gRPC :8090)"
+echo "  Replay        : bin/producer (SPEED_MULTIPLIER=2880 -> 1 day ≈ 30s)"
 echo "  Smoke test    : bash scripts/smoke_check.sh"
 echo "  MinIO console : http://localhost:9001  (minioadmin / minioadmin)"
 echo "  dbt docs      : dbt/target/index.html"

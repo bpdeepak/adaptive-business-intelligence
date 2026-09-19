@@ -27,8 +27,8 @@ type Catalog struct {
 }
 
 // Version is bumped whenever a definition changes. Keep it in sync with the
-// `Metric definitions` table in docs/phase0.md (section 4).
-const Version = "1.0.0"
+// `Metric definitions` table in docs/phase0.md (section 4) and docs/phase1.md.
+const Version = "1.1.0"
 
 // Default returns the Phase 0 catalog.
 func Default() Catalog {
@@ -157,6 +157,55 @@ func Default() Catalog {
 					"Not yet exposed on an endpoint — available in the gold model for Phase 2+ questions.",
 				},
 			},
+			{
+				Name:        "revenue_realtime",
+				Label:       "Revenue — live (1-min bucket)",
+				Description: "Revenue in the current 1-minute streaming bucket; identical population to `revenue` but bucketed by event time.",
+				Population:  "orders with order_status NOT IN ('canceled','unavailable') AND payment_value_total > 0 (replayed)",
+				Grain:       "1-minute bucket (bucket_start)",
+				DateField:   "bucket_start",
+				Aggregation: "SUM(payment_value_total) per bucket",
+				Unit:        "BRL",
+				SourceTable: "gold.realtime_metrics",
+				Tags:        []string{"kpi", "money", "realtime"},
+				Notes: []string{
+					"Same revenue filter as the batch metric — but computed on replayed order events, bucketed by the event's occurred_at minute.",
+					"Live means compressed replay: the whole dataset is replayed ~1 day per 30 seconds (SPEED_MULTIPLIER)," + " so a \"minute\" of data is a fraction of a wall second. Do NOT add realtime values to batch totals.",
+					"Buckets are upserted every 5 seconds; a bucket may still grow within its minute window.",
+				},
+			},
+			{
+				Name:        "orders_realtime",
+				Label:       "Orders — live (1-min bucket)",
+				Description: "Distinct non-lost orders in the current 1-minute streaming bucket.",
+				Population:  "orders with order_status NOT IN ('canceled','unavailable') AND payment_value_total > 0 (replayed)",
+				Grain:       "1-minute bucket (bucket_start)",
+				DateField:   "bucket_start",
+				Aggregation: "COUNT(DISTINCT order_id) per bucket",
+				Unit:        "count",
+				SourceTable: "gold.realtime_metrics",
+				Tags:        []string{"kpi", "count", "realtime"},
+				Notes: []string{
+					"Aligned to the revenue_realtime population; lost orders are excluded by construction.",
+					"Anomaly detection runs on this metric after each closed bucket.",
+				},
+			},
+			{
+				Name:        "active_sessions",
+				Label:       "Active sessions — live (1-min bucket)",
+				Description: "Distinct browsing sessions with at least one click event in the bucket.",
+				Population:  "sessions with ≥1 page.view/cart.abandoned event (replayed, includes synthetic bot traffic)",
+				Grain:       "1-minute bucket (bucket_start)",
+				DateField:   "bucket_start",
+				Aggregation: "COUNT(DISTINCT session_id) per bucket",
+				Unit:        "count",
+				SourceTable: "gold.realtime_metrics",
+				Tags:        []string{"kpi", "traffic", "realtime"},
+				Notes: []string{
+					"Counts ALL sessions (human + synthetic bots). Bot ground truth lives in the restricted ecommerce.internal.training_labels topic / bronze.training_ground_truth, never in the clickstream.",
+					"Only for estimating concurrent/converting traffic pressure; not comparable to customers.",
+				},
+			},
 		},
 		Notes: []string{
 			"Dataset: Olist Brazilian E-Commerce, 2016-09-04 → 2018-09-03 (purchase dates).",
@@ -164,6 +213,7 @@ func Default() Catalog {
 			"The source contains 3 customers with empty city/state ('unidentified'); they are flagged is_identified=false but not excluded.",
 			"Geo data (bronze.geolocation, 1,000,163 rows) is landed but not staged in Phase 0.",
 			"Errata: summary's aov/counts describe the paying, non-lost population; daily_orders.total describes all orders. Always check the population field of a metric before combining metrics.",
+			"Realtime metrics (Phase 1) describe a compressed REPLAY of the same orders; they are bounded to their own gold.realtime_metrics table and are never added to the batch gold.daily_* totals.",
 		},
 	}
 }

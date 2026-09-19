@@ -37,3 +37,41 @@ sources:
       - name: geolocation
         description: Olist geolocation dataset (raw text). Not staged in Phase 0.
         loaded_at_field: _loaded_at
+      - name: stream_events
+        description: >-
+          Verbatim streaming events recorded by the Phase 1 realtime stack
+          (bronze-writer consumer). Every row is one Kafka envelope with lineage
+          columns (_source_file = 'stream:<topic>', _batch_id = replay loop id)
+          and Kafka coordinates. Written by api/internal/realtime, retained 12h.
+        loaded_at_field: _loaded_at
+        freshness:
+          warn_after:
+            count: 24
+            period: hour
+      - name: training_ground_truth
+        description: >-
+          Restricted synthetic bot-training labels (ecommerce.internal.training_labels
+          topic). Never served to production consumers; Phase 2 trains against it.
+          Written by api/internal/realtime, retained with stream_events.
+        loaded_at_field: recorded_at
+
+  - name: gold
+    description: >-
+      Serving layer. Batch tables are built by dbt mart models; the realtime
+      gold tables below are written by the Go realtime stack (api/internal/realtime)
+      and declared here as sources so dbt lineage/tests can see them.
+    database: "{{ target.database }}"
+    schema: gold
+    tables:
+      - name: realtime_metrics
+        description: >-
+          1-minute hot metrics buckets (revenue, orders, active_sessions) computed
+          by the realtime aggregator. Separate from the batch gold.daily_* tables
+          so streaming writes never contend with batch reads. Retained 3h.
+        loaded_at_field: updated_at
+      - name: anomalies
+        description: >-
+          Detected anomalies from the online EWMA/z-score detector (aggregator
+          process). Status lifecycle: open -> resolved | dismissed. Written by
+          api/internal/realtime.
+        loaded_at_field: detected_at

@@ -1,0 +1,203 @@
+// Command server is the Phase 1 realtime runtime: it runs the bronze-writer
+// and realtime aggregator (with in-process anomaly detection) on Redpanda,
+// persists to Postgres, and serves the REST/SSE dashboard plus the gRPC live
+// metrics stream. It replaces cmd/api as the always-on process.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
+
+	"abi/internal/config"
+	grpcapi "abi/internal/grpcapi"
+	metricsv1 "abi/internal/grpcapi/metricsv1"
+	httpapi "abi/internal/http"
+	"abi/internal/kafka"
+	"abi/internal/model"
+	"abi/internal/realtime"
+	"abi/internal/store"
+	"abi/internal/stream"
+)
+
+func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
+	if err := run(logger, config.FromEnv()); err != nil {
+		logger.Error("server fatal", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(logger *slog.Logger, cfg config.Config) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// 1. Postgres + realtime schema.
+	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect to postgres: %w", err)
+	}
+	defer pool.Close()
+
+	if err := realtime.EnsureSchema(ctx, pool); err != nil {
+		return err
+	}
+	logger.Info("realtime schema ensured")
+
+	st, err := store.NewPostgresStore(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect store: %w", err)
+	}
+	defer st.Close()
+
+	// 2. Kafka clients.
+	anomPub, err := kafka.Producer(cfg.KafkaSeedBrokers)
+	if err != nil {
+		return fmt.Errorf("anomaly producer: %w", err)
+	}
+	defer anomPub.Close()
+
+	bronzeCl, err := kafka.Consumer(cfg.KafkaSeedBrokers, cfg.ConsumerGroupBronze, stream.AllTopics)
+	if err != nil {
+		return fmt.Errorf("bronze consumer: %w", err)
+	}
+	defer bronzeCl.Close()
+
+	rtCl, err := kafka.Consumer(cfg.KafkaSeedBrokers, cfg.ConsumerGroupRT,
+		[]string{stream.TopicOrders, stream.TopicClicks})
+	if err != nil {
+		return fmt.Errorf("rt consumer: %w", err)
+	}
+	defer rtCl.Close()
+
+	// 3. Broadcaster + live feed, seeded with the stored snapshot so SSE/gRPC
+	// clients render immediately on connect.
+	bc := realtime.NewBroadcaster()
+	feed := realtime.NewLiveFeed(bc, cfg.SpeedMultiplier, "replay")
+	seedBroadcaster(ctx, bc, feed, st)
+
+	// 4. Consumers.
+	writer := realtime.NewBronzeWriter(pool, bronzeCl, "server-uuid-"+time.Now().Format("20060102-150405"), logger)
+	aggregator := realtime.NewAggregator(pool, rtCl, anomPub, bc, cfg.SpeedMultiplier, "replay", logger)
+
+	// 5. HTTP (REST + SSE + dashboard).
+	srv := httpapi.New(st, logger)
+	srv.AttachLive(feed)
+	httpSrv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           srv,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// 6. gRPC (live metrics stream).
+	grpcSrv := grpc.NewServer()
+	metricsv1.RegisterMetricsServiceServer(grpcSrv, grpcapi.New(feed, logger))
+	reflection.Register(grpcSrv)
+	grpcLis, err := net.Listen("tcp", cfg.GRPCAddr)
+	if err != nil {
+		return fmt.Errorf("grpc listen: %w", err)
+	}
+
+	// 7. Retention janitor.
+	retentionCtx, retentionCancel := context.WithCancel(ctx)
+	defer retentionCancel()
+	go retentionLoop(retentionCtx, logger, pool, cfg)
+
+	errCh := make(chan error, 4)
+	go func() {
+		logger.Info("http + SSE listening", "addr", cfg.HTTPAddr)
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("http: %w", err)
+		}
+	}()
+	go func() {
+		logger.Info("gRPC listening", "addr", cfg.GRPCAddr)
+		if err := grpcSrv.Serve(grpcLis); err != nil {
+			errCh <- fmt.Errorf("grpc: %w", err)
+		}
+	}()
+	go func() {
+		logger.Info("bronze-writer consuming", "group", cfg.ConsumerGroupBronze)
+		if err := writer.Run(ctx); err != nil {
+			errCh <- fmt.Errorf("bronze-writer: %w", err)
+		}
+	}()
+	go func() {
+		logger.Info("aggregator consuming", "group", cfg.ConsumerGroupRT)
+		if err := aggregator.Run(ctx); err != nil {
+			errCh <- fmt.Errorf("aggregator: %w", err)
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		cancel()
+		return err
+	case <-ctx.Done():
+		logger.Info("shutting down")
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer shutdownCancel()
+	_ = httpSrv.Shutdown(shutdownCtx)
+	grpcSrv.GracefulStop()
+	logger.Info("server stopped")
+	return nil
+}
+
+// seedBroadcaster publishes the stored recent buckets as the broadcaster's
+// initial snapshot so a fresh SSE/gRPC client gets data immediately.
+func seedBroadcaster(ctx context.Context, bc *realtime.Broadcaster, feed *realtime.LiveFeed, st *store.PostgresStore) {
+	buckets, err := st.RecentRealtimeMetrics(ctx, 60)
+	if err != nil {
+		slog.Default().Warn("seed snapshot failed", "error", err)
+		return
+	}
+	if len(buckets) == 0 {
+		return
+	}
+	last := buckets[len(buckets)-1]
+	bc.Publish(model.MetricsUpdate{
+		Snapshot:        buckets,
+		Current:         last,
+		SpeedMultiplier: feed.SpeedMultiplier(),
+		Status:          feed.Status(),
+	})
+}
+
+// retentionLoop periodically trims the streaming tables back to their budgets.
+func retentionLoop(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, cfg config.Config) {
+	keep, err1 := time.ParseDuration(cfg.RetentionKeep)
+	bucketKeep, err2 := time.ParseDuration(cfg.RetentionBucketKeep)
+	if err1 != nil || err2 != nil {
+		logger.Warn("retention durations invalid; using defaults", "err1", err1, "err2", err2)
+		keep, bucketKeep = 12*time.Hour, 3*time.Hour
+	}
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := realtime.Retention(ctx, pool, keep, bucketKeep); err != nil {
+				logger.Warn("retention purge failed", "error", err)
+			}
+		}
+	}
+}

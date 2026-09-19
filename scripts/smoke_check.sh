@@ -1,39 +1,58 @@
 #!/usr/bin/env bash
 #
-# Portable end-to-end smoke test (Linux/macOS/CI). Windows equivalent:
-# scripts/smoke_test.ps1.
+# End-to-end smoke test for the Phase 1 realtime pipeline (Linux/macOS/CI).
+# Windows equivalent: scripts/smoke_test.ps1.
 #
-# Requires: Go, `uv run`d Python env, and the full pipeline already built
-# (docker compose up, data downloaded, loader run, dbt build).
-# Builds api/bin/api, starts it on a scratch port, asserts every endpoint
-# returns the known-good Phase 0 numbers, then kills it.
+# Requires: Go, the full pipeline already built and running
+#   (docker compose up -d --wait, data downloaded, loader run, dbt build).
 #
-# Usage:  bash scripts/smoke_check.sh   [BASE_URL] [HTTP_ADDR]
-#         defaults: http://localhost:18085  :18085
+# Builds api/bin/server + api/bin/producer, starts them on scratch ports, then
+# asserts:
+#   - the Phase 0 batch endpoints return the known-good numbers
+#   - the metrics catalog carries the Phase 1 realtime definitions (v1.1.0+)
+#   - the live SSE stream emits metrics frames
+#   - the realtime REST surface / the anomalies endpoint answer
+#
+# Usage:  bash scripts/smoke_check.sh   [BASE_URL] [HTTP_ADDR] [GRPC_ADDR]
+#         defaults: http://localhost:18085  :18085  :18090
 set -euo pipefail
 
 BASE_URL="${1:-http://localhost:18085}"
 HTTP_ADDR="${2:-:18085}"
+GRPC_ADDR="${3:-:18090}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 export DATABASE_URL="${DATABASE_URL:-postgres://abi:abi@localhost:5432/abi}"
 export ABI_HTTP_ADDR="${HTTP_ADDR}"
+export ABI_GRPC_ADDR="${GRPC_ADDR}"
+export ABI_KAFKA_SEED_BROKERS="${ABI_KAFKA_SEED_BROKERS:-localhost:29092}"
 
-echo "==> Building API"
+echo "==> Building server + producer"
 (
   cd "$ROOT/api"
-  go build -o bin/api ./cmd/api
+  go build -o bin/server ./cmd/server
+  go build -o bin/producer ./cmd/producer
 )
 
-echo "==> Starting API at ${BASE_URL}"
-"$ROOT/api/bin/api" &
-API_PID=$!
-cleanup() { kill "$API_PID" 2>/dev/null || true; wait "$API_PID" 2>/dev/null || true; }
+echo "==> Starting server at ${BASE_URL}"
+"$ROOT/api/bin/server" &
+SERVER_PID=$!
+
+echo "==> Starting producer (28800x -> 1 historical day ≈ 3s)"
+ABI_SPEED_MULTIPLIER=28800 "$ROOT/api/bin/producer" &
+PRODUCER_PID=$!
+
+cleanup() {
+  kill "$PRODUCER_PID" 2>/dev/null || true
+  kill "$SERVER_PID" 2>/dev/null || true
+  wait "$PRODUCER_PID" 2>/dev/null || true
+  wait "$SERVER_PID" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 echo "==> Waiting for /healthz"
 healthy=0
-for _ in $(seq 1 30); do
+for _ in $(seq 1 40); do
   if curl -fsS --max-time 3 "$BASE_URL/healthz" >/dev/null 2>&1; then
     healthy=1
     break
@@ -41,10 +60,36 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 if [ "$healthy" -ne 1 ]; then
-  echo "FAIL: API did not become healthy at $BASE_URL" >&2
+  echo "FAIL: server did not become healthy at $BASE_URL" >&2
   exit 1
 fi
 echo "  healthz ok"
+
+echo "==> Waiting for the first live 1-minute bucket"
+buckets=0
+for _ in $(seq 1 45); do
+  if bucket_count="$(
+    curl -fsS --max-time 3 "$BASE_URL/api/v1/realtime/metrics" 2>/dev/null \
+      | python3 -c "import json,sys; d=json.load(sys.stdin)['data']; print(len(d.get('buckets', [])))" 2>/dev/null
+  )" && [ "${bucket_count:-0}" -ge 1 ]; then
+    buckets="${bucket_count}"
+    break
+  fi
+  sleep 1
+done
+if [ "${buckets}" -lt 1 ]; then
+  echo "FAIL: no realtime buckets appeared ($buckets)" >&2
+  exit 1
+fi
+echo "  realtime buckets ok (${buckets} buckets)"
+
+echo "==> Waiting for an SSE frame on /api/v1/stream/metrics"
+SSE_OUT="$(curl -sN --max-time 12 "$BASE_URL/api/v1/stream/metrics" | head -c 400)"
+if ! printf '%s' "$SSE_OUT" | grep -q "event: metrics"; then
+  echo "FAIL: no SSE metrics frame" >&2
+  exit 1
+fi
+echo "  sse ok"
 
 # Assertions live in Python (stdlib urllib, no jq dependency).
 python3 - "$BASE_URL" <<'PY'
@@ -91,8 +136,22 @@ check(names[0] == "bed_bath_table", f"top category {names[0]} != bed_bath_table"
 print(f"  categories/top ok top5: {', '.join(names)}")
 
 metrics = get("/api/v1/metrics")["data"]
-check(len(metrics["metrics"]) >= 8, "metrics catalog too small")
-check(any(m["name"] == "revenue" for m in metrics["metrics"]), "revenue metric missing")
+check(len(metrics["metrics"]) >= 11, "metrics catalog too small")
+realnames = {m["name"] for m in metrics["metrics"]}
+check({"revenue", "orders", "revenue_realtime", "orders_realtime", "active_sessions"} <= realnames,
+      f"realtime metric definitions missing; have {sorted(realnames)}")
+print(f"  metrics ok  {len(metrics['metrics'])} definitions (v{metrics.get('version')})")
+
+rt = get("/api/v1/realtime/metrics")["data"]["buckets"]
+check(len(rt) >= 1, "realtime metrics empty")
+check("bucket_start" in rt[-1] and "revenue" in rt[-1] and "orders" in rt[-1], "bucket shape wrong")
+print(f"  realtime metrics ok  latest bucket {rt[-1]['bucket_start']} revenue={rt[-1]['revenue']} orders={rt[-1]['orders']}")
+
+anoms = get("/api/v1/anomalies")["data"]
+assert isinstance(anoms, list), "anomalies must be a list"
+print(f"  anomalies ok  {len(anoms)} open")
 
 print("\nSMOKE TEST PASSED")
 PY
+
+echo "==> Stopping server + producer"

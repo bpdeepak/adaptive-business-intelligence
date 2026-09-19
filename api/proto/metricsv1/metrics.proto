@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+// Phase 1 live-streaming contract: a server-streaming RPC mirroring the SSE
+// /api/v1/stream/metrics feed. gRPC clients get the same MetricsUpdate payloads.
+package abi.metricsv1;
+
+option go_package = "abi/internal/grpcapi/metricsv1";
+
+message RealtimeBucket {
+  string bucket_start = 1;      // RFC3339 UTC
+  double revenue = 2;
+  int64  orders = 3;
+  int64  active_sessions = 4;
+  string updated_at = 5;        // RFC3339 UTC
+  bool   anomaly_flag = 6;
+}
+
+message Anomaly {
+  int64  id = 1;
+  string metric = 2;
+  string bucket_start = 3;      // RFC3339 UTC
+  double observed = 4;
+  double expected = 5;
+  double z_score = 6;
+  string severity = 7;
+  string status = 8;
+  string detected_at = 9;       // RFC3339 UTC
+}
+
+message MetricsUpdate {
+  repeated RealtimeBucket snapshot = 1;  // sent once right after connect
+  RealtimeBucket current = 2;            // latest 1-minute bucket
+  Anomaly anomaly = 3;                   // set when a new anomaly fired
+  double speed_multiplier = 4;           // replay pacing
+  string status = 5;                     // "live" | "replay"
+}
+
+message StreamMetricsRequest {}
+
+service MetricsService {
+  rpc StreamMetrics(StreamMetricsRequest) returns (stream MetricsUpdate);
+}

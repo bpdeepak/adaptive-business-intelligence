@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ABI · Phase 0 — Foundations</title>
+  <title>ABI · Adaptive Business Intelligence</title>
   <link rel="stylesheet" href="/style.css" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
   <script src="/app.js" defer></script>
@@ -14,7 +14,7 @@
       <span class="logo">ABI</span>
       <div>
         <h1>Adaptive Business Intelligence</h1>
-        <p class="subtitle">Phase 0 · Foundations — Olist e-commerce 2016–2018</p>
+        <p class="subtitle">Olist e-commerce 2016–2018 · batch foundation + live replay</p>
       </div>
     </div>
     <div class="controls">
@@ -27,6 +27,41 @@
       <button class="refresh" id="refresh" title="Refresh">↻ Refresh</button>
     </div>
   </header>
+
+  <section class="live" id="liveSection" hidden>
+    <div class="live-head">
+      <h2>Live stream <span class="hint" id="liveState">(replay)</span></h2>
+      <span class="live-badge offline" id="liveBadge">connecting…</span>
+    </div>
+    <div class="live-tiles">
+      <div class="card live-tile">
+        <span class="kpi-label">Revenue · last 1 min</span>
+        <span class="live-value" id="liveRevenue">—</span>
+        <span class="kpi-hint" id="liveRevenueAt">waiting for stream</span>
+      </div>
+      <div class="card live-tile">
+        <span class="kpi-label">Orders · last 1 min</span>
+        <span class="live-value" id="liveOrders">—</span>
+        <span class="kpi-hint" id="liveOrdersAt">waiting for stream</span>
+      </div>
+      <div class="card live-tile">
+        <span class="kpi-label">Active sessions · last 1 min</span>
+        <span class="live-value" id="liveSessions">—</span>
+        <span class="kpi-hint" id="liveSpeed">waiting for stream</span>
+      </div>
+    </div>
+    <div class="card anomaly-banner" id="anomalyBanner" hidden>
+      <div class="anomaly-text">
+        <strong id="anomalyTitle">Anomaly</strong>
+        <span id="anomalyDetail"></span>
+      </div>
+      <button id="dismissAnomaly" type="button">Dismiss</button>
+    </div>
+    <div class="card">
+      <h2>Live 1-minute revenue <span class="hint">(recent buckets)</span></h2>
+      <div class="chart-box chart-box-short"><canvas id="chartLive"></canvas></div>
+    </div>
+  </section>
 
   <main>
     <section class="kpis" id="kpis" aria-live="polite"></section>
@@ -57,7 +92,7 @@
   <footer class="footer">
     <p>
       Data: <a href="https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce">Olist Brazilian E-Commerce</a>
-      · Pipeline: MinIO (bronze) → dbt (silver/gold) → Go API → dashboard
+      · Pipeline: MinIO (bronze) → dbt (silver/gold) → Redpanda (live replay) → Go server → dashboard
     </p>
   </footer>
 </body>

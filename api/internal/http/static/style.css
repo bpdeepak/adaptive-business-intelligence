@@ -66,6 +66,66 @@ button.active { background: var(--accent); border-color: var(--accent); color: #
 
 main { padding: 24px 28px; }
 
+/* Phase 1 · live replay panel */
+.live {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px 28px 4px;
+}
+
+.live-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.live-head h2 { font-size: 16px; font-weight: 650; }
+
+.live-badge {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.live-badge.ok { color: var(--accent-2); border-color: var(--accent-2); }
+.live-badge.offline { color: var(--danger); border-color: var(--danger); }
+
+.live-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+}
+
+.live-tile { display: flex; flex-direction: column; gap: 4px; }
+.live-value { font-size: 24px; font-weight: 700; }
+
+.anomaly-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-color: var(--danger);
+  background: linear-gradient(90deg, rgba(248,81,73,0.12), var(--panel));
+}
+.anomaly-banner[hidden] { display: none; }
+.anomaly-text { display: flex; flex-direction: column; gap: 2px; }
+.anomaly-text strong { color: var(--danger); font-size: 14px; }
+.anomaly-text span { color: var(--muted); font-size: 13px; }
+.anomaly-banner button {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: transparent;
+  white-space: nowrap;
+}
+.anomaly-banner button:hover { background: var(--danger); color: #fff; }
+
+.chart-box-short { height: 140px; }
+
 .kpis {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
