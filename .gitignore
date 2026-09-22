@@ -22,6 +22,10 @@ data/raw/
 api/bin/
 api/*.test
 
+# Derived model artifacts (regenerate with `make train`; serving reads them
+# from disk — never commit *products* of training into source control)
+artifacts/
+
 # OS / editors
 .DS_Store
 Thumbs.db

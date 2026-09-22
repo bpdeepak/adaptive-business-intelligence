@@ -36,11 +36,15 @@ type Catalog struct {
 const (
 	SourceBatch      = "batch"
 	SourceLiveReplay = "live_replay"
+	// SourceModel marks a model output: a scored/forecast value in
+	// gold.predictions produced by a versioned model in gold.model_registry.
+	// It is never additive with the batch or live_replay sources.
+	SourceModel = "model"
 )
 
 // Version is bumped whenever a definition changes. Keep it in sync with the
 // `Metric definitions` table in docs/phase0.md (section 4) and docs/phase1.md.
-const Version = "1.2.0"
+const Version = "1.3.0"
 
 // Default returns the Phase 0 catalog.
 func Default() Catalog {
@@ -229,6 +233,75 @@ func Default() Catalog {
 					"Only for estimating concurrent/converting traffic pressure; not comparable to customers.",
 				},
 			},
+			{
+				Name:        "forecast_revenue",
+				Label:       "Forecast revenue — category × week",
+				Source:      SourceModel,
+				Description: "4-week-ahead revenue forecast per product category, from the trained LightGBM model.",
+				Population:  "all categories with >=16 weeks of demand history",
+				Grain:       "product category × ISO week (week_start)",
+				DateField:   "week_start",
+				Aggregation: "LightGBM regression on lag/rolling features; rolling-origin backtest reported in gold.model_registry",
+				Unit:        "BRL",
+				SourceTable: "gold.predictions (model_name='forecast_category_weekly_revenue')",
+				Tags:        []string{"model", "forecast", "money"},
+				Notes: []string{
+					"Revenue here is allocated across an order's line items by price share, so it is mutually exclusive across categories (unlike top_categories).",
+					"Model outputs are NOT comparable to batch/realtime actuals as if they were observed revenue; always cite the model version and horizon.",
+					"Explanation payload carries the model's global SHAP ranking.",
+				},
+			},
+			{
+				Name:        "churn_risk",
+				Label:       "Customer churn risk",
+				Source:      SourceModel,
+				Description: "Probability that a repeat customer will not purchase again within 90 days, scored as-of their penultimate order.",
+				Population:  "customers with >=2 orders",
+				Grain:       "customer (customer_unique_id)",
+				Aggregation: "XGBoost binary classifier; time-split backtest (latest 20% of as-of dates held out)",
+				Unit:        "probability 0–1",
+				SourceTable: "gold.predictions (model_name='churn_risk')",
+				Tags:        []string{"model", "risk", "customer"},
+				Notes: []string{
+					"Churn label: no purchase within 90 days following the as-of order; the penultimate-order design means no right-censoring.",
+					"Every served/persisted prediction carries per-row SHAP contributions in explanation.shap.",
+					"Use the lift-at-5% metric in gold.model_registry to size retention campaigns.",
+				},
+			},
+			{
+				Name:        "fraud_risk",
+				Label:       "Transaction fraud risk",
+				Source:      SourceModel,
+				Description: "Probability that an order is fraudulent, from features available at order time.",
+				Population:  "all orders",
+				Grain:       "order (order_id)",
+				Aggregation: "XGBoost binary classifier on synthetically injected fraud patterns; time-split backtest",
+				Unit:        "probability 0–1",
+				SourceTable: "gold.predictions (model_name='fraud_risk')",
+				Tags:        []string{"model", "risk", "order"},
+				Notes: []string{
+					"Labels are SYNTHETIC (the Olist source is clean): velocity >=3 orders/24h, price >=8x the trailing-90d category average, excessive installments, plus a 0.4% noise floor.",
+					"Features are strictly as-of the order timestamp (trailing windows), so the backtest has no future leakage.",
+					"Per-row SHAP contributions are stored with every prediction.",
+				},
+			},
+			{
+				Name:        "bot_score",
+				Label:       "Synthetic-bot session score",
+				Source:      SourceModel,
+				Description: "Probability that a browsing session is automated, from session-shape features only.",
+				Population:  "all sessions (converting + abandoned)",
+				Grain:       "session (session_id)",
+				Aggregation: "LightGBM binary classifier; time-split backtest by session date",
+				Unit:        "probability 0–1",
+				SourceTable: "gold.predictions (model_name='bot_score'); features in gold.session_features",
+				Tags:        []string{"model", "traffic", "risk"},
+				Notes: []string{
+					"Trained on gold.session_features, the durable corpus built by ml/replay_session_corpus.py that mirrors the replay's session synthesis (labels never appear in the clickstream).",
+					"Signals: page-to-page timing (bots fire 3–12 clicks in <1s), funnel shape (bots skip search), and inter-click variance.",
+					"Persisted test predictions are a sample; live scoring is available through POST /api/v1/score.",
+				},
+			},
 		},
 		Notes: []string{
 			"Dataset: Olist Brazilian E-Commerce, 2016-09-04 → 2018-09-03 (purchase dates).",
@@ -238,6 +311,7 @@ func Default() Catalog {
 			"Errata: summary's aov/counts describe the paying, non-lost population; daily_orders.total describes all orders. Always check the population field of a metric before combining metrics.",
 			"Realtime metrics (Phase 1) describe a compressed REPLAY of the same orders; they are bounded to their own gold.realtime_metrics table and are never added to the batch gold.daily_* totals.",
 			"Every metric carries a required `source` field: \"batch\" vs \"live_replay\". Never add or compare figures across the two sources; treat the split as part of the contract.",
+			"Phase 2 adds a third source, \"model\": forecast/risk scores in gold.predictions produced by versioned models in gold.model_registry. Model outputs are never additive with batch or live_replay figures; always cite the model version and its backtest metrics.",
 		},
 	}
 }

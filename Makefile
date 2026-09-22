@@ -1,5 +1,5 @@
 # ABI — Phase 1 dev targets (Linux/CI). On Windows prefer scripts/*.ps1.
-.PHONY: infra-up infra-down data load dbt build-docs server producer app test integration-test smoke bootstrap smoke-check
+.PHONY: infra-up infra-down data load dbt build-docs server producer app test integration-test smoke bootstrap smoke-check ml-sync ml-features train serve-models
 
 infra-up:
 	docker compose up -d --wait
@@ -46,3 +46,24 @@ smoke:
 # Portable end-to-end smoke test (Linux/macOS/CI).
 smoke-check:
 	bash scripts/smoke_check.sh
+
+# --- Phase 2: predictive layer (isolated `ml` uv dependency group) ---
+
+# Install the ML stack (scikit-learn, lightgbm, xgboost, shap).
+ml-sync:
+	uv sync --group ml
+
+# Build the two non-SQL feature stores (fraud orders, session corpus). The two
+# SQL feature stores are materialized by `make dbt`.
+ml-features:
+	uv run --group ml python ml/build_fraud_features.py
+	uv run --group ml python ml/replay_session_corpus.py
+
+# Train + backtest all four model families, register versions, and write the
+# serving manifest. Requires the gold feature tables (run `make dbt ml-features`).
+train:
+	uv run --group ml python ml/train_all.py
+
+# Serve registered models over the stdlib scoring sidecar (POST /score).
+serve-models:
+	uv run --group ml python ml/serve.py

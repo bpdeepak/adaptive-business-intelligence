@@ -6,7 +6,11 @@ medallion data stack on the Olist Brazilian E-Commerce dataset, an idiomatic Go
 metrics API, and a browser dashboard. **Phase 1 adds the real-time layer**: the
 history is replayed onto Redpanda, Go consumers compute hot 1-minute metrics
 with online anomaly detection, and live SSE/gRPC streams feed live dashboard
-tiles — all built, tested, and running end to end.
+tiles. **Phase 2 adds the predictive layer**: four gradient-boosted models
+(demand forecast, churn, fraud, bot) in Python, each with SHAP explanations
+from day one, a versioned Postgres model registry, every prediction persisted
+with its explanation to `gold.predictions`, and a lightweight Python scoring
+sidecar wired into the Go API — all built, tested, and running end to end.
 
 | Layer | What ships |
 |---|---|
@@ -15,7 +19,8 @@ tiles — all built, tested, and running end to end.
 | Silver | 8 typed, cleaned staging views (`silver.stg_*`), dedup of duplicate reviews, NULL handling |
 | Gold | `gold.fct_orders` + `gold.fct_order_items`, 4 dims, metric tables (`daily_revenue`, `daily_orders`, `daily_aov`, `top_categories`) — plus **hot-path** `gold.realtime_metrics` (1-min buckets, reconciled from bronze), `gold.anomalies`, and `gold.detector_state` (restart-resumable baseline) written by the Go realtime stack |
 | Streaming | `cmd/producer` replays history (virtual clock, 3-source merge, infinite loops); `cmd/server` runs the bronze-writer + realtime aggregator (Welford/z-score + sigma floor), a retention janitor (enforces 12 h bronze / 3 h bucket budgets), a bronze→realtime reconcile (self-heals redelivery double-counts), and Prometheus `/metrics` |
-| Serving | Go REST API + SSE live stream + gRPC :8090 (live metrics), embedded dashboard with live tiles + anomaly banner |
+| Serving | Go REST API + SSE live stream + gRPC :8090 (live metrics), embedded dashboard with live tiles + anomaly banner; **Phase 2** predict surface (`/api/v1/model-registry`, `/predictions[/latest]`, `/score`, `/models/health`) served from Postgres, with an optional Python scoring sidecar (`127.0.0.1:8093`) |
+| Predictive (Phase 2) | `ml/` Python stack (uv `ml` group): LightGBM + XGBoost trained with strict time splits, SHAP `TreeExplainer` explanations on every prediction, `gold.model_registry` (5 active versions), `gold.predictions` (41k+ backtest rows + live scores, each with explanation jsonb), versioned joblib artifacts in `artifacts/`, stdlib HTTP sidecar `ml/serve.py` |
 | Dashboard | Vanilla JS + Chart.js: KPI cards, daily charts, top categories, 7D/30D/90D/All windows, **live revenue/orders/sessions tiles, anomaly banner, replay-speed badge** |
 
 ## Architecture
@@ -55,28 +60,61 @@ tiles — all built, tested, and running end to end.
                     └───────────────┘
 ```
 
+## Predictive layer (Phase 2)
+
+```
+dbt SQL feature stores            Python feature stores
+  gold.feature_forecast_weekly      gold.feature_fraud_orders (99,441)
+  gold.feature_customer_churn       gold.session_features    (3.3M)
+        └──────────┬─────────────────────┘
+                   ▼
+        ml/train_all.py  ──►  artifacts/<model>/<version>.joblib + sidecar_models.json
+                   │                        │
+                   ▼                        ▼
+   gold.model_registry  ◄── versioning   ml/serve.py  (127.0.0.1:8093, stdin-free stdlib sidecar)
+                   │                        │ POST /score ──► prediction + SHAP
+                   ▼                        │
+   gold.predictions  (every prediction  ◄──┘ persists each live score)
+        ▲
+        └── Go API: /api/v1/model-registry · /predictions · /predictions/latest
+            /api/v1/score (sidecar optional: 503 unset, 502 unreachable) · /api/v1/models/health
+```
+
+Four backtested models — **forecast** (weekly revenue WMAPE 0.31, orders 0.27),
+**churn** (AUC 0.65, honest label-availability + no calendar-year proxy),
+**fraud** (AUC 0.85, lift@5% 19.9×), **bot** (AUC 1.0 on the deterministic
+synthetic corpus — expected, documented). Every scored entity lands in
+`gold.predictions` with its SHAP contributions. Full detail, decisions, and
+deferrals: `docs/phase2.md`.
+
 ## Repository layout
 
 ```
 ├── docker-compose.yml        # Postgres + MinIO + Redpanda, healthchecked
-├── pyproject.toml            # uv project: dbt-core, dbt-postgres, boto3, psycopg
-├── Makefile                  # infra/test/app/integration-test/smoke targets
+├── pyproject.toml            # uv project: dbt-core, dbt-postgres, boto3, psycopg (+ `ml` group)
+├── Makefile                  # infra/test/app/integration-test/smoke + ml-sync/ml-features/train/serve-models
 ├── .github/workflows/ci.yml  # CI: compose up → load → dbt → vet/unit/integration → smoke
 ├── scripts/
 │   ├── bootstrap.ps1         # infra → data → bronze → dbt → docs → build (Windows)
 │   ├── bootstrap.sh          # same pipeline for Linux/macOS (make bootstrap)
 │   ├── smoke_test.ps1        # starts server+producer, validates every endpoint (Windows)
-│   ├── smoke_check.sh        # portable smoke test (Linux/macOS/CI)
+│   ├── smoke_check.sh        # portable smoke test (Linux/macOS/CI) incl. Phase 2 predict asserts
 │   ├── run_api.ps1           # run cmd/server in the foreground (dev)
 │   ├── run_producer.ps1      # run cmd/producer replay in the foreground (dev)
 │   └── download_olist.py     # stdlib downloader with byte-size verification
 ├── loader/loader.py          # CSV → MinIO bronze → Postgres bronze.* (COPY + lineage cols)
 ├── dbt/                      # dbt project (profile, macros, sources incl. realtime gold tables)
+├── ml/                       # Phase 2 Python: feature builders, trainers, SHAP explainer,
+│                            #   registry/prediction writers, stdlib serving sidecar (serve.py), tests
+├── artifacts/                # derived (gitignored): versioned model joblibs + serving
+│                            #   manifest, written by `make train` — regenerate, don't commit
 ├── api/                      # Go module: cmd/{server,producer,api} + internal/{stream,realtime,
-│                            #   kafka,grpcapi,config,http,metrics,model,store,telemetry}
+│                            #   predict,kafka,grpcapi,config,http,metrics,model,store,telemetry}
 └── docs/
     ├── phase0.md             # Phase 0 decisions, schema dictionary, metric definitions
-    └── phase1.md             # Phase 1 event contract, realtime schema, anomaly detection, ops
+    ├── phase1.md             # Phase 1 event contract, realtime schema, anomaly detection, ops
+    └── phase2.md             # Phase 2 model cards (verified metrics), registry/predictions
+                              #   contracts, sidecar API, ops, deferrals
 ```
 
 ## Quickstart (Windows)
@@ -96,6 +134,16 @@ uv sync
 
 # 4. End-to-end verification (starts/stops its own server + producer on scratch ports)
 ./scripts/smoke_test.ps1
+
+# 5. Phase 2: predictive layer
+# Trained artifacts + the serving manifest are gitignored (derived): a fresh
+# clone regenerates them with `make train` before starting the sidecar.
+uv sync --group ml                        # ML stack (scikit-learn, lightgbm, xgboost, shap)
+uv run --group ml python ml/build_fraud_features.py   # non-SQL feature stores
+uv run --group ml python ml/replay_session_corpus.py
+uv run dbt build --project-dir dbt --profiles-dir dbt # SQL feature stores
+uv run --group ml python ml/train_all.py  # backtest + register 4 models + write manifest
+uv run --group ml python ml/serve.py      # sidecar http://127.0.0.1:8093 (phase 2 scoring)
 ```
 
 Linux/CI equivalents:
@@ -112,7 +160,17 @@ ABI_SPEED_MULTIPLIER=2880 ./api/bin/producer &
 # 3. Verify
 bash scripts/smoke_check.sh         # portable end-to-end smoke test
 make integration-test               # real Postgres + Redpanda pipeline tests
+
+# 4. Phase 2: feature stores → train → sidecar (see docs/phase2.md §7 for ops)
+make ml-sync
+make dbt ml-features
+make train                           # backtest + register models + sidecar_models.json
+make serve-models                    # scoring sidecar on 127.0.0.1:8093
 ```
+
+The Go API treats the sidecar as optional: without it `POST /api/v1/score`
+returns 503/502 while every read endpoint (`model-registry`, `predictions`,
+`predictions/latest`, `models/health`) keeps serving from Postgres.
 
 Every push/PR to `main` also runs the full pipeline in CI: `docker compose up -d
 --wait` → load → dbt → `go vet` + unit + integration → `make app` + smoke
@@ -123,10 +181,11 @@ Every push/PR to `main` also runs the full pipeline in CI: `docker compose up -d
 - **Bronze:** 9/9 files downloaded and size-verified from a public mirror; row
   counts match the official dataset (`orders` 99,441, `order_items` 112,650,
   `geolocation` 1,000,163, …).
-- **dbt:** `dbt build` → **95/95 pass** (17 models + 78 data tests incl. FK,
-  uniqueness, accepted-value, and 5 singular tests), 0 warnings — now also
-  declaring `fct_order_items` (FK-tested to `fct_orders`) and the realtime gold
-  tables as sources.
+- **dbt:** `dbt build` → **116/116 pass** (20 models — 12 tables incl. the Phase 2
+  churn feature store + 8 views — with 96 data tests incl. FK, uniqueness,
+  accepted-value, and 5 singular tests), 0 warnings — declaring `fct_order_items`
+  (FK-tested to `fct_orders`), the realtime gold tables, and the gold feature
+  stores as sources.
 - **Go unit tests:** simulator ordering/loop-wrap/ring capacity, Welford/z-score
   anomaly detection, SSE live stream (snapshot + flush + anomaly frames,
   heartbeat, 503-without-live), anomalies + dismiss, realtime metrics endpoint,
@@ -143,6 +202,22 @@ Every push/PR to `main` also runs the full pipeline in CI: `docker compose up -d
   endpoint all answer.
 - **Lineage:** every bronze row carries `_loaded_at`, `_source_file`, `_batch_id`
   (streaming rows add `loop_id`, `_kafka_topic/partition/offset`).
+- **Phase 2 models (strict time splits, out-of-sample):** forecast revenue WMAPE
+  **0.310**, orders **0.272**; churn AUC **0.652** (label-availability rule, no
+  calendar-year drift proxy); fraud AUC **0.85**, lift@5% **19.9×**; bot AUC
+  **1.0** (deterministic synthetic corpus — documented, not over-claimed). All
+  metrics stored in `gold.model_registry.metrics` per version.
+- **Phase 2 explainability:** every persisted prediction in `gold.predictions`
+  carries a SHAP `explanation` jsonb (per-feature contributions +
+  predicted_probability); TreeExplainer is built once per model, so backtest
+  persistence and live scoring stay fast (17k-row timeout fixed by design).
+- **Phase 2 serving, verified live:** stdlib sidecar `ml/serve.py` scores all
+  four families with explanations; Go `POST /api/v1/score` round-trips and
+  persists a scored row, and the read endpoints serve the registry (9 versions,
+  5 active) and 41k+ predictions; 502/503 degrade paths and 400 validation
+  verified; predict integration tests (fake in-process sidecar) green.
+- **ML tests:** `uv run --group ml python -m pytest ml/tests -q` green
+  (backtest metric maths incl. single-class guard).
 
 ## Metric definitions
 
@@ -162,24 +237,28 @@ so the split is structural, not a prose caveat; the realtime rows above are
 `live_replay` and are **never additive** with the batch totals.
 
 This dictionary is served **programmatically** at `GET /api/v1/metrics`
-(`api/internal/metrics/catalog.go`, versioned — currently **v1.2.0**) — the
-machine-readable semantic layer that agents should fetch before answering metric
-questions.
+(`api/internal/metrics/catalog.go`, versioned — currently **v1.3.0**, which adds
+the Phase 2 `model` source) — the machine-readable semantic layer that agents
+should fetch before answering metric questions.
 
 ## Roadmap
 
-- **Phase 1 (this phase)** — live replay + real-time metrics: `cmd/producer`
+- **Phase 1** — live replay + real-time metrics: `cmd/producer`
   replays history onto Redpanda; `cmd/server` runs the bronze-writer and the
   realtime aggregator (Welford/z-score online anomaly detection) into
   `gold.realtime_metrics` / `gold.anomalies`; SSE + gRPC streams feed live
   dashboard tiles with an anomaly banner. **Complete and verified.**
-- **Phase 2** — Bot-detection model trained against
-  `bronze.training_ground_truth` (labels already stream under a restricted
-  topic), semantic layer + natural-language queries (LLM → metric DSL → SQL).
-- **Phase 3** — Forecasting, agent-driven root-cause explanations (reacting to
-  `ecommerce.anomalies` events).
-- **Phase 4** — Conversational agents, subscriptions, alerting.
+- **Phase 2 (this phase)** — predictive layer: four gradient-boosted models
+  (forecast, churn, fraud, bot) with strict time-split backtests, SHAP
+  explanations on every prediction, `gold.model_registry` + `gold.predictions`
+  contracts, a Python scoring sidecar behind the Go API, CI coverage, and
+  `docs/phase2.md`. **Complete and verified.**
+- **Phase 3** — agent-driven root-cause explanations (reacting to
+  `ecommerce.anomalies` events) plus the semantic layer / natural-language
+  queries path.
+- **Phase 4** — conversational agents, subscriptions, alerting; drift monitoring
+  and drift-triggered retraining of the Phase 2 models.
 - **Phase 5** — Deployment: Docker image (already provided in `api/Dockerfile`),
   observability, horizontal scaling of consumers.
 
-See `docs/phase0.md` and `docs/phase1.md` for full detail.
+See `docs/phase0.md`, `docs/phase1.md`, and `docs/phase2.md` for full detail.

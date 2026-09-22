@@ -27,6 +27,7 @@ import (
 	httpapi "abi/internal/http"
 	"abi/internal/kafka"
 	"abi/internal/model"
+	"abi/internal/predict"
 	"abi/internal/realtime"
 	"abi/internal/store"
 	"abi/internal/stream"
@@ -58,6 +59,11 @@ func run(logger *slog.Logger, cfg config.Config) error {
 		return err
 	}
 	logger.Info("realtime schema ensured")
+
+	if err := predict.EnsureSchema(ctx, pool); err != nil {
+		return err
+	}
+	logger.Info("predict schema ensured")
 
 	st, err := store.NewPostgresStore(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -107,6 +113,16 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	rootMux := http.NewServeMux()
 	rootMux.Handle("/", srv)
 	rootMux.Handle("GET /metrics", reg.Handler())
+
+	// 5b. Phase 2 predictive layer: the model registry + explainable
+	// predictions are read from Postgres, and live scoring is brokered through
+	// the Python model sidecar (optional; empty ABI_SCORE_URL disables it).
+	predictSvc := predict.NewService(pool, predict.NewScoreClient(cfg.ScoreURL), logger)
+	predictSvc.Instrument(reg)
+	predictSvc.Register(rootMux)
+	predictCtx, predictCancel := context.WithCancel(ctx)
+	defer predictCancel()
+	go predictSvc.RunGaugeLoop(predictCtx, 30*time.Second)
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           rootMux,

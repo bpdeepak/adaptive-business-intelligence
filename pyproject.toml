@@ -9,11 +9,22 @@ dependencies = [
     "dbt-postgres>=1.9,<2",
     "boto3>=1.35,<2",
     "psycopg[binary]>=3.2,<4",
+    "pandas>=2.2",
+    "numpy>=2.1",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8",
+]
+
+# Phase 2 ML training stack. Kept in its own group so plain `uv sync` (dbt +
+# loaders) stays light; add with `uv sync --group ml`.
+ml = [
+    "scikit-learn>=1.5",
+    "lightgbm>=4.5",
+    "xgboost>=2.1",
+    "shap>=0.46",
 ]
 
 [tool.uv]

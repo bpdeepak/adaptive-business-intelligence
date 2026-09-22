@@ -16,6 +16,14 @@
 // the Kafka topics, lets the consumers fold them into bronze.stream_events and
 // gold.realtime_metrics, and asserts the spike is detected into
 // gold.anomalies with the correct lineage stamped on every raw row.
+//
+// Isolation note: run this while the platform's own consumers are stopped. A
+// concurrently running aggregator (cmd/server) consumes the same topics and
+// folds the test's events into *its* baseline, writing extra anomaly rows and
+// detector state that the precise spike assertions cannot distinguish from
+// the controlled ones (observed live: z=4.55 "warning" shadowing the test's
+// z>=5 "severe"). The stack also resets gold.detector_state per run so
+// repeated runs stay deterministic instead of inheriting each other's spikes.
 package realtime
 
 import (
@@ -79,6 +87,15 @@ func newRealtimeStack(t *testing.T) *realtimeStack {
 	}
 	if err := EnsureSchema(probeCtx, pool); err != nil {
 		t.Fatalf("ensure realtime schema: %v", err)
+	}
+	// Reset the persisted anomaly baseline so this run measures its own clean
+	// baseline. Restored state left by prior runs (or a live pipeline sharing
+	// the database) already contains a 60-order spike, which inflates the
+	// restored sigma and pushes this run's controlled spike z-score onto the
+	// wrong side of the "severe" bar (observed: 4.93 vs want >= 5). Same
+	// philosophy as TrimTopics below: the assertions rely on a precise dataset.
+	if _, err := pool.Exec(probeCtx, `TRUNCATE gold.detector_state`); err != nil {
+		t.Fatalf("reset detector_state: %v", err)
 	}
 	// Trim any leftover records from earlier runs (or a stray producer) so a
 	// fresh consumer group sees exactly the records this run produces — the
@@ -380,7 +397,9 @@ func TestRealtimePipelineEndToEnd(t *testing.T) {
 	}
 
 	// 6. The spike row is unambiguous: observed == burst, severe, z >= 5, and
-	// it points at the exact spike minute.
+	// it points at the exact spike minute. Pin the query to this run's spike
+	// bucket so unrelated anomalies inside the window (e.g. a live pipeline
+	// run that shared the database) can never shadow the controlled spike.
 	var anObs, anExpected, anZ float64
 	var severity string
 	var bucketStart string
@@ -388,8 +407,8 @@ func TestRealtimePipelineEndToEnd(t *testing.T) {
 		SELECT observed::float8, expected::float8, z_score, severity,
 		       to_char(bucket_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 		FROM gold.anomalies
-		WHERE bucket_start >= $1 AND metric = 'orders'
-		ORDER BY z_score DESC LIMIT 1`, st.markerFrom).
+		WHERE bucket_start = $1 AND metric = 'orders'
+		ORDER BY z_score DESC LIMIT 1`, spikeAt.UTC()).
 		Scan(&anObs, &anExpected, &anZ, &severity, &bucketStart); err != nil {
 		t.Fatalf("spike anomaly: %v", err)
 	}

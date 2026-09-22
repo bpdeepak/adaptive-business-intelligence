@@ -112,3 +112,40 @@ models:
         tests: [not_null]
       - name: order_rank
         tests: [not_null]
+
+  - name: feature_forecast_weekly
+    description: >
+      Phase 2 feature store for the demand-forecast model. One row per
+      (category, ISO-week) over a dense, zero-filled weekly spine with
+      time-lags (1/2/4/8 weeks) and rolling 4-week aggregates. Revenue per
+      category is payment-value allocated across line items by price share,
+      so category revenue is mutually exclusive and additive.
+    columns:
+      - name: category
+        tests: [not_null]
+      - name: week_start
+        tests: [not_null]
+      - name: revenue
+        tests: [not_null]
+      - name: orders
+        tests: [not_null]
+
+  - name: feature_customer_churn
+    description: >
+      Phase 2 feature store for the customer-churn model. One row per REPEAT
+      customer (>=2 orders); as-of is the penultimate order; the label is read
+      from the observed last order (churned = gap > 90 days), fully resolved.
+      Two honesty rules: rows whose 90-day label window is not yet in-data are
+      excluded, and no as_of_year feature (a drift proxy) is exposed — only
+      as_of_month seasonality. All features use only orders before as-of.
+    columns:
+      - name: customer_unique_id
+        tests: [unique, not_null]
+      - name: as_of_date
+        tests: [not_null]
+      - name: churned
+        tests: [not_null]
+      - name: n_prior_orders
+        tests: [not_null]
+      - name: total_spend_prior
+        tests: [not_null]

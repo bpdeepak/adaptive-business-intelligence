@@ -290,19 +290,24 @@ func (a *Aggregator) flushAndDetect(ctx context.Context) error {
 	// Keep the persisted anomaly baseline fresh (crash-safe resume).
 	a.saveBaseline(ctx)
 
-	// Broadcast the most recent bucket.
+	// Broadcast the most recent bucket. It may already have been pruned by
+	// persistBuckets when a flush was starved long enough for the newest bucket
+	// to age past the retention window (host sleep, ticker stall): a stale
+	// bucket is not "current state", so publish nothing for it rather than
+	// panicking on a nil dereference.
 	var current model.RealtimeBucket
 	if len(starts) > 0 {
 		latest := starts[len(starts)-1]
 		a.mu.Lock()
-		b := a.buckets[latest]
-		current = model.RealtimeBucket{
-			BucketStart:    b.start.UTC().Format(time.RFC3339),
-			Revenue:        round2(b.revenue),
-			Orders:         int64(len(b.orders)),
-			ActiveSessions: int64(len(b.sessions)),
-			AnomalyFlag:    b.anomaly,
-			UpdatedAt:      now.UTC().Format(time.RFC3339),
+		if b, ok := a.buckets[latest]; ok {
+			current = model.RealtimeBucket{
+				BucketStart:    b.start.UTC().Format(time.RFC3339),
+				Revenue:        round2(b.revenue),
+				Orders:         int64(len(b.orders)),
+				ActiveSessions: int64(len(b.sessions)),
+				AnomalyFlag:    b.anomaly,
+				UpdatedAt:      now.UTC().Format(time.RFC3339),
+			}
 		}
 		a.mu.Unlock()
 	}

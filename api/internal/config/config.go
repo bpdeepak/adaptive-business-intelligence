@@ -45,6 +45,10 @@ type Config struct {
 	// ReconcileEvery is how often gold.realtime_metrics is reconciled from the
 	// idempotent bronze layer (self-healing against redelivery double-counts).
 	ReconcileEvery string
+	// ScoreURL is the base URL of the Phase 2 Python model sidecar
+	// (ml/serve.py). Empty disables live scoring; read APIs still serve the
+	// persisted predictions from gold.predictions.
+	ScoreURL string
 }
 
 // FromEnv builds a Config from environment variables with sane defaults.
@@ -65,6 +69,7 @@ func FromEnv() Config {
 		RetentionAnomalies:    getenv("ABI_RETENTION_ANOMALIES", "720h"),
 		ReconcileEvery:        getenv("ABI_RECONCILE_EVERY", "60s"),
 		MetricsAddr:           getenv("ABI_METRICS_ADDR", ":8092"),
+		ScoreURL:              getenv("ABI_SCORE_URL", "http://127.0.0.1:8093"),
 	}
 }
 

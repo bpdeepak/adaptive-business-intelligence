@@ -94,6 +94,7 @@ echo "  sse ok"
 # Assertions live in Python (stdlib urllib, no jq dependency).
 python3 - "$BASE_URL" <<'PY'
 import json
+import urllib.error
 import urllib.request
 import sys
 
@@ -150,6 +151,37 @@ print(f"  realtime metrics ok  latest bucket {rt[-1]['bucket_start']} revenue={r
 anoms = get("/api/v1/anomalies")["data"]
 assert isinstance(anoms, list), "anomalies must be a list"
 print(f"  anomalies ok  {len(anoms)} open")
+
+# --- Phase 2: predictive layer surface ---
+# CI does not run `make train` and starts no sidecar, so the read endpoints
+# must answer with well-formed (possibly empty) payloads and scoring must
+# degrade to a clean 502/503 instead of hanging or 500ing.
+reg = get("/api/v1/model-registry")["data"]
+check(isinstance(reg, list), "model-registry data not a list")
+print(f"  model-registry ok  {len(reg)} versions")
+
+preds = get("/api/v1/predictions?limit=5")["data"]
+check(isinstance(preds, list), "predictions data not a list")
+latest = get("/api/v1/predictions/latest?limit=3")["data"]
+check(isinstance(latest, list), "predictions/latest data not a list")
+print(f"  predictions ok  {len(preds)} rows, latest {len(latest)}")
+
+health = get("/api/v1/models/health")["data"]
+check("active_models" in health and "sidecar" in health,
+      f"models/health shape wrong: {health}")
+print(f"  models/health ok  active={health['active_models']} sidecar={health['sidecar']}")
+
+body = json.dumps({"model": "smoke-unknown", "features": {"x": 1.0}}).encode()
+req = urllib.request.Request(
+    f"{base}/api/v1/score", data=body,
+    headers={"Content-Type": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        code = resp.status
+except urllib.error.HTTPError as e:  # graceful degrade is the expected path
+    code = e.code
+check(code in (502, 503), f"score without sidecar should return 502/503, got {code}")
+print(f"  score degrades ok  {code} without sidecar")
 
 print("\nSMOKE TEST PASSED")
 PY
