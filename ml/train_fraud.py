@@ -97,6 +97,13 @@ def main() -> int:
     model = make_model(train, features)
     metrics = evalwrite.evaluate_classifier(model, test[features], test["is_fraud"],
                                             train_positive_rate=float(train["is_fraud"].mean()))
+    test_probs = model.predict_proba(test[features])[:, 1]
+    # Record the OPERATING THRESHOLD for Phase 4's hold-for-review playbook:
+    # the most permissive cutoff whose precision clears 85 %. Never the naive
+    # 0.5 — at fraud's ~1 % base rate, 0.5 flags more false positives than real.
+    metrics["recommended_threshold"] = backtest.recommended_threshold(
+        test["is_fraud"].to_numpy(), test_probs
+    )
     print("  metrics:", {k: round(v, 4) for k, v in metrics.items()})
 
     if args.skip_persist:
@@ -135,7 +142,7 @@ def main() -> int:
     print(f"  wrote {written:,} test predictions to gold.predictions")
 
     # actionable export: highest-risk orders in the test window
-    probs = model.predict_proba(test[features])[:, 1]
+    probs = test_probs
     out = test[["order_id", "customer_unique_id", "order_purchase_timestamp", "order_value"]].copy()
     out["fraud_risk"] = probs
     out = out.sort_values("fraud_risk", ascending=False).head(100)

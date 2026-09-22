@@ -46,10 +46,13 @@ class ModelStore:
             self.models[m["name"]] = m
 
     def descriptors(self) -> list[dict[str, Any]]:
-        return [
-            {k: v for k, v in m.items() if k != "artifact_path"}
-            for m in self.models.values()
-        ]
+        # Entries gain runtime-only state once used: the loaded model object
+        # (warmup/_load) and the cached TreeExplainer (first /score). None of
+        # that may leak into /models — it is not JSON-serializable.
+        out: list[dict[str, Any]] = []
+        for m in self.models.values():
+            out.append({k: v for k, v in m.items() if k not in ("artifact_path", "model", "__explainer")})
+        return out
 
     def _load(self, name: str) -> dict[str, Any]:
         m = self.models[name]
@@ -84,7 +87,14 @@ class ModelStore:
 
         if task == "regression":
             pred = float(model.predict(df)[0])
+            # Global WMAPE today; per-category WMAPE when the manifest carries
+            # baseline_wmape_by_code (drives a per-forecast confidence so rare
+            # categories that forecast badly report a lower confidence).
             wmape = float(m.get("baseline_wmape", 0.10))
+            by_code = m.get("baseline_wmape_by_code") or {}
+            code = features.get("category_code")
+            if code is not None and by_code:
+                wmape = float(by_code.get(str(int(round(float(code)))), wmape))
             confidence = float(max(0.05, min(0.999, 1 - wmape)))
         else:
             prob = float(model.predict_proba(df)[0][1])

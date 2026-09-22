@@ -57,6 +57,10 @@ def write_sidecar_manifest() -> None:
         }
         if r["task"] == "regression":
             entry["baseline_wmape"] = round(float(metrics.get("wmape", 0.10)), 4)
+            by_code = metrics.get("wmape_by_category_code") or {}
+            entry["baseline_wmape_by_code"] = {str(k): round(float(v), 4) for k, v in by_code.items()}
+        elif metrics.get("recommended_threshold") is not None:
+            entry["recommended_threshold"] = float(metrics["recommended_threshold"])
         models.append(entry)
     manifest = {"generated_at": common.now_tag(), "models": models}
     common.ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -98,7 +102,7 @@ def main() -> int:
         pass
     if not args.dry_run:
         write_sidecar_manifest()
-    print("\n✅ Phase 2 training complete")
+    print("\nPhase 2 training complete")
     return 0
 
 

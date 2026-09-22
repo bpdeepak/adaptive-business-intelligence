@@ -99,6 +99,12 @@ def main() -> int:
     model = make_model(train)
     metrics = evalwrite.evaluate_classifier(model, test[FEATURES], test["churned"],
                                             train_positive_rate=float(train["churned"].mean()))
+    # Operating decision rule for Phase 4: churn outreach should act at the
+    # recorded recommended_threshold (max recall at >= 85 % precision), never
+    # at an undocumented 0.5.
+    metrics["recommended_threshold"] = backtest.recommended_threshold(
+        test["churned"].to_numpy(), model.predict_proba(test[FEATURES])[:, 1]
+    )
     print("  metrics:", {k: round(v, 4) for k, v in metrics.items()})
 
     if args.skip_persist:

@@ -116,6 +116,34 @@ def rolling_origin_records(df: pd.DataFrame, target: str) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def per_category_wmape(records: pd.DataFrame) -> dict[str, float]:
+    """Per-category WMAPE from the backtest records.
+
+    Drives a per-forecast confidence (1 − this category's WMAPE) instead of
+    one global number, so rare categories that forecast badly get a visibly
+    wider (lower-confidence) band than categories like bed_bath_table.
+    Categories whose actuals are ~all-zero are skipped (undefined ratio); they
+    fall back to the global baseline at serve time.
+    """
+    out: dict[str, float] = {}
+    for cat, g in records.groupby("category"):
+        actuals = g["actual"].to_numpy(dtype=float)
+        denom = float(np.abs(actuals).sum())
+        if denom <= 1e-9:
+            continue
+        out[cat] = float(np.abs(g["prediction"].to_numpy(dtype=float) - actuals).sum() / denom)
+    return out
+
+
+def category_wmape_by_code(cat_wmape: dict[str, float], rank: dict[str, int]) -> dict[str, float]:
+    """Key per-category WMAPE by the serving category code (revenue rank).
+
+    `/score` sends `category_code`, so the manifest + sidecar resolve it back
+    here; codes missing from the map fall back to the global baseline_wmape.
+    """
+    return {str(rank[cat]): round(w, 4) for cat, w in cat_wmape.items() if cat in rank}
+
+
 def train_final(df: pd.DataFrame, target: str) -> LGBMRegressor:
     m = LGBMRegressor(
         n_estimators=500,
@@ -131,9 +159,23 @@ def train_final(df: pd.DataFrame, target: str) -> LGBMRegressor:
     return m
 
 
-def persist_backtest_predictions(records: pd.DataFrame, model_name: str, version: str) -> int:
+def persist_backtest_predictions(
+    records: pd.DataFrame,
+    model_name: str,
+    version: str,
+    *,
+    cat_wmape: dict[str, float] | None = None,
+    global_wmape: float = 0.10,
+) -> int:
     """Write the last fold's backtest predictions into gold.predictions so the
-    API can show a forecast-vs-actual trail with explanations."""
+    API can show a forecast-vs-actual trail with explanations. Each row carries
+    a per-category confidence (1 − that category's backtest WMAPE), falling
+    back to the global WMAPE for categories the backtest did not cover."""
+    def _clamped(w: float) -> float:
+        return float(max(0.05, min(0.999, 1.0 - w)))
+
+    global_confidence = _clamped(global_wmape)
+    conf_by_cat = {cat: _clamped(w) for cat, w in cat_wmape.items()} if cat_wmape else {}
     last_fold = records[records["fold"] == records["fold"].max()]
     if len(last_fold) > 2000:
         last_fold = last_fold.sample(n=2000, random_state=42)
@@ -141,7 +183,7 @@ def persist_backtest_predictions(records: pd.DataFrame, model_name: str, version
         {
             "entity_id": f"{r['category']}@{r['week_start'].isoformat()}",
             "prediction": r["prediction"],
-            "confidence": 0.0,
+            "confidence": conf_by_cat.get(r["category"], global_confidence),
             "lower_bound": None,
             "upper_bound": None,
             "explanation": {},
@@ -157,7 +199,7 @@ def main() -> int:
     ap.add_argument("--skip-persist", action="store_true", help="backtest only, no registry/predictions writes")
     args = ap.parse_args()
 
-    df, _rank = load_data()
+    df, rank = load_data()
     print(f"feature rows: {len(df):,} across {df['category'].nunique()} categories "
           f"[{df['week_start'].min()} .. {df['week_start'].max()}]")
 
@@ -165,18 +207,28 @@ def main() -> int:
     for target, model_name in (( "revenue","forecast_category_weekly_revenue"), ("orders", "forecast_category_weekly_orders")):
         print(f"\n=== {model_name} (target={target}) ===")
         recs = rolling_origin_records(df, target)
-        metrics = backtest.forecast_metrics(recs)
-        print("  backtest:", {k: round(v, 4) for k, v in metrics.items()})
+        raw_metrics = backtest.forecast_metrics(recs)
+        print("  backtest:", {k: round(v, 4) for k, v in raw_metrics.items()})
         print(f"  folds across all categories: {recs['fold'].nunique()}, test rows: {len(recs):,}")
 
         if args.skip_persist:
             continue
 
+        cat_wmape = per_category_wmape(recs)
+        by_code = category_wmape_by_code(cat_wmape, rank)
+        metrics = {
+            **{k: round(v, 4) for k, v in raw_metrics.items()},
+            "wmape_by_category_code": by_code,
+            "wmape_by_category": {c: round(v, 4) for c, v in sorted(cat_wmape.items())},
+        }
+        lo, hi = min(cat_wmape.values()), max(cat_wmape.values()) if cat_wmape else (0.0, 0.0)
+        print(f"  per-category WMAPE: {len(cat_wmape)} categories, range {lo:.3f} .. {hi:.3f}")
+
         model = train_final(df, target)
         artifact = common.save_artifact(
             model_name, version, model,
             {"target": target, "features": FEATURES,
-             "backtest": {k: round(v, 4) for k, v in metrics.items()}},
+             "backtest": {k: round(v, 4) for k, v in raw_metrics.items()}},
         )
         # Global SHAP: which features drive this target most?
         sample = df.sample(n=min(3000, len(df)), random_state=42)
@@ -194,14 +246,17 @@ def main() -> int:
             framework="lightgbm", task="regression", grain="category_week",
             artifact_path=str(artifact), params={"n_estimators": 500, "learning_rate": 0.05,
                                                   "horizon_weeks": HORIZON},
-            metrics={**{k: round(v, 4) for k, v in metrics.items()},
+            metrics={**metrics,
                      "shap_top_features": top,
                      "shap_plot": (str(shap_png) if shap_png else None)},
             features=FEATURES,
             trained_on={"target": target, "n_rows": int(len(df)), "n_categories": int(df["category"].nunique())},
             trained_window={"start": str(df["week_start"].min()), "end": str(df["week_start"].max())},
         )
-        written = persist_backtest_predictions(recs, model_name, version)
+        written = persist_backtest_predictions(
+            recs, model_name, version,
+            cat_wmape=cat_wmape, global_wmape=float(raw_metrics["wmape"]),
+        )
         print(f"  wrote {written:,} backtest predictions to gold.predictions")
     return 0
 

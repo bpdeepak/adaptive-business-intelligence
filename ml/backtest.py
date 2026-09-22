@@ -165,3 +165,37 @@ def score_at_thresholds(y_true: np.ndarray, y_prob: np.ndarray, thresholds=(0.5,
         out[f"recall@{t}"] = float(recall_score(y_true, y_pred, zero_division=0))
         out[f"f1@{t}"] = float(f1_score(y_true, y_pred, zero_division=0))
     return out
+
+
+def recommended_threshold(y_true: np.ndarray, y_prob: np.ndarray, *, min_precision: float = 0.85) -> float:
+    """Smallest probability threshold whose precision clears `min_precision`.
+
+    Rare-positive problems (fraud ~1 %, bot 2 %, churn-test 9.7 %) make a naive
+    0.5 cutoff a poor operating point — at 0.5, more than half of flagged rows
+    are usually false positives. Run on the TEST set, this returns the most
+    permissive threshold that still meets the precision bar (i.e. maximum
+    recall at the required precision). When the bar is unreachable (a small or
+    hard test split), it returns the threshold with the best achievable
+    precision rather than silently keeping 0.5. Each classifier records the
+    result as `metrics.recommended_threshold`; Phase 4 playbooks
+    (hold-for-review, alert, outreach) should adopt it instead of an
+    undocumented 0.5.
+    """
+    from sklearn.metrics import precision_score
+
+    y_true = np.asarray(y_true, dtype=int)
+    y_prob = np.asarray(y_prob, dtype=float)
+    # Sweep from low to high so the FIRST hit is the most permissive threshold
+    # meeting the bar (max recall at the required precision).
+    best = 0.5
+    best_prec = 0.0
+    for t in np.arange(0.50, 0.995 + 1e-9, 0.005):
+        p = precision_score(y_true, (y_prob >= t).astype(int), zero_division=0)
+        if p >= min_precision:
+            return round(float(t), 3)
+        if p > best_prec:
+            best_prec, best = p, float(t)
+    # Bar unreachable on this test set (small or hard sample, e.g. churn's
+    # 579-row / ~56-positive split): return the threshold with the best
+    # achievable precision instead of silently keeping the naive 0.5 cutoff.
+    return round(best, 3)

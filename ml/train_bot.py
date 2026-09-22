@@ -85,6 +85,12 @@ def main() -> int:
     model = make_model(train)
     metrics = evalwrite.evaluate_classifier(model, test[FEATURES], test["is_synthetic_bot"],
                                             train_positive_rate=float(train["is_synthetic_bot"].mean()))
+    # Operating decision rule for Phase 4 (flag for review/rate-limit): record
+    # the most permissive threshold at >= 85 % precision; bot rate is only ~2 %,
+    # so the naive 0.5 cutoff over-flags.
+    metrics["recommended_threshold"] = backtest.recommended_threshold(
+        test["is_synthetic_bot"].to_numpy(), model.predict_proba(test[FEATURES])[:, 1]
+    )
     print("  metrics:", {k: round(v, 4) for k, v in metrics.items()})
 
     if args.skip_persist:

@@ -20,7 +20,7 @@ sidecar wired into the Go API — all built, tested, and running end to end.
 | Gold | `gold.fct_orders` + `gold.fct_order_items`, 4 dims, metric tables (`daily_revenue`, `daily_orders`, `daily_aov`, `top_categories`) — plus **hot-path** `gold.realtime_metrics` (1-min buckets, reconciled from bronze), `gold.anomalies`, and `gold.detector_state` (restart-resumable baseline) written by the Go realtime stack |
 | Streaming | `cmd/producer` replays history (virtual clock, 3-source merge, infinite loops); `cmd/server` runs the bronze-writer + realtime aggregator (Welford/z-score + sigma floor), a retention janitor (enforces 12 h bronze / 3 h bucket budgets), a bronze→realtime reconcile (self-heals redelivery double-counts), and Prometheus `/metrics` |
 | Serving | Go REST API + SSE live stream + gRPC :8090 (live metrics), embedded dashboard with live tiles + anomaly banner; **Phase 2** predict surface (`/api/v1/model-registry`, `/predictions[/latest]`, `/score`, `/models/health`) served from Postgres, with an optional Python scoring sidecar (`127.0.0.1:8093`) |
-| Predictive (Phase 2) | `ml/` Python stack (uv `ml` group): LightGBM + XGBoost trained with strict time splits, SHAP `TreeExplainer` explanations on every prediction, `gold.model_registry` (5 active versions), `gold.predictions` (41k+ backtest rows + live scores, each with explanation jsonb), versioned joblib artifacts in `artifacts/`, stdlib HTTP sidecar `ml/serve.py` |
+| Predictive (Phase 2) | `ml/` Python stack (uv `ml` group): LightGBM + XGBoost trained with strict time splits, SHAP `TreeExplainer` explanations on every prediction, `gold.model_registry` (5 active versions), `gold.predictions` (42k+ backtest rows + live scores, each with explanation jsonb), per-category forecast confidence bands, versioned joblib artifacts in `artifacts/`, stdlib HTTP sidecar `ml/serve.py` |
 | Dashboard | Vanilla JS + Chart.js: KPI cards, daily charts, top categories, 7D/30D/90D/All windows, **live revenue/orders/sessions tiles, anomaly banner, replay-speed badge** |
 
 ## Architecture
@@ -203,19 +203,27 @@ Every push/PR to `main` also runs the full pipeline in CI: `docker compose up -d
 - **Lineage:** every bronze row carries `_loaded_at`, `_source_file`, `_batch_id`
   (streaming rows add `loop_id`, `_kafka_topic/partition/offset`).
 - **Phase 2 models (strict time splits, out-of-sample):** forecast revenue WMAPE
-  **0.310**, orders **0.272**; churn AUC **0.652** (label-availability rule, no
-  calendar-year drift proxy); fraud AUC **0.85**, lift@5% **19.9×**; bot AUC
-  **1.0** (deterministic synthetic corpus — documented, not over-claimed). All
-  metrics stored in `gold.model_registry.metrics` per version.
+  **0.310**, orders **0.272** — with **per-category confidence bands** (category
+  WMAPE spans 0.16 … 2.87 / 0.15 … 4.17, so rare categories report a visibly
+  lower confidence than the headline); churn AUC **0.652** (label-availability
+  rule, no calendar-year drift proxy); fraud AUC **0.85**, lift@5% **19.9×**;
+  bot AUC **1.0** (deterministic synthetic corpus — documented, not
+  over-claimed). Every classifier records a `recommended_threshold` (fraud
+  **0.795** for the hold-for-review playbook, churn 0.595, bot 0.5) so Phase 4
+  never inherits an undocumented 0.5 default. All metrics stored in
+  `gold.model_registry.metrics` per version.
 - **Phase 2 explainability:** every persisted prediction in `gold.predictions`
   carries a SHAP `explanation` jsonb (per-feature contributions +
   predicted_probability); TreeExplainer is built once per model, so backtest
   persistence and live scoring stay fast (17k-row timeout fixed by design).
 - **Phase 2 serving, verified live:** stdlib sidecar `ml/serve.py` scores all
-  four families with explanations; Go `POST /api/v1/score` round-trips and
-  persists a scored row, and the read endpoints serve the registry (9 versions,
-  5 active) and 41k+ predictions; 502/503 degrade paths and 400 validation
-  verified; predict integration tests (fake in-process sidecar) green.
+  four families with explanations (forecast confidence is per-category);
+  Go `POST /api/v1/score` round-trips and persists a scored row, and the read
+  endpoints serve the registry (11 versions, 5 active) and 42k+ predictions;
+  502/503 degrade paths and 400 validation verified; predict integration tests
+  (fake in-process sidecar) green; the serving DDL is single-sourced from
+  `api/internal/predict/schema.sql` (Go `//go:embed` + `ml/common.py`), pinned
+  by unit tests.
 - **ML tests:** `uv run --group ml python -m pytest ml/tests -q` green
   (backtest metric maths incl. single-class guard).
 
@@ -255,7 +263,13 @@ should fetch before answering metric questions.
   `docs/phase2.md`. **Complete and verified.**
 - **Phase 3** — agent-driven root-cause explanations (reacting to
   `ecommerce.anomalies` events) plus the semantic layer / natural-language
-  queries path.
+  queries path. Phase 3 also owns the live-path work deferred from Phase 2
+  (recorded in `docs/phase2.md` §9): **stream-driven scoring** (fraud per
+  order / bot per session off the Redpanda consumers, reusing the sidecar),
+  the **fraud model-score writer into `gold.anomalies`**, and the
+  **prediction UI pass** (forecast chart with confidence bands, churn-risk
+  leaderboard, fraud-score column on the live order feed) — all data for it
+  is already exposed by the Phase 2 API.
 - **Phase 4** — conversational agents, subscriptions, alerting; drift monitoring
   and drift-triggered retraining of the Phase 2 models.
 - **Phase 5** — Deployment: Docker image (already provided in `api/Dockerfile`),

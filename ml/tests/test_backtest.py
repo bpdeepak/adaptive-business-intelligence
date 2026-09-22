@@ -89,3 +89,39 @@ def test_classification_metrics_known_auc():
     p2 = np.array([0.4, 0.6, 0.1, 0.9])
     m2 = backtest.classification_metrics(y, p2, positive_share=0.5)
     assert m2["auc"] == pytest.approx(0.5)
+
+
+def test_recommended_threshold_perfect_separator():
+    y = np.array([0, 0, 0, 1, 1, 1])
+    p = np.array([0.1, 0.2, 0.3, 0.95, 0.97, 0.99])
+    # precision is already 1.0 at 0.5 -> the naive cutoff IS the operating point
+    assert backtest.recommended_threshold(y, p) == 0.5
+
+
+def test_recommended_threshold_raises_the_cutoff():
+    # precision at 0.5 (0.45) is below the bar -> the helper must raise the
+    # cutoff. The last negative sits at 0.56 and the positives at >= 0.97, so
+    # the first >= 0.85-precision sweep step lands mid-gap (~0.565): threshold
+    # rounding can never flip the outcome.
+    y = np.array([0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
+    p = np.array([0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.97, 0.975, 0.98, 0.985, 0.99])
+    t = backtest.recommended_threshold(y, p)
+    assert t > 0.5
+
+    from sklearn.metrics import precision_score
+
+    assert precision_score(y, (p >= t).astype(int), zero_division=0) >= 0.85
+
+
+def test_recommended_threshold_falls_back_to_best_achievable():
+    # bar unreachable (min_precision 0.9): fall back to the argmax-precision
+    # threshold, never to a silent 0.5 that is worse than achievable
+    y = np.array([1, 0, 0])
+    p = np.array([0.6, 0.7, 0.8])
+    t = backtest.recommended_threshold(y, p, min_precision=0.9)
+
+    from sklearn.metrics import precision_score
+
+    sweep = np.arange(0.5, 0.995, 0.005)
+    best = max(precision_score(y, (p >= th).astype(int), zero_division=0) for th in sweep)
+    assert precision_score(y, (p >= t).astype(int), zero_division=0) == pytest.approx(best)

@@ -40,43 +40,24 @@ DATABASE_URL = database_url_from_env()
 # (ml/serve.py) reads from here; Go keeps the path in gold.model_registry.
 ARTIFACTS_DIR = pathlib.Path(os.getenv("ABI_ARTIFACTS_DIR", "artifacts"))
 
-# Model registry DDL shared with api/internal/predict (keep in sync).
-MODEL_REGISTRY_DDL = """
-CREATE TABLE IF NOT EXISTS gold.model_registry (
-    model_name text NOT NULL,
-    model_version text NOT NULL,
-    status text NOT NULL DEFAULT 'active',
-    framework text NOT NULL,
-    task text NOT NULL,
-    grain text NOT NULL,
-    artifact_path text NOT NULL,
-    params jsonb NOT NULL DEFAULT '{}'::jsonb,
-    metrics jsonb NOT NULL DEFAULT '{}'::jsonb,
-    features jsonb NOT NULL DEFAULT '[]'::jsonb,
-    trained_on jsonb NOT NULL DEFAULT '{}'::jsonb,
-    trained_window jsonb NOT NULL DEFAULT '{}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (model_name, model_version)
-)
-"""
+# The Phase 2 serving contracts (gold.model_registry, gold.predictions) are
+# defined ONCE in api/internal/predict/schema.sql. The Go API embeds that file
+# (//go:embed schema.sql) and the trainers load it here, so the Python and Go
+# sides can never drift apart — edit schema.sql only, never a copy.
+_SCHEMA_SQL_PATH = pathlib.Path(__file__).resolve().parent.parent / "api" / "internal" / "predict" / "schema.sql"
 
-PREDICTIONS_DDL = """
-CREATE TABLE IF NOT EXISTS gold.predictions (
-    id bigserial PRIMARY KEY,
-    model_name text NOT NULL,
-    model_version text NOT NULL,
-    grain text NOT NULL,
-    entity_id text NOT NULL,
-    predicted_at timestamptz NOT NULL DEFAULT now(),
-    prediction double precision NOT NULL,
-    confidence double precision NOT NULL DEFAULT 0,
-    lower_bound double precision,
-    upper_bound double precision,
-    explanation jsonb NOT NULL DEFAULT '{}'::jsonb,
-    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT now()
-)
-"""
+
+def _load_schema_sql() -> str:
+    try:
+        return _SCHEMA_SQL_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:  # pragma: no cover — layout is fixed in-repo
+        raise RuntimeError(
+            f"cannot find the shared serving DDL at {_SCHEMA_SQL_PATH} "
+            "(api/internal/predict/schema.sql is the single source of truth)"
+        ) from exc
+
+
+SCHEMA_SQL = _load_schema_sql()
 
 
 def conn() -> psycopg.Connection:
@@ -98,16 +79,9 @@ def read_sql(sql: str) -> pd.DataFrame:
 def ensure_serving_tables() -> None:
     """Idempotent: create gold.model_registry + gold.predictions if missing."""
     with conn() as c:
-        c.execute(MODEL_REGISTRY_DDL)
-        c.execute(PREDICTIONS_DDL)
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_predictions_model_entity "
-            "ON gold.predictions (model_name, entity_id, predicted_at DESC)"
-        )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_predictions_created "
-            "ON gold.predictions (predicted_at DESC)"
-        )
+        # psycopg3 runs parameter-less statements on the simple-query protocol,
+        # so the multi-statement schema.sql executes in a single round-trip.
+        c.execute(SCHEMA_SQL)
 
 
 # ---------------------------------------------------------------------------

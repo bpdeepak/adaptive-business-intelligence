@@ -74,6 +74,7 @@ reproducible with `make dbt ml-features train`.
 | Model | LightGBM regression, 67 categories × week | same |
 | Train rows | 7,102 category-weeks (2016-08-29 → 2018-09-03) | same |
 | **WMAPE** | **0.31** | **0.27** |
+| Per-category WMAPE range | 0.16 … 2.87 | 0.15 … 4.17 |
 | MAPE (non-zero weeks only) | 0.72 | 0.49 |
 | MAE / RMSE | 1,196 / 2,421 | 6.4 / 13.3 |
 | Top SHAP drivers | `orders_lag1`, `avg_order_value`, `revenue_lag1`, `category_code` | `orders_lag1`, `orders_roll4_mean`, `week_of_year`, `category_code` |
@@ -83,6 +84,17 @@ lags `1/2/4/8`, rolling-4 mean/std, `has_prior_week`. The week-ahead horizon at
 the time of writing shows WMAPE in the 27–31 % band — the dominant signal is
 last week's own level (lag-1), which is exactly what a demand forecaster should
 learn from this dataset.
+
+**Confidence is per-category, not one global number.** `1 − wmape` is keyed by
+category from the backtest records: the 67 categories span 0.16 … 2.87 (revenue)
+and 0.15 … 4.17 (orders). Several rare categories sit above 1.0 WMAPE, so their
+forecasts report a visibly lower confidence (clamped ≥ 0.05) than
+`bed_bath_table`-type series — a single global number would have overstated
+them. The map is stored in `gold.model_registry.metrics.wmape_by_category_code`
+and served via the manifest's `baseline_wmape_by_code`, keyed by the same
+`category_code` feature `/score` receives; unknown codes fall back to the global
+WMAPE. Registered `20260922.160716` after the per-category retrain (global
+metrics reproduced exactly; superseded prior versions stay queryable).
 
 ### 4.2 Churn — `churn_risk`
 
@@ -94,7 +106,15 @@ learn from this dataset.
 | **AUC** | **0.65** |
 | Top-5 % vs regime base | 13.8 % vs 9.7 % (**≈ 1.4×**) |
 | Precision / recall @ 0.5 | 0.10 / 0.96 |
+| **Recommended threshold** | **0.595** (first cutoff clearing 85 % precision on the 579-row test set) |
 | Top SHAP drivers | `days_since_first_order` (recency), `aov_prior`, `total_spend_prior`, `avg_review_prior`, `orders_last_90d_prior` |
+
+Operating posture: the recorded `recommended_threshold` is 0.595 (the most
+permissive cutoff whose test precision clears 85 %, computed by
+`backtest.recommended_threshold` and stored in the registry `metrics`). With
+only 579 test rows (~56 churned) these threshold statistics are noisy, so
+Phase 4's outreach playbook should **rank customers by score and work down
+from the top** rather than hard-cutoff at a single number.
 
 **Honesty rules encoded in the feature store** (`dbt/models/marts/predict/feature_customer_churn.sql`):
 
@@ -119,6 +139,7 @@ learn from this dataset.
 | **AUC** | **0.85** |
 | **Lift at top 5 %** | **19.9×** (top-5 % contains 19.3 % of all fraud vs a 1 % base) |
 | Precision / recall @ 0.5 | 0.48 / 0.71; at 0.9 threshold: 0.89 / 0.68 |
+| **Recommended threshold** | **0.795** (max recall at ≥ 85 % test precision — see the decision rule below) |
 | Top SHAP drivers | `velocity_24h`, `price_vs_benchmark`, `order_value`, `order_hour`, `freight_share` |
 
 Labels are injected (`ml/build_fraud_features.py`): velocity bursts (≥ 3
@@ -126,6 +147,15 @@ orders/24 h from a new account), price outliers (≥ 8× the category benchmark)
 ride-the-installments signals (≥ 12 installments on high-value orders), plus
 0.4 % random noise. The model's top SHAP driver being `velocity_24h` confirms
 it learned the injected ground truth, not artifacts.
+
+**Intended operating decision rule (for Phase 4's hold-for-review playbook):**
+flag at `p ≥ 0.795` — the most permissive cutoff whose test precision clears
+85 %, i.e. maximum recall at acceptable queue contamination. **Never default
+to 0.5**: at fraud's ~1 % base rate, the 0.5 cutoff has precision 0.48, so
+more than half of held orders would be false positives — an expensive ops
+queue. `recommended_threshold` is recorded in the registry `metrics` and
+surfaced by the sidecar's `/models`. At 0.795 expect roughly recall in the
+high-0.7s at ~85 %+ precision (between the card's 0.7/0.9 rows).
 
 ### 4.4 Bot — `bot_score`
 
@@ -135,6 +165,7 @@ it learned the injected ground truth, not artifacts.
 | Train / test | 2,651,747 / 662,937 sessions (test from 2018-05-24; bot rate 2 %) |
 | **AUC** | **1.0** (see the caveat) |
 | Lift at top 5 % | 20.2× |
+| **Recommended threshold** | **0.5** (AUC 1.0 ⇒ precision 1.0 already at the naive cutoff — it IS the operating point) |
 | Top SHAP drivers | `has_search` (negative), `click_interval_cv`, `duration_seconds`, `click_count` |
 
 AUC 1.0 is **expected and honest**: the offline corpus
@@ -177,16 +208,21 @@ rows; live `/score` calls land with `{"source":"live_score"}`.
 }
 ```
 
-Both DDLs live in **two places that must stay identical**: `ml/common.py` and
-`api/internal/predict/schema.go` (a `predict.EnsureSchema` bootstrap makes the
-Go server self-sufficient against a fresh stack).
+The DDL is **single-sourced**: `api/internal/predict/schema.sql` is the only
+place these two tables are declared. Go embeds it (`//go:embed schema.sql` —
+`predict.EnsureSchema` makes the server self-sufficient against a fresh stack)
+and `ml/common.py` reads the same file for `make train`, so the Python and Go
+sides can never drift apart; edit `schema.sql` only. `ml/tests/test_schema_source.py`
+pins the file's completeness (both tables, both indexes, and every column).
 
 ### 5.3 Serving manifest — `artifacts/sidecar_models.json`
 
 Written by `ml/train_all.py::write_sidecar_manifest()` from the registry's
-`active` rows: name, version, task, grain, artifact path, feature list
-(+ `baseline_wmape` for regressions, which drives the regression confidence
-`1 − wmape`).
+`active` rows: name, version, task, grain, artifact path, feature list; plus
+`baseline_wmape` **and** `baseline_wmape_by_code` for regressions (the
+per-category WMAPE map that drives a per-forecast confidence, §4.1) and
+`recommended_threshold` for classifiers (§4.2–§4.4). `GET /models` returns
+these descriptors minus `artifact_path` and runtime state.
 
 `artifacts/` is **derived, not committed** (items are build products of
 training — same policy as `data/raw/`, `api/bin/`, `dbt/target/`, and
@@ -201,7 +237,7 @@ empty model list and a clear stderr hint rather than crashing.
 | Endpoint | Behaviour |
 |---|---|
 | `GET /health` | `{"status":"ok","models":[...]}` |
-| `GET /models` | descriptors (name, version, task, grain, features) |
+| `GET /models` | descriptors (name, version, task, grain, features, per-category WMAPE for regressions, recommended threshold for classifiers) |
 | `POST /score` | `{"model":"fraud_risk","features":{...}}` → prediction, confidence, top-25 SHAP contributions |
 
 `ml/serve.py` is stdlib-only at run time (the ML imports happen at first
@@ -244,7 +280,20 @@ tests). See `api/internal/config/config.go`, `ml/serve.py`, `.env.example`.
 ## 8. Test evidence
 
 - **ML unit tests**: `uv run --group ml python -m pytest ml/tests -q` — green
-  (backtest metric maths incl. the single-class guard).
+  (backtest metric maths incl. the single-class guard and the recommended-
+  threshold sweep, the single-sourced schema test, and the sidecar descriptor
+  runtime-state guard).
+- **Schema drift net**: both sides load the SAME `api/internal/predict/schema.sql`
+  (Go `//go:embed`, `ml/common.py`) — there is no second copy to diverge;
+  `test_schema_source.py` pins both tables, both indexes and every column.
+- **Sidecar /models contract**: `test_serve_descriptors.py` proves a
+  warmup-loaded estimator / cached TreeExplainer never leaks into `/models`
+  (JSON-unsafe runtime state is stripped).
+- **CI smoke training is bounded**: the workflow trains against the CI Postgres
+  with explicit caps (fraud 20k orders; bot corpus 500 converting + ≤ 20
+  abandoned/day vs the local 3.3M sessions) and `--skip-persist` on every
+  trainer, keeping wall-clock fit for shared runners; full training runs
+  locally via `make train`.
 - **dbt**: `uv run dbt build` green in CI (feature-store tests incl. the new
   churn contract, 96 data tests).
 - **Go vet + build + unit tests**: `go vet ./...`, `go build ./...`,
@@ -252,11 +301,13 @@ tests). See `api/internal/config/config.go`, `ml/serve.py`, `.env.example`.
 - **Integration** (real Postgres; predict tests spin a fake in-process
   sidecar): `go test -tags integration ./internal/store/ ./internal/realtime/
   ./internal/predict/` — green locally and in CI.
-- **Live E2E**: sidecar `/health` + `/score` exercised for all four families
-  (regression WMAPE-driven confidence; classifier confidence = distance from
-  toss-up) with SHAP contributions returned; Go `POST /api/v1/score` round-trip
-  persisted a live-scored row and read it back; stale-port and 503/502 paths
-  verified. `scripts/smoke_check.sh` asserts the predict endpoints in CI.
+- **Live E2E**: sidecar `/models` + `/score` exercised for all four families
+  (regression confidence is per-category — `1 − wmape` keyed by `category_code`,
+  verified 0.78 vs 0.05 for a good vs a rare category; classifier confidence =
+  distance from toss-up, with `recommended_threshold` in the descriptors) with
+  SHAP contributions returned; Go `POST /api/v1/score` round-trip persisted a
+  live-scored row and read it back; stale-port and 503/502 paths verified.
+  `scripts/smoke_check.sh` asserts the predict endpoints in CI.
 
 ## 9. Deferred (explicitly out of Phase 2 scope)
 
@@ -280,3 +331,30 @@ tests). See `api/internal/config/config.go`, `ml/serve.py`, `.env.example`.
 8. **Category-level trend lines / holiday flags** in the forecast — the spec's
    Brazilian holiday flag is noted as a future feature; current WMAPE already
    meets the phase bar.
+9. **Fraud/bot model-score writer into `gold.anomalies`** (Phase 2 spec §8) —
+   **deliberate scope change, recorded so Phase 3 does not assume it exists.**
+   The spec planned a model-score writer beside the statistical (Welford)
+   writer in the same `gold.anomalies` table the dashboard banner already
+   reads. The sidecar design supersedes that: model scores live in
+   `gold.predictions` and are served by `POST /api/v1/score`; `gold.anomalies`
+   stays statistical-only. **Phase 3's action layer must read model scores
+   from `gold.predictions`, not `gold.anomalies`.**
+10. **Stream-driven scoring.** Fraud-per-order and bot-per-session scoring do
+    not yet run automatically as orders/sessions arrive off Redpanda — the
+    model layer is a callable service, not yet part of the live pipeline.
+    Wiring a realtime consumer-side scoring hook (reusing the sidecar, which
+    would also feed the `gold.anomalies` writer of item 9) is **Phase 3
+    scope**.
+11. **Dashboard/UI for predictions.** The spec's forecast chart with confidence
+    bands, a churn-risk leaderboard, and a fraud-score column on the live order
+    feed are deferred to a **dedicated Phase 3 UI pass**. All the data a UI
+    needs is already exposed (§6.2: registry, predictions, `/score`), so the
+    pass is pure frontend.
+12. **Shared bot-synthesis config.** `ml/replay_session_corpus.py` now reads the
+    SAME env vars as the Go producer (`ABI_BOT_RATIO`,
+    `ABI_SESSION_CONVERSION_RATE`), closing the primary drift vector between
+    live synthesis and the classifier's training corpus — tuning the replay
+    applies to training automatically. The session-level timing micro-constants
+    (click gaps, burst intervals, funnel walk shapes) are still hand-mirrored
+    between `simulator.go` and the corpus builder: **flagged tech debt**, with
+    a single shared JSON config as the eventual fix.

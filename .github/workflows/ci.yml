@@ -53,9 +53,13 @@ jobs:
 
       - name: Phase 2 ML — smoke feature build + training (scratch Postgres tables)
         run: |
-          ## The builders (re)create their non-SQL feature stores in the CI
-          ## Postgres with small limits; the trainers disable registry/prediction
-          ## writes (--skip-persist) and just prove the backtests run end to end.
+          ## CI smoke training: builders (re)create their feature stores in the
+          ## CI Postgres with EXPLICIT caps (fraud 20k orders; bot corpus 500
+          ## converting + <=20 abandoned/day vs the local 3.3M sessions), and
+          ## every trainer runs --skip-persist (backtests only — no registry,
+          ## prediction, or artifact writes). Bounded corpus => bounded
+          ## wall-clock on shared runners; full training runs locally via
+          ## `make train` (docs/phase2.md §8).
           uv run --group ml python ml/build_fraud_features.py --limit 20000
           uv run --group ml python ml/replay_session_corpus.py --limit-orders 500 --max-abandon-per-day 20
           uv run --group ml python ml/train_forecast.py --skip-persist

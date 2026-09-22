@@ -27,6 +27,7 @@ Output table: gold.session_features (durable, per-session features + label).
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -35,9 +36,31 @@ import pandas as pd
 
 import common
 
-BOT_RATIO = 0.02
-CONVERSION = 0.03
+BOT_RATIO_DEFAULT = 0.02
+CONVERSION_DEFAULT = 0.03
 CLICK_MIN, CLICK_MAX = 3, 12
+
+
+def _env_float(name: str, default: float) -> float:
+    """Same env contract as api/internal/config/config.go (floatenv): invalid
+    or non-positive values fall back to the default."""
+    try:
+        v = float(os.getenv(name, ""))
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+# Mirrors the Go producer (api/internal/config/config.go: ABI_BOT_RATIO /
+# ABI_SESSION_CONVERSION_RATE). Reading the SAME env vars means tuning the
+# replay's synthesis (e.g. the conversion rate) automatically applies to the
+# offline training corpus — closing the primary drift vector between the live
+# stream and the classifier's training data. The session-level timing
+# micro-constants (click gaps, burst intervals, funnel walks) are still
+# hand-mirrored between simulator.go and this file: flagged tech debt
+# (docs/phase2.md §9).
+BOT_RATIO = _env_float("ABI_BOT_RATIO", BOT_RATIO_DEFAULT)
+CONVERSION = _env_float("ABI_SESSION_CONVERSION_RATE", CONVERSION_DEFAULT)
 
 FUNNEL = ["home", "category", "search", "product", "cart", "checkout"]
 BROWSE = ["home", "category", "search", "product", "cart"]
