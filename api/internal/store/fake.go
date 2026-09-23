@@ -16,7 +16,7 @@ type FakeStore struct {
 	TopCategoriesFn func(ctx context.Context, metric string, limit int) ([]model.Category, error)
 
 	RecentMetricsFn func(ctx context.Context, n int) ([]model.RealtimeBucket, error)
-	OpenAnomaliesFn func(ctx context.Context) ([]model.Anomaly, error)
+	OpenAnomaliesFn func(ctx context.Context, detector string) ([]model.Anomaly, error)
 	DismissFn       func(ctx context.Context, id int64) error
 }
 
@@ -55,9 +55,9 @@ func (f *FakeStore) RecentRealtimeMetrics(ctx context.Context, n int) ([]model.R
 	return []model.RealtimeBucket{}, nil
 }
 
-func (f *FakeStore) OpenAnomalies(ctx context.Context) ([]model.Anomaly, error) {
+func (f *FakeStore) OpenAnomalies(ctx context.Context, detector string) ([]model.Anomaly, error) {
 	if f.OpenAnomaliesFn != nil {
-		return f.OpenAnomaliesFn(ctx)
+		return f.OpenAnomaliesFn(ctx, detector)
 	}
 	return []model.Anomaly{}, nil
 }

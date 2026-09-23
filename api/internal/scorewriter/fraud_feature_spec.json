@@ -1,0 +1,26 @@
+{
+  "model": "fraud_risk",
+  "version": 1,
+  "description": "Shared feature contract for the transaction fraud-risk model. Both the Python training pipeline (ml/train_fraud.py, gold.feature_fraud_orders) and the Go stream-score feature assembler (api/internal/scorewriter/features.go) must agree on exactly these names, in this order — it is the model's manifest feature order, which ml/serve.py uses to build the scoring DataFrame (missing features become 0.0). The file lives in the Go module because the Go side embeds it; the Python side reads it from disk and both test suites assert against it.",
+  "features": [
+    { "name": "order_value",        "source": "event",     "transform": "payment_value_total from the order event", "units": "BRL" },
+    { "name": "item_count",         "source": "event",     "transform": "count of order item rows (count(*), no quantity scaling)", "units": "count" },
+    { "name": "freight_share",      "source": "event",     "transform": "sum(freight_value) / (sum(price) + sum(freight_value))", "units": "fraction" },
+    { "name": "payment_count",      "source": "event",     "transform": "count of payment rows on the order", "units": "count" },
+    { "name": "installments_max",   "source": "event",     "transform": "max(payment_installments) over payment rows; 1 when none", "units": "count" },
+    { "name": "categories_count",   "source": "reference", "transform": "distinct product categories in the order via gold.dim_products", "units": "count" },
+    { "name": "price_vs_benchmark", "source": "ring",      "transform": "order_value / trailing-90-day mean order_value of the order's primary category (strictly-before window; 1.0 when no prior history)", "units": "ratio" },
+    { "name": "velocity_24h",       "source": "ring",      "transform": "same-customer order count with event-time at or after t-24h, excluding this order", "units": "count" },
+    { "name": "account_age_days",   "source": "ring",      "transform": "whole days (floor) between the customer's first processed order and this order (event-time)", "units": "days" },
+    { "name": "order_hour",         "source": "event",     "transform": "extract(hour from order_purchase_timestamp)", "units": "hour" },
+    { "name": "is_weekend",         "source": "event",     "transform": "1 when the purchase timestamp isodow is 6 or 7", "units": "flag" },
+    { "name": "is_lost",            "source": "event",     "transform": "1 when order_status in (canceled, unavailable)", "units": "flag" },
+    { "name": "pay_boleto",         "source": "event",     "transform": "one-hot of the primary payment type (row with max payment_value); 1 when boleto", "units": "flag" },
+    { "name": "pay_credit_card",    "source": "event",     "transform": "one-hot of the primary payment type; 1 when credit_card", "units": "flag" },
+    { "name": "pay_debit_card",     "source": "event",     "transform": "one-hot of the primary payment type; 1 when debit_card", "units": "flag" },
+    { "name": "pay_not_defined",    "source": "event",     "transform": "one-hot of the primary payment type; 1 when not_defined", "units": "flag" },
+    { "name": "pay_unknown",        "source": "event",     "transform": "one-hot; 1 when the order has no payment rows (fillna 'unknown')", "units": "flag" },
+    { "name": "pay_voucher",        "source": "event",     "transform": "one-hot of the primary payment type; 1 when voucher", "units": "flag" },
+    { "name": "category_code",      "source": "reference", "transform": "revenue-rank code of the top-price item's category via registry metrics.category_rank (never recomputed here)", "units": "code" }
+  ]
+}

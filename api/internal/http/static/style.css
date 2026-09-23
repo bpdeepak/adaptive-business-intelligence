@@ -175,6 +175,80 @@ main { padding: 24px 28px; }
 .meta-card li b { color: var(--text); font-weight: 600; }
 #refreshTime { margin-top: 10px; font-size: 12px; }
 
+/* Phase 3 · risk tables (fraud feed + churn leaderboard) */
+.cat-select {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px 8px;
+  font-size: 12px;
+  margin-left: 8px;
+}
+
+.risk-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.risk-table th {
+  text-align: left;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.risk-table td {
+  padding: 7px 8px;
+  border-bottom: 1px dashed var(--border);
+  font-variant-numeric: tabular-nums;
+}
+.risk-table tr:last-child td { border-bottom: none; }
+.muted-cell { color: var(--muted); text-align: center; }
+
+.score {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.score.high { color: var(--danger); }
+.score.mid { color: var(--warn); }
+.score.low { color: var(--accent-2); }
+
+.src-badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.src-badge.stream_score { color: var(--accent-2); border-color: var(--accent-2); }
+.src-badge.batch, .src-badge.live_score { color: var(--accent); border-color: var(--accent); }
+
+.id-cell { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; color: var(--muted); }
+.time-cell { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.score-cell { text-align: right; }
+
+.band-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+}
+.band-item { display: flex; flex-direction: column; gap: 2px; }
+.band-item .band-k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+.band-item .band-v { font-weight: 650; font-variant-numeric: tabular-nums; }
+.band-item .band-h { color: var(--muted); font-size: 11px; }
+
 .footer {
   padding: 20px 28px;
   color: var(--muted);

@@ -51,6 +51,13 @@ jobs:
           uv sync --group ml
           uv run --group ml python -m pytest ml/tests -q
 
+      - name: Phase 3 agent — deterministic eval regression gate
+        # The 19-question NL-BI eval (grounding v2 + honest refusal +
+        # batch/live provenance trap) runs against the fake DB with the mock
+        # LLM: fully deterministic, no Ollama, no network, no Postgres.
+        run: |
+          uv run --group ml python -m ml.agent.eval_agent --db fake --llm mock
+
       - name: Phase 2 ML — smoke feature build + training (scratch Postgres tables)
         run: |
           ## CI smoke training: builders (re)create their feature stores in the

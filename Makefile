@@ -67,3 +67,26 @@ train:
 # Serve registered models over the stdlib scoring sidecar (POST /score).
 serve-models:
 	uv run --group ml python ml/serve.py
+
+# --- Phase 3: agentic NL-BI (ml/agent) ---
+
+# Serve the NL-BI agent sidecar (POST /query). mock = deterministic harness;
+# live = Ollama/OpenAI-compatible LLM (ABI_LLM_BASE_URL / ABI_LLM_MODEL).
+agent-mock:
+	uv run --group ml python ml/agent/server.py --mode mock
+
+agent-serve:
+	uv run --group ml python ml/agent/server.py --mode live
+
+# Regression gate: the 19-question eval against the deterministic fake DB.
+agent-eval:
+	uv run --group ml python -m ml.agent.eval_agent --db fake --llm mock
+
+# Same questions against the dev Postgres (requires the stack + gold layer).
+agent-eval-real:
+	uv run --group ml python -m ml.agent.eval_agent --db real --llm mock
+
+# Everything Python in this phase: ml unit tests + the deterministic eval gate.
+agent-test:
+	uv run --group ml python -m pytest ml/tests -q
+	uv run --group ml python -m ml.agent.eval_agent --db fake --llm mock

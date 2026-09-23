@@ -314,12 +314,38 @@ FROM gold.fct_order_items`)
 		return nil, err
 	}
 
+	payRows, err := pool.Query(ctx, `
+SELECT order_id, payment_type,
+       COALESCE(payment_installments, 0)::int,
+       payment_value::float8
+FROM silver.stg_order_payments
+ORDER BY order_id, payment_value DESC, payment_installments DESC, payment_type`)
+	if err != nil {
+		return nil, fmt.Errorf("load replay payments: %w", err)
+	}
+	defer payRows.Close()
+	payments := make(map[string][]model.ReplayPayment)
+	for payRows.Next() {
+		var orderID, pType string
+		var installments int
+		var value float64
+		if err := payRows.Scan(&orderID, &pType, &installments, &value); err != nil {
+			return nil, fmt.Errorf("scan replay payment: %w", err)
+		}
+		payments[orderID] = append(payments[orderID], model.ReplayPayment{
+			Type: pType, Installments: installments, Value: value,
+		})
+	}
+	if err := payRows.Err(); err != nil {
+		return nil, err
+	}
+
 	out := make([]model.ReplayOrder, 0, len(bs))
 	for _, b := range bs {
 		out = append(out, model.ReplayOrder{
 			OrderID: b.orderID, CustomerID: b.customerID, Status: b.status,
 			PurchaseAt: b.at, PaymentValue: b.value, IsLost: b.lost,
-			Items: items[b.orderID],
+			Items: items[b.orderID], Payments: payments[b.orderID],
 		})
 	}
 	return out, nil

@@ -18,6 +18,6 @@ type Store interface {
 
 	// Realtime (Phase 1) surface backed by gold.realtime_metrics/anomalies.
 	RecentRealtimeMetrics(ctx context.Context, n int) ([]model.RealtimeBucket, error)
-	OpenAnomalies(ctx context.Context) ([]model.Anomaly, error)
+	OpenAnomalies(ctx context.Context, detector string) ([]model.Anomaly, error)
 	DismissAnomaly(ctx context.Context, id int64) error
 }

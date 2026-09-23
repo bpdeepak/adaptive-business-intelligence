@@ -3,6 +3,8 @@ package predict
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -32,6 +34,11 @@ func NewService(pool *pgxpool.Pool, client *ScoreClient, log *slog.Logger) *Serv
 // Instrument attaches the operational registry (nil-safe; optional).
 func (s *Service) Instrument(reg *telemetry.Registry) { s.reg = reg }
 
+// Enabled reports whether live scoring through the sidecar is configured
+// (ABI_SCORE_URL non-empty). The Phase 3 score-writer uses this to decide
+// whether to queue scoring jobs at all.
+func (s *Service) Enabled() bool { return s.client != nil }
+
 // Register wires the Phase 2 endpoints into an existing mux.
 func (s *Service) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/model-registry", s.handleRegistry)
@@ -39,6 +46,7 @@ func (s *Service) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/predictions/latest", s.handleLatestPredictions)
 	mux.HandleFunc("POST /api/v1/score", s.handleScore)
 	mux.HandleFunc("GET /api/v1/models/health", s.handleModelsHealth)
+	mux.HandleFunc("GET /api/v1/forecast/{category}", s.handleForecast)
 }
 
 // RunGaugeLoop refreshes model-serving gauges on a schedule.
@@ -94,7 +102,8 @@ func (s *Service) handlePredictions(w http.ResponseWriter, r *http.Request) {
 		limit = n
 	}
 	rows, err := s.ListPredictions(r.Context(), PredictionsFilter{
-		Model: q.Get("model"), Grain: q.Get("grain"), Entity: q.Get("entity"), Limit: limit,
+		Model: q.Get("model"), Grain: q.Get("grain"), Entity: q.Get("entity"),
+		Source: q.Get("source"), Limit: limit,
 	})
 	if err != nil {
 		s.log.Error("predictions", "error", err)
@@ -102,6 +111,30 @@ func (s *Service) handlePredictions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, rows, start)
+}
+
+// handleForecast serves GET /api/v1/forecast/{category}: the merged weekly
+// forecasts (orders + revenue) for one category with ±MAE confidence bands and
+// the backtest series the band overlays. It only reads persisted predictions —
+// no live scoring involved.
+func (s *Service) handleForecast(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	category := r.PathValue("category")
+	if category == "" {
+		s.writeError(w, http.StatusBadRequest, "missing category path segment")
+		return
+	}
+	summary, err := s.ForecastByCategory(r.Context(), category)
+	if err != nil {
+		s.log.Error("forecast", "category", category, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if len(summary.Series) == 0 && len(summary.Orders) == 0 {
+		s.writeError(w, http.StatusNotFound, "no forecast for category")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, summary, start)
 }
 
 func (s *Service) handleLatestPredictions(w http.ResponseWriter, r *http.Request) {
@@ -147,32 +180,20 @@ func (s *Service) handleScore(w http.ResponseWriter, r *http.Request) {
 		entityID = "adhoc"
 	}
 
-	resp, err := s.client.Score(r.Context(), req.Model, req.Features)
+	resp, id, err := s.ScoreAndPersist(r.Context(), req.Model, entityID, req.Features,
+		json.RawMessage(`{"source":"live_score"}`))
 	if err != nil {
 		s.reg.Counter("abi_score_errors_total", "Live scoring failures.").Inc()
 		s.log.Warn("score", "model", req.Model, "error", err)
-		s.writeError(w, http.StatusBadGateway, err.Error())
+		if resp == nil {
+			s.writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		s.writeError(w, http.StatusInternalServerError, "scored but failed to persist prediction")
 		return
 	}
 	s.reg.Gauge("abi_score_latency_ms", "Wall-clock latency of the last sidecar scoring call.").
 		Set(float64(time.Since(start).Milliseconds()))
-
-	id, err := s.InsertPrediction(r.Context(), InsertPredictionParams{
-		ModelName:    resp.Model,
-		ModelVersion: resp.Version,
-		Grain:        resp.Grain,
-		EntityID:     entityID,
-		Prediction:   resp.Prediction,
-		Confidence:   resp.Confidence,
-		Explanation:  resp.Explanation,
-		Metadata:     json.RawMessage(`{"source":"live_score"}`),
-	})
-	if err != nil {
-		s.reg.Counter("abi_score_errors_total", "Live scoring failures.").Inc()
-		s.log.Error("persist prediction", "error", err)
-		s.writeError(w, http.StatusInternalServerError, "scored but failed to persist prediction")
-		return
-	}
 	s.reg.Counter("abi_predictions_written_total", "Predictions persisted to gold.predictions.").Inc()
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
@@ -181,6 +202,41 @@ func (s *Service) handleScore(w http.ResponseWriter, r *http.Request) {
 		"prediction": resp.Prediction, "confidence": resp.Confidence,
 		"explanation": resp.Explanation,
 	}, start)
+}
+
+// ScoreAndPersist scores one feature vector through the sidecar and persists
+// the explainable prediction. It is THE shared score path for the REST
+// single-shot endpoint and the Phase 3 score-writer (stream-driven rows carry
+// source="stream_score" via their metadata), so both layers exercise exactly
+// the same client call and persistence. The returned response is non-nil when
+// the sidecar answered but persistence failed (the caller can distinguish).
+func (s *Service) ScoreAndPersist(ctx context.Context, modelName, entityID string,
+	features map[string]float64, metadata json.RawMessage) (*ScoreResponse, int64, error) {
+
+	if s.client == nil {
+		return nil, 0, errors.New("live scoring is disabled (ABI_SCORE_URL empty)")
+	}
+	resp, err := s.client.Score(ctx, modelName, features)
+	if err != nil {
+		return nil, 0, fmt.Errorf("score %s: %w", modelName, err)
+	}
+	if resp.Status != "ok" {
+		return resp, 0, fmt.Errorf("sidecar error for %s: %s", modelName, resp.Error)
+	}
+	id, err := s.InsertPrediction(ctx, InsertPredictionParams{
+		ModelName:    resp.Model,
+		ModelVersion: resp.Version,
+		Grain:        resp.Grain,
+		EntityID:     entityID,
+		Prediction:   resp.Prediction,
+		Confidence:   resp.Confidence,
+		Explanation:  resp.Explanation,
+		Metadata:     metadata,
+	})
+	if err != nil {
+		return resp, 0, fmt.Errorf("persist prediction: %w", err)
+	}
+	return resp, id, nil
 }
 
 func (s *Service) handleModelsHealth(w http.ResponseWriter, r *http.Request) {

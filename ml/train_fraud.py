@@ -54,13 +54,12 @@ def load_data() -> tuple[pd.DataFrame, list[str]]:
 
     # category as its revenue-rank code keeps the feature space small and
     # gives trees a meaningful ordering (mirrors the forecast model).
-    rev_by_cat = df.groupby("category_primary")["order_value"].sum().sort_values(ascending=False)
-    rank = {c: i for i, c in enumerate(rev_by_cat.index)}
+    rank = common.category_rank_from(df, "category_primary", "order_value")
     df["category_code"] = df["category_primary"].map(rank).fillna(len(rank)).astype(int)
     df = df.drop(columns=["category_primary"])
 
     features = BASE_FEATURES + pay_cols + ["category_code"]
-    return df, features
+    return df, features, rank
 
 
 def make_model(train: pd.DataFrame, features: list[str]) -> XGBClassifier:
@@ -87,7 +86,7 @@ def main() -> int:
     ap.add_argument("--skip-persist", action="store_true")
     args = ap.parse_args()
 
-    df, features = load_data()
+    df, features, rank = load_data()
     print(f"rows: {len(df):,} orders, fraud rate {df['is_fraud'].mean():.3%}")
 
     train, test = backtest.time_split(df, time_col="order_purchase_timestamp", test_frac=TEST_FRAC)
@@ -126,6 +125,7 @@ def main() -> int:
         params={"n_estimators": 300, "max_depth": 6, "learning_rate": 0.05,
                 "scale_pos_weight": "train-balanced", "synthetic_labels": True},
         metrics={**{k: round(v, 4) for k, v in metrics.items()},
+                 "category_rank": rank,
                  "shap_top_features": top, "shap_plot": str(shap_png) if shap_png else None},
         features=features,
         trained_on={"n_train": int(len(train)), "n_test": int(len(test)),

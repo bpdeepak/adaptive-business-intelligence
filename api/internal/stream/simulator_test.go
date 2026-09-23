@@ -2,7 +2,9 @@ package stream
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -194,6 +196,160 @@ func TestSimulatorLoopWrap(t *testing.T) {
 	if l0OrderIDs[0] == l1OrderIDs[0] {
 		t.Fatal("event ids must differ across loops")
 	}
+}
+
+// TestSessionEndEmittedForCompletedSessions pins the Phase 3 session.end
+// contract: every completed session (converting + abandoned, bot + human) ends
+// with a session.end payload whose statistics are internally consistent with
+// the page views that preceded it — the feature vector a stream score-writer
+// forwards verbatim to the bot model.
+func TestSessionEndEmittedForCompletedSessions(t *testing.T) {
+	sim, ring, w0 := newTestSim(t, sampleOrders(), 0.5)
+	sim.Advance(w0.Add(time.Second))
+	envs := drain(t, ring)
+
+	// session id → sorted page-view times + page types.
+	pages := map[string][]struct {
+		at   time.Time
+		page string
+	}{}
+	carts := map[string]time.Time{}
+	var ends []Envelope
+	for _, e := range envs {
+		switch e.EventType {
+		case EventPageView:
+			var pv PageView
+			if err := e.DecodePayload(&pv); err != nil {
+				t.Fatal(err)
+			}
+			pages[pv.SessionID] = append(pages[pv.SessionID], struct {
+				at   time.Time
+				page string
+			}{e.OccurredAt, pv.PageType})
+		case EventCartAbandoned:
+			var ca CartAbandoned
+			if err := e.DecodePayload(&ca); err != nil {
+				t.Fatal(err)
+			}
+			carts[ca.SessionID] = e.OccurredAt
+		case EventSessionEnd:
+			ends = append(ends, e)
+		}
+	}
+
+	// Three converting sessions (one order each) + the day's abandoned count;
+	// at 1 sim-day per wall-second every session completes.
+	ordersPerDay := 3
+	abandonPerDay := int(math.Round(float64(ordersPerDay) * (1 - 0.03) / 0.03))
+	if len(ends) != ordersPerDay+abandonPerDay {
+		t.Fatalf("session.end count = %d, want %d", len(ends), ordersPerDay+abandonPerDay)
+	}
+
+	// Session-end must be the session's final *clickstream* event: no page view
+	// or cart-abandoned event for the same session may follow it. (Ground-truth
+	// training labels live on a separate restricted topic and may trail it.)
+	lastClick := map[string]int{}
+	for i, e := range envs {
+		if e.EventType == EventPageView || e.EventType == EventCartAbandoned {
+			lastClick[e.Key] = i
+		}
+	}
+	for _, e := range ends {
+		var se SessionEnd
+		if err := e.DecodePayload(&se); err != nil {
+			t.Fatal(err)
+		}
+		if se.SessionID != e.Key {
+			t.Fatalf("session.end key %q != payload session %q", e.Key, se.SessionID)
+		}
+		if want, ok := lastClick[e.Key]; ok && !e.OccurredAt.After(envs[want].OccurredAt) {
+			t.Fatalf("session %s session.end at %v must be after its last click at %v",
+				e.Key, e.OccurredAt, envs[want].OccurredAt)
+		}
+
+		ps := pages[se.SessionID]
+		if se.ClickCount != len(ps) {
+			t.Fatalf("session %s click_count=%d, have %d page views", se.SessionID, se.ClickCount, len(ps))
+		}
+		if se.IsConverting == 1 && !strings.HasPrefix(se.SessionID, "c-") {
+			t.Fatalf("converting session id %q not prefixed c-", se.SessionID)
+		}
+		if se.IsConverting == 0 && !strings.HasPrefix(se.SessionID, "a-") {
+			t.Fatalf("abandoned session id %q not prefixed a-", se.SessionID)
+		}
+		if se.DurationSeconds < 0 {
+			t.Fatalf("session %s negative duration %.3f", se.SessionID, se.DurationSeconds)
+		}
+		// A 30 ms click burst (a multi-click synthetic bot) has an exact
+		// duration and a zero coefficient of variation.
+		if len(ps) >= 2 {
+			uniform := true
+			for i := 1; i < len(ps); i++ {
+				if ps[i].at.Sub(ps[i-1].at) != 30*time.Millisecond {
+					uniform = false
+					break
+				}
+			}
+			if uniform {
+				if got, want := se.DurationSeconds, round3(float64(len(ps)-1)*0.03); got != want {
+					t.Fatalf("session %s duration = %.4f, want %.4f (30 ms burst)", se.SessionID, got, want)
+				}
+				if se.ClickIntervalCV != 0 {
+					t.Fatalf("session %s cv = %v, want 0 for a burst", se.SessionID, se.ClickIntervalCV)
+				}
+			}
+		}
+		// Page-type flags consistent with the observed page views.
+		var types []string
+		for _, p := range ps {
+			types = append(types, p.page)
+		}
+		if se.PageTypesDistinct != len(uniqueStrings(types)) {
+			t.Fatalf("session %s page_types_distinct=%d, want %d", se.SessionID, se.PageTypesDistinct, len(uniqueStrings(types)))
+		}
+		hasFlag := func(want string) int {
+			for _, p := range ps {
+				if p.page == want {
+					return 1
+				}
+			}
+			return 0
+		}
+		if se.HasSearch != hasFlag(PageSearch) || se.HasProductPage != hasFlag(PageProduct) ||
+			se.HasCartPage != hasFlag(PageCart) || se.HasCheckoutPage != hasFlag(PageCheckout) {
+			t.Fatalf("session %s page flags inconsistent with its page views: %+v", se.SessionID, se)
+		}
+		// Cart semantics: abandoned sessions may add a cart; converting never do.
+		if se.IsConverting == 1 {
+			if se.CartAdded != 0 || se.CartValue != 0 {
+				t.Fatalf("converting session %s has cart state: %+v", se.SessionID, se)
+			}
+		} else {
+			if _, had := carts[se.SessionID]; had != (se.CartAdded == 1) {
+				t.Fatalf("session %s cart_added=%d but cart event present=%v", se.SessionID, se.CartAdded, had)
+			}
+			if se.CartAdded == 0 && se.CartValue != 0 {
+				t.Fatalf("session %s cart_value=%v with no cart", se.SessionID, se.CartValue)
+			}
+			if se.CartAdded == 1 {
+				if got := carts[se.SessionID]; !got.Before(e.OccurredAt) {
+					t.Fatalf("session %s session.end must follow its cart event", se.SessionID)
+				}
+			}
+		}
+	}
+}
+
+func uniqueStrings(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // TestRingDropOldest verifies drop-oldest backpressure on the bounded ring.

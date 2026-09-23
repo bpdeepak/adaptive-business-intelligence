@@ -400,18 +400,19 @@ ON CONFLICT (bucket_start) DO UPDATE SET
 }
 
 // persistAnomaly writes a triggered anomaly to gold.anomalies, returning the
-// row with its assigned id.
+// row with its assigned id. The statistical detector is a distinct writer kind
+// from the Phase 3 model-driven rate anomalies (see scorewriter).
 func (a *Aggregator) persistAnomaly(ctx context.Context, anom *model.Anomaly) (*model.Anomaly, error) {
 	var out model.Anomaly
 	err := a.pool.QueryRow(ctx, `
-INSERT INTO gold.anomalies (metric, bucket_start, observed, expected, z_score, severity, status, detected_at)
-VALUES ($1, $2, $3, $4, $5, $6, 'open', now())
-RETURNING id, metric,
+INSERT INTO gold.anomalies (metric, detector, bucket_start, observed, expected, z_score, severity, status, detected_at)
+VALUES ($1, 'statistical', $2, $3, $4, $5, $6, 'open', now())
+RETURNING id, metric, detector,
   to_char(bucket_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
   observed, expected, z_score, severity, status,
   to_char(detected_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
 		anom.Metric, anom.BucketStart, anom.Observed, anom.Expected, anom.ZScore, anom.Severity).
-		Scan(&out.ID, &out.Metric, &out.BucketStart, &out.Observed, &out.Expected,
+		Scan(&out.ID, &out.Metric, &out.Detector, &out.BucketStart, &out.Observed, &out.Expected,
 			&out.ZScore, &out.Severity, &out.Status, &out.DetectedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert anomaly: %w", err)
@@ -429,6 +430,7 @@ func (a *Aggregator) publishAnomaly(ctx context.Context, anom *model.Anomaly) er
 	env, err := stream.NewEnvelope(stream.EventAnomaly, anom.Metric, bt, "", stream.AnomalyEvent{
 		ID:         anom.ID,
 		Metric:     anom.Metric,
+		Detector:   anom.Detector,
 		BucketTime: bt,
 		Observed:   anom.Observed,
 		Expected:   anom.Expected,

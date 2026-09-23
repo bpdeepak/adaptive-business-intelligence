@@ -60,6 +60,7 @@ async function load() {
     renderKpis(d);
     renderMeta(summary);
     renderCharts(revenue.data, orders.data, cats.data);
+    initForecastPicker(cats.data);
     document.querySelectorAll("[data-range-label]").forEach((el) => (el.textContent = rangeLabel()));
   } catch (err) {
     document.getElementById("kpis").innerHTML =
@@ -284,10 +285,15 @@ function showAnomaly(a) {
   live.anomaly = a;
   const banner = document.getElementById("anomalyBanner");
   banner.hidden = false;
+  const rateBased = (a.detector || "") === "model";
+  const fmt = (v) => (String(a.metric).endsWith("_rate")
+    ? `${(v * 100).toFixed(1)}%`
+    : BRL.format(v));
   document.getElementById("anomalyTitle").textContent =
-    `${a.metric} anomaly (${a.severity})`;
+    `${a.metric} anomaly · ${rateBased ? "model rate" : "statistical"} · ${a.severity}`;
   document.getElementById("anomalyDetail").textContent =
-    `bucket ${a.bucket_start} · observed ${BRL.format(a.observed)} vs expected ${BRL.format(a.expected)} · z=${a.z_score.toFixed(2)}`;
+    `bucket ${a.bucket_start} · observed ${fmt(a.observed)} vs expected ${fmt(a.expected)}` +
+    (rateBased ? " · >3× baseline" : ` · z=${a.z_score.toFixed(2)}`);
 }
 
 async function refreshOpenAnomalies() {
@@ -370,7 +376,169 @@ document.getElementById("dismissAnomaly").addEventListener("click", async () => 
   }
 });
 
+/* ------------------------------------------------------------------ */
+/* Phase 3 · model panels: forecast band, churn board, fraud feed      */
+/* ------------------------------------------------------------------ */
+
+const risk = { fraudTimer: null };
+
+function shortID(id) {
+  if (!id) return "—";
+  return id.length > 14 ? `${id.slice(0, 12)}…` : id;
+}
+
+// Thresholds mirror the registry's recommended_thresholds (fraud 0.795,
+// bot 0.5, churn 0.5 are the active rows); anything under is low for display.
+function scoreClass(v) {
+  if (v >= 0.7) return "high";
+  if (v >= 0.4) return "mid";
+  return "low";
+}
+
+function pct(v) { return `${(v * 100).toFixed(1)}%`; }
+
+function sourceOf(p) {
+  return (p.metadata && p.metadata.source) || "batch";
+}
+
+function initForecastPicker(cats) {
+  const sel = document.getElementById("forecastCat");
+  if (!sel || sel.options.length) return;
+  (cats || []).slice(0, 8).forEach((c) => {
+    const opt = document.createElement("option");
+    opt.value = c.category;
+    opt.textContent = c.category;
+    sel.appendChild(opt);
+  });
+  if (!sel.options.length) return;
+  sel.addEventListener("change", () => loadForecast(sel.value));
+  loadForecast(sel.value);
+}
+
+async function loadForecast(category) {
+  try {
+    const env = await getJSON(`/api/v1/forecast/${encodeURIComponent(category)}`);
+    renderForecast(env.data || {});
+  } catch (err) {
+    document.getElementById("forecastBand").hidden = true;
+    const chart = charts.chartForecast;
+    if (chart) {
+      chart.data.labels = [];
+      chart.data.datasets.forEach((ds) => { ds.data = []; });
+      chart.update();
+    }
+  }
+}
+
+function renderForecast(d) {
+  const series = d.series || [];
+  const ord = (d.orders || [])[0];
+  const rev = (d.revenue || [])[0];
+
+  const band = document.getElementById("forecastBand");
+  const items = [];
+  if (ord) {
+    items.push(`<div class="band-item"><span class="band-k">Orders forecast</span>` +
+      `<span class="band-v">${NUM.format(Math.round(ord.prediction))}</span>` +
+      `<span class="band-h">±MAE band ${NUM.format(Math.round(ord.lower_bound))}–${NUM.format(Math.round(ord.upper_bound))}</span></div>`);
+  }
+  if (rev) {
+    items.push(`<div class="band-item"><span class="band-k">Revenue forecast</span>` +
+      `<span class="band-v">${BRL.format(rev.prediction)}</span>` +
+      `<span class="band-h">±MAE band ${BRL.format(rev.lower_bound)}–${BRL.format(rev.upper_bound)} · wMAPE ${pct(rev.wmape || 0)}</span></div>`);
+  }
+  const horizon = (ord && ord.week_start) || (rev && rev.week_start) || "";
+  if (horizon && items.length) {
+    items.push(`<div class="band-item"><span class="band-k">Horizon</span>` +
+      `<span class="band-v">${horizon}</span>` +
+      `<span class="band-h">weekly forecast · backtest series</span></div>`);
+  }
+  band.innerHTML = items.join("");
+  band.hidden = items.length === 0;
+
+  const chart = ensureChart("chartForecast", {
+    type: "line",
+    data: {
+      labels: [],
+      datasets: [
+        { label: "Orders · forecast", data: [], borderColor: PALETTE[0], tension: 0.25, pointRadius: 0, fill: false },
+        { label: "Orders · actual", data: [], borderColor: PALETTE[0], borderDash: [5, 4], pointStyle: "rectRot", fill: false },
+        { label: "Revenue · forecast (BRL)", data: [], borderColor: PALETTE[1], tension: 0.25, pointRadius: 0, fill: false, yAxisID: "y2" },
+        { label: "Revenue · actual (BRL)", data: [], borderColor: PALETTE[1], borderDash: [5, 4], pointStyle: "rectRot", fill: false, yAxisID: "y2" },
+      ],
+    },
+    options: {
+      ...chartDefaults(),
+      scales: {
+        ...chartDefaults().scales,
+        y2: { position: "right", grid: { drawOnChartArea: false }, ticks: { color: "#8b949e" } },
+      },
+    },
+  });
+  if (chart) {
+    chart.data.labels = series.map((p) => p.week_start);
+    chart.data.datasets[0].data = series.map((p) => p.orders);
+    chart.data.datasets[1].data = series.map((p) => p.orders_actual);
+    chart.data.datasets[2].data = series.map((p) => p.revenue);
+    chart.data.datasets[3].data = series.map((p) => p.revenue_actual);
+    chart.update();
+  }
+}
+
+async function loadModelRisk() {
+  try {
+    const env = await getJSON("/api/v1/predictions?model=churn_risk&limit=50");
+    const rows = (env.data || [])
+      .slice()
+      .sort((a, b) => b.prediction - a.prediction)
+      .slice(0, 12);
+    const tbody = document.getElementById("churnBoard");
+    tbody.innerHTML = rows.map((p) =>
+      `<tr><td class="id-cell">${shortID(p.entity_id)}</td>` +
+      `<td class="score-cell"><span class="score ${scoreClass(p.prediction)}">${pct(p.prediction)}</span></td>` +
+      `<td class="score-cell">${(p.confidence * 100).toFixed(0)}%</td>` +
+      `<td class="time-cell">${(p.predicted_at || "").slice(0, 16).replace("T", " ")}</td></tr>`
+    ).join("");
+  } catch {
+    document.getElementById("churnBoard").innerHTML =
+      `<tr><td colspan="4" class="muted-cell">churn board unavailable</td></tr>`;
+  }
+}
+
+async function loadFraudFeed() {
+  let rows = null;
+  try {
+    const env = await getJSON("/api/v1/predictions?model=fraud_risk&source=stream_score&limit=25");
+    rows = env.data || [];
+  } catch { /* fall through to unfiltered */ }
+  if (!rows || !rows.length) {
+    try {
+      const env = await getJSON("/api/v1/predictions?model=fraud_risk&limit=25");
+      rows = env.data || [];
+    } catch { rows = null; }
+  }
+  const tbody = document.querySelector("#fraudFeed tbody");
+  if (!rows || !rows.length) {
+    tbody.innerHTML = `<tr><td colspan="5" class="muted-cell">no stream-scored fraud predictions yet</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map((p) =>
+    `<tr><td class="id-cell">${shortID(p.entity_id)}</td>` +
+    `<td class="score-cell"><span class="score ${scoreClass(p.prediction)}">${pct(p.prediction)}</span></td>` +
+    `<td class="score-cell">${(p.confidence * 100).toFixed(0)}%</td>` +
+    `<td><span class="src-badge ${sourceOf(p)}">${sourceOf(p)}</span></td>` +
+    `<td class="time-cell">${(p.predicted_at || "").slice(0, 16).replace("T", " ")}</td></tr>`
+  ).join("");
+}
+
+function startFraudFeed() {
+  loadFraudFeed();
+  if (!risk.fraudTimer) risk.fraudTimer = setInterval(loadFraudFeed, 15000);
+}
+
 connectLive();
 refreshOpenAnomalies();
+loadModelRisk();
+startFraudFeed();
 
 load();

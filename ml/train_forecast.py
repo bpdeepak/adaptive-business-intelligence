@@ -65,8 +65,7 @@ def load_data() -> tuple[pd.DataFrame, dict]:
     keep = presence[presence >= 16].index
     df = df[df["category"].isin(keep)].copy()
 
-    revenue_by_cat = df.groupby("category")["revenue"].sum().sort_values(ascending=False)
-    rank = {c: i for i, c in enumerate(revenue_by_cat.index)}
+    rank = common.category_rank_from(df, "category", "revenue")
     df["category_code"] = df["category"].map(rank)
 
     numeric = FEATURES + ["revenue", "orders"]
@@ -247,6 +246,7 @@ def main() -> int:
             artifact_path=str(artifact), params={"n_estimators": 500, "learning_rate": 0.05,
                                                   "horizon_weeks": HORIZON},
             metrics={**metrics,
+                     "category_rank": rank,
                      "shap_top_features": top,
                      "shap_plot": (str(shap_png) if shap_png else None)},
             features=FEATURES,

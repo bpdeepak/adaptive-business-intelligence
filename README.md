@@ -11,6 +11,15 @@ tiles. **Phase 2 adds the predictive layer**: four gradient-boosted models
 from day one, a versioned Postgres model registry, every prediction persisted
 with its explanation to `gold.predictions`, and a lightweight Python scoring
 sidecar wired into the Go API — all built, tested, and running end to end.
+**Phase 3 makes it live and conversational**: the Go score-writer scores every
+replayed order and session with batch-exact feature vectors
+(`metadata.source="stream_score"`) and fires model-driven **rate anomalies**
+(`detector='model'`, >3× baseline over 5-minute windows) on the same live
+banner; the dashboard gains forecast confidence bands, a churn leaderboard and
+a live fraud feed; and a free open-source LLM (`ml/agent`, Ollama + Qwen2.5-7B)
+answers natural-language questions with **grounding v2** — only observed or
+derived numbers, batch/live never summed, honest refusal after one bounded
+revision, and a 19-question regression eval.
 
 | Layer | What ships |
 |---|---|
@@ -21,7 +30,9 @@ sidecar wired into the Go API — all built, tested, and running end to end.
 | Streaming | `cmd/producer` replays history (virtual clock, 3-source merge, infinite loops); `cmd/server` runs the bronze-writer + realtime aggregator (Welford/z-score + sigma floor), a retention janitor (enforces 12 h bronze / 3 h bucket budgets), a bronze→realtime reconcile (self-heals redelivery double-counts), and Prometheus `/metrics` |
 | Serving | Go REST API + SSE live stream + gRPC :8090 (live metrics), embedded dashboard with live tiles + anomaly banner; **Phase 2** predict surface (`/api/v1/model-registry`, `/predictions[/latest]`, `/score`, `/models/health`) served from Postgres, with an optional Python scoring sidecar (`127.0.0.1:8093`) |
 | Predictive (Phase 2) | `ml/` Python stack (uv `ml` group): LightGBM + XGBoost trained with strict time splits, SHAP `TreeExplainer` explanations on every prediction, `gold.model_registry` (5 active versions), `gold.predictions` (42k+ backtest rows + live scores, each with explanation jsonb), per-category forecast confidence bands, versioned joblib artifacts in `artifacts/`, stdlib HTTP sidecar `ml/serve.py` |
-| Dashboard | Vanilla JS + Chart.js: KPI cards, daily charts, top categories, 7D/30D/90D/All windows, **live revenue/orders/sessions tiles, anomaly banner, replay-speed badge** |
+| Stream scoring (Phase 3) | `cmd/server` score-writer consumes the replay, assembles batch-exact feature vectors in Go (19-feature fraud spec as the single cross-language source), scores through the same sidecar, persists `source="stream_score"` rows, and fires **model rate anomalies** (`detector='model'`, 5-min window >3× baseline, `z_score NULL`) onto the SSE banner + `gold.anomalies` |
+| Agentic BI (Phase 3) | `ml/agent` NL-BI sidecar (stdlib HTTP :8094): 9 provenance-labeled tools (`batch` / `live_replay` / `registry` / `predictions`), grounding v2 (R1 literal · R2 within-label sum/mean · R3 batch/live-mix ban · R4 score-entity trace), one bounded revision then honest refusal, and a 19-question deterministic eval (fake DB + mock LLM) mirrored against the real DB; Go API `POST /api/v1/agent/query` + metrics |
+| Dashboard | Vanilla JS + Chart.js: KPI cards, daily charts, top categories, 7D/30D/90D/All windows, **live revenue/orders/sessions tiles, anomaly banner (statistical + model rate), replay-speed badge — plus Phase 3 forecast confidence band, churn-risk leaderboard, stream-scored fraud feed** |
 
 ## Architecture
 
@@ -87,12 +98,35 @@ synthetic corpus — expected, documented). Every scored entity lands in
 `gold.predictions` with its SHAP contributions. Full detail, decisions, and
 deferrals: `docs/phase2.md`.
 
+## Stream scoring & agent (Phase 3)
+
+```
+producer ──► order.placed / session.end ──► score-writer (in cmd/server, group "score-writer")
+   │  assembly of batch-exact vectors in Go (fraud 19-feature spec; session end 15-field map)
+   ▼
+ml/serve.py :8093 ──► gold.predictions (metadata.source="stream_score")
+                          │
+   rate tracker (5-min window, >3× baseline) ──► gold.anomalies (detector='model') + SSE banner
+   dashboard: forecast confidence band · churn leaderboard · live fraud feed
+
+NL-BI:
+dashboard ──► Go POST /api/v1/agent/query ──► ml/agent/server.py :8094 ──► Ollama Qwen2.5-7B (or mock)
+   9 provenance-labeled tools · grounding v2 (R1–R4) · ≤1 revision → honest refusal
+   eval gate: 19 questions · fake DB (CI) 19/19 · real DB 18/18 + 1 skip
+```
+
+Two Phase 3 invariants worth calling out: **provenance labels travel with
+every number** (`batch` is the historical layer, `live_replay` is the replay's
+1-minute view — the agent refuses to add them), and **model scores only come
+from `gold.predictions`** (the grounder verifies entity-score claims against
+observed rows). Full detail: `docs/phase3.md`.
+
 ## Repository layout
 
 ```
 ├── docker-compose.yml        # Postgres + MinIO + Redpanda, healthchecked
 ├── pyproject.toml            # uv project: dbt-core, dbt-postgres, boto3, psycopg (+ `ml` group)
-├── Makefile                  # infra/test/app/integration-test/smoke + ml-sync/ml-features/train/serve-models
+├── Makefile                  # infra/test/app/integration-test/smoke + ml-sync/ml-features/train/serve-models and Phase 3 agent targets (agent-eval/agent-mock/agent-serve/agent-test)
 ├── .github/workflows/ci.yml  # CI: compose up → load → dbt → vet/unit/integration → smoke
 ├── scripts/
 │   ├── bootstrap.ps1         # infra → data → bronze → dbt → docs → build (Windows)
@@ -104,17 +138,20 @@ deferrals: `docs/phase2.md`.
 │   └── download_olist.py     # stdlib downloader with byte-size verification
 ├── loader/loader.py          # CSV → MinIO bronze → Postgres bronze.* (COPY + lineage cols)
 ├── dbt/                      # dbt project (profile, macros, sources incl. realtime gold tables)
-├── ml/                       # Phase 2 Python: feature builders, trainers, SHAP explainer,
-│                            #   registry/prediction writers, stdlib serving sidecar (serve.py), tests
+├── ml/                       # Phase 2/3 Python: feature builders, trainers, SHAP explainer,
+│                            #   registry/prediction writers, serving sidecar (serve.py),
+│                            #   NL-BI agent (agent/ — tools, grounding v2, eval, mock LLM), tests
 ├── artifacts/                # derived (gitignored): versioned model joblibs + serving
 │                            #   manifest, written by `make train` — regenerate, don't commit
 ├── api/                      # Go module: cmd/{server,producer,api} + internal/{stream,realtime,
-│                            #   predict,kafka,grpcapi,config,http,metrics,model,store,telemetry}
+│                            #   predict,agent,kafka,grpcapi,config,http,metrics,model,store,telemetry}
 └── docs/
     ├── phase0.md             # Phase 0 decisions, schema dictionary, metric definitions
     ├── phase1.md             # Phase 1 event contract, realtime schema, anomaly detection, ops
-    └── phase2.md             # Phase 2 model cards (verified metrics), registry/predictions
-                              #   contracts, sidecar API, ops, deferrals
+    ├── phase2.md             # Phase 2 model cards (verified metrics), registry/predictions
+    │                         #   contracts, sidecar API, ops, deferrals
+    └── phase3.md             # Phase 3 stream score-writer, rate anomalies, dashboard panels,
+                              #   agent grounding v2 + eval gate, ops
 ```
 
 ## Quickstart (Windows)
@@ -144,6 +181,12 @@ uv run --group ml python ml/replay_session_corpus.py
 uv run dbt build --project-dir dbt --profiles-dir dbt # SQL feature stores
 uv run --group ml python ml/train_all.py  # backtest + register 4 models + write manifest
 uv run --group ml python ml/serve.py      # sidecar http://127.0.0.1:8093 (phase 2 scoring)
+
+# 6. Phase 3: NL-BI agent (run the eval gate, then serve it; mock needs no LLM)
+uv run --group ml python -m ml.agent.eval_agent --db fake --llm mock   # expect 19 passed
+uv run --group ml python ml/agent/server.py --mode mock                # agent on :8094
+# after installing Ollama (winget install Ollama.Ollama; ollama pull qwen2.5:7b-instruct),
+# restart the agent with --mode live. The Go API exposes POST /api/v1/agent/query.
 ```
 
 Linux/CI equivalents:
@@ -166,6 +209,12 @@ make ml-sync
 make dbt ml-features
 make train                           # backtest + register models + sidecar_models.json
 make serve-models                    # scoring sidecar on 127.0.0.1:8093
+
+# 5. Phase 3: agent eval + sidecar (see docs/phase3.md §8)
+make agent-eval                      # deterministic 19-question gate (fake DB + mock LLM)
+make agent-test                      # ml unit tests + the same gate
+make agent-mock                      # agent sidecar on 127.0.0.1:8094 (no LLM required)
+make agent-serve                     # agent sidecar, live mode (Ollama/OpenAI-compatible)
 ```
 
 The Go API treats the sidecar as optional: without it `POST /api/v1/score`
@@ -256,23 +305,25 @@ should fetch before answering metric questions.
   realtime aggregator (Welford/z-score online anomaly detection) into
   `gold.realtime_metrics` / `gold.anomalies`; SSE + gRPC streams feed live
   dashboard tiles with an anomaly banner. **Complete and verified.**
-- **Phase 2 (this phase)** — predictive layer: four gradient-boosted models
+- **Phase 2** — predictive layer: four gradient-boosted models
   (forecast, churn, fraud, bot) with strict time-split backtests, SHAP
   explanations on every prediction, `gold.model_registry` + `gold.predictions`
   contracts, a Python scoring sidecar behind the Go API, CI coverage, and
   `docs/phase2.md`. **Complete and verified.**
-- **Phase 3** — agent-driven root-cause explanations (reacting to
-  `ecommerce.anomalies` events) plus the semantic layer / natural-language
-  queries path. Phase 3 also owns the live-path work deferred from Phase 2
-  (recorded in `docs/phase2.md` §9): **stream-driven scoring** (fraud per
-  order / bot per session off the Redpanda consumers, reusing the sidecar),
-  the **fraud model-score writer into `gold.anomalies`**, and the
-  **prediction UI pass** (forecast chart with confidence bands, churn-risk
-  leaderboard, fraud-score column on the live order feed) — all data for it
-  is already exposed by the Phase 2 API.
+- **Phase 3 (this phase)** — the deferred live path from Phase 2 §9 plus the
+  agentic NL-BI layer: **stream-driven scoring** (fraud per order / bot per
+  session off the Redpanda consumers, reusing the sidecar), **model-driven
+  rate anomalies** into `gold.anomalies` (`detector='model'`, >3× baseline over
+  a 5-minute window), **prediction UI** (forecast confidence band, churn-risk
+  leaderboard, fraud-score column on the live feed), and a **grounded NL-BI
+  agent** (provenance-labeled tools, grounding v2, honest refusal, 19-question
+  regression eval) backed by a free open-source LLM (Ollama Qwen2.5-7B).
+  **Complete and verified** (`docs/phase3.md`): the live sidecar answers
+  grounded questions against the local model at ~2–5 s each (§8.1).
 - **Phase 4** — conversational agents, subscriptions, alerting; drift monitoring
   and drift-triggered retraining of the Phase 2 models.
 - **Phase 5** — Deployment: Docker image (already provided in `api/Dockerfile`),
   observability, horizontal scaling of consumers.
 
-See `docs/phase0.md`, `docs/phase1.md`, and `docs/phase2.md` for full detail.
+See `docs/phase0.md`, `docs/phase1.md`, `docs/phase2.md`, and `docs/phase3.md`
+for full detail.

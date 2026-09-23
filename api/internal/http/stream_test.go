@@ -20,9 +20,9 @@ import (
 func sseServer(t *testing.T) (*Server, *realtime.Broadcaster) {
 	t.Helper()
 	fake := &store.FakeStore{
-		OpenAnomaliesFn: func(context.Context) ([]model.Anomaly, error) {
+		OpenAnomaliesFn: func(context.Context, string) ([]model.Anomaly, error) {
 			return []model.Anomaly{{
-				ID: 1, Metric: "revenue", BucketStart: "2026-01-01T00:00:00Z",
+				ID: 1, Metric: "revenue", Detector: "statistical", BucketStart: "2026-01-01T00:00:00Z",
 				Observed: 9000, Expected: 4000, ZScore: 5.2, Severity: "severe",
 				Status: "open", DetectedAt: "2026-01-01T00:05:00Z",
 			}}, nil

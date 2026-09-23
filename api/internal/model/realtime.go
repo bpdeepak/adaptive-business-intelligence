@@ -15,7 +15,19 @@ type ReplayItem struct {
 	Freight   float64 `json:"freight_value"`
 }
 
+// ReplayPayment is one payment row (silver.stg_order_payments) as needed by the
+// producer and, through the order event, by the Phase 3 fraud feature assembler
+// (payment_count, installments_max, and the pay_* one-hot of the primary type).
+type ReplayPayment struct {
+	Type         string  `json:"payment_type"`
+	Installments int     `json:"payment_installments"`
+	Value        float64 `json:"payment_value"`
+}
+
 // ReplayOrder is one historical order the producer replays onto the stream.
+// Payments are loaded from silver.stg_order_payments so the stream score-writer
+// sees the same payment detail the batch feature builder sees — they are part
+// of the shared feature contract, not re-derived downstream.
 type ReplayOrder struct {
 	OrderID      string
 	CustomerID   string
@@ -24,6 +36,7 @@ type ReplayOrder struct {
 	PaymentValue float64
 	IsLost       bool
 	Items        []ReplayItem
+	Payments     []ReplayPayment
 }
 
 // ---------------------------------------------------------------------------
@@ -44,10 +57,11 @@ type RealtimeBucket struct {
 type Anomaly struct {
 	ID          int64   `json:"id"`
 	Metric      string  `json:"metric"`
+	Detector    string  `json:"detector"` // "statistical" (Phase 1) | "model" (Phase 3 rate-based)
 	BucketStart string  `json:"bucket_start"`
 	Observed    float64 `json:"observed"`
 	Expected    float64 `json:"expected"`
-	ZScore      float64 `json:"z_score"`
+	ZScore      float64 `json:"z_score,omitempty"` // NULL for rate-based model anomalies
 	Severity    string  `json:"severity"`
 	Status      string  `json:"status"`
 	DetectedAt  string  `json:"detected_at"`

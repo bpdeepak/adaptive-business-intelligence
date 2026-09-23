@@ -44,16 +44,19 @@ LIMIT $1`, n)
 	return desc, nil
 }
 
-// OpenAnomalies returns undismissed anomaly rows, newest first.
-func (s *PostgresStore) OpenAnomalies(ctx context.Context) ([]model.Anomaly, error) {
+// OpenAnomalies returns undismissed anomaly rows, newest first. An empty
+// `detector` returns anomalies from every writer kind; pass "statistical" or
+// "model" to narrow to one (Phase 3: the dashboard separates the two).
+func (s *PostgresStore) OpenAnomalies(ctx context.Context, detector string) ([]model.Anomaly, error) {
 	rows, err := s.pool.Query(ctx, `
-SELECT id, metric,
+SELECT id, metric, detector,
        to_char(bucket_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
        observed, expected, z_score, severity, status,
        to_char(detected_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 FROM gold.anomalies
 WHERE status = 'open'
-ORDER BY detected_at DESC`)
+  AND ($1 = '' OR detector = $1)
+ORDER BY detected_at DESC`, detector)
 	if err != nil {
 		return nil, fmt.Errorf("open anomalies: %w", err)
 	}
@@ -62,7 +65,7 @@ ORDER BY detected_at DESC`)
 	var out []model.Anomaly
 	for rows.Next() {
 		var a model.Anomaly
-		if err := rows.Scan(&a.ID, &a.Metric, &a.BucketStart, &a.Observed, &a.Expected,
+		if err := rows.Scan(&a.ID, &a.Metric, &a.Detector, &a.BucketStart, &a.Observed, &a.Expected,
 			&a.ZScore, &a.Severity, &a.Status, &a.DetectedAt); err != nil {
 			return nil, fmt.Errorf("open anomalies scan: %w", err)
 		}

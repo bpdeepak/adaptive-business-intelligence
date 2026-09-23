@@ -113,10 +113,17 @@ func (s *Server) handleRealtimeMetrics(w http.ResponseWriter, r *http.Request) {
 	}, start, s.now))
 }
 
-// handleAnomalies returns open (undismissed) anomalies, newest first.
+// handleAnomalies returns open (undismissed) anomalies, newest first. The
+// optional `detector` query parameter filters by writer kind (statistical /
+// model / empty = all).
 func (s *Server) handleAnomalies(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	anoms, err := s.store.OpenAnomalies(r.Context())
+	detector := r.URL.Query().Get("detector")
+	if detector != "" && detector != "statistical" && detector != "model" {
+		writeError(w, http.StatusBadRequest, "detector must be one of statistical, model", s.now)
+		return
+	}
+	anoms, err := s.store.OpenAnomalies(r.Context(), detector)
 	if err != nil {
 		s.log.Error("anomalies", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error", s.now)

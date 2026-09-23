@@ -296,30 +296,46 @@ func (o *orderSource) buildQueue(rng *rand.Rand, od model.ReplayOrder) {
 	isBot := rng.Float64() < o.cfg.BotRatio
 
 	var queue []subevent
+	var ss *sessionStats
+	var lastEmitted time.Time
 	if isBot {
 		start := orderTime.Add(-250 * time.Millisecond)
 		pages := botPages(rng, o.cfg.ClickMin+rng.Intn(o.cfg.ClickMax-o.cfg.ClickMin+1))
+		ss = newSessionStats(start, true)
+		last := start
 		for i, page := range pages {
 			at := start.Add(time.Duration(i) * 30 * time.Millisecond)
+			ss.addPage(page, 0) // constant 30 ms burst → cv 0
+			last = at
 			queue = append(queue, subevent{
 				env: newEnv(EventPageView, sessID, at, o.ls.loopID,
 					o.pageView(sessID, page, od, rng))})
 		}
+		lastEmitted = last
+		ss.setLast(last)
 	} else {
 		n := o.cfg.ClickMin + rng.Intn(o.cfg.ClickMax-o.cfg.ClickMin+1)
 		pages := funnelPages(rng, n)
-		t := orderTime.Add(-time.Duration(10+rng.Intn(30)) * time.Minute)
+		start := orderTime.Add(-time.Duration(10+rng.Intn(30)) * time.Minute)
+		ss = newSessionStats(start, true)
+		t := start
 		for _, page := range pages {
-			t = t.Add(time.Duration(45+rng.Intn(300)) * time.Second)
+			gap := time.Duration(45+rng.Intn(300)) * time.Second
+			t = t.Add(gap)
 			// Stop once the walk is close to the order — but only after at
 			// least one click has been emitted so sessions always browse.
 			if len(queue) > 0 && t.After(orderTime.Add(-time.Duration(5+rng.Intn(30))*time.Second)) {
 				break
 			}
+			ss.addPage(page, gap.Seconds())
+			lastEmitted = t
 			queue = append(queue, subevent{
 				env: newEnv(EventPageView, sessID, t, o.ls.loopID,
 					o.pageView(sessID, page, od, rng))})
 		}
+		// Corpus semantics: the session ends at the walk's final t — including
+		// the overshoot gap when it broke early, and the dwell before click 1.
+		ss.setLast(t)
 	}
 
 	queue = append(queue, subevent{
@@ -332,7 +348,13 @@ func (o *orderSource) buildQueue(rng *rand.Rand, od model.ReplayOrder) {
 				PaymentValue: od.PaymentValue,
 				IsLost:       od.IsLost,
 				Items:        toOrderItems(od.Items),
+				Payments:     toOrderPayments(od.Payments),
 			})})
+
+	// Terminal marker for the completed converting session, placed just after
+	// the last emitted click (scored regardless of bot/human).
+	queue = append(queue, subevent{
+		env: sessionEndEnv(ss, sessID, od.CustomerID, o.ls.loopID, lastEmitted.Add(time.Millisecond))})
 
 	if isBot {
 		queue = append(queue, subevent{
@@ -364,6 +386,118 @@ func toOrderItems(items []model.ReplayItem) []OrderItem {
 		})
 	}
 	return out
+}
+
+func toOrderPayments(payments []model.ReplayPayment) []OrderPayment {
+	out := make([]OrderPayment, 0, len(payments))
+	for _, p := range payments {
+		out = append(out, OrderPayment{
+			Type:         p.Type,
+			Installments: p.Installments,
+			Value:        p.Value,
+		})
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// session.end emission (Phase 3): every completed session — converting or
+// abandoned, bot or human — ends with a SessionEnd event carrying the exact
+// statistics the bot classifier needs, pre-aggregated here by the producer. The
+// formulas mirror ml/replay_session_corpus.py (the training corpus) so the live
+// feature space is the trained feature space: duration spans the dwell before
+// the first click (and, on an early walk break, the overshoot gap), click_interval_cv
+// is the population std (np.std, ddof=0) of the inter-click gaps (0 when <2
+// gaps or mean <= 0), and hour_of_day/is_weekend come from the session start.
+// ---------------------------------------------------------------------------
+
+type sessionStats struct {
+	startAt    time.Time
+	lastAt     time.Time
+	clickCount int
+	gaps       []float64 // seconds, one per emitted page
+	pageTypes  map[string]struct{}
+	cartAdded  bool
+	cartValue  float64
+	converting bool
+}
+
+func newSessionStats(startAt time.Time, converting bool) *sessionStats {
+	return &sessionStats{startAt: startAt, pageTypes: make(map[string]struct{}), converting: converting}
+}
+
+// addPage records one emitted page view and its trailing interval in seconds.
+// A constant interval (bots) is recorded as 0 — the cv guard (mean <= 0) then
+// reports 0.0 exactly like a constant-gap session.
+func (s *sessionStats) addPage(page string, gapSeconds float64) {
+	s.clickCount++
+	s.gaps = append(s.gaps, gapSeconds)
+	s.pageTypes[page] = struct{}{}
+}
+
+// setLast fixes the session's final timestamp: the end of the walk. On an early
+// break this is the overshoot time (corpus `last = t`), otherwise the last
+// emitted page's time.
+func (s *sessionStats) setLast(t time.Time) { s.lastAt = t }
+
+// build outputs the bot feature vector as the session.end payload.
+func (s *sessionStats) build(sessID, customerID string) SessionEnd {
+	flags := func(want string) int {
+		if _, ok := s.pageTypes[want]; ok {
+			return 1
+		}
+		return 0
+	}
+	return SessionEnd{
+		SessionID:         sessID,
+		CustomerID:        customerID,
+		IsConverting:      b2i(s.converting),
+		ClickCount:        s.clickCount,
+		DurationSeconds:   round3(s.lastAt.Sub(s.startAt).Seconds()),
+		ClickIntervalCV:   popStd(s.gaps),
+		HasSearch:         flags(PageSearch),
+		HasProductPage:    flags(PageProduct),
+		HasCartPage:       flags(PageCart),
+		HasCheckoutPage:   flags(PageCheckout),
+		PageTypesDistinct: len(s.pageTypes),
+		CartAdded:         b2i(s.cartAdded),
+		CartValue:         round2f(s.cartValue),
+		HourOfDay:         s.startAt.Hour(),
+		IsWeekend:         b2i(s.startAt.Weekday() == time.Saturday || s.startAt.Weekday() == time.Sunday),
+	}
+}
+
+func sessionEndEnv(ss *sessionStats, sessID, customerID, loopID string, at time.Time) Envelope {
+	return newEnv(EventSessionEnd, sessID, at, loopID, ss.build(sessID, customerID))
+}
+
+// popStd is the population standard deviation (np.std semantics, ddof=0) with
+// the corpus's cv guards: <2 gaps or a non-positive mean → 0.0.
+func popStd(xs []float64) float64 {
+	if len(xs) < 2 {
+		return 0
+	}
+	sum := 0.0
+	for _, x := range xs {
+		sum += x
+	}
+	mean := sum / float64(len(xs))
+	if mean <= 0 {
+		return 0
+	}
+	v := 0.0
+	for _, x := range xs {
+		d := x - mean
+		v += d * d
+	}
+	return math.Sqrt(v / float64(len(xs)))
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // abandonSource generates abandoned sessions per simulated day, scaled to the
@@ -404,27 +538,33 @@ func (a *abandonSource) buildDay(rng *rand.Rand, dayIdx int) {
 		t0 := dayStart.Add(time.Duration(rng.Float64() * float64(span)))
 		sessID := newSessionID("a-"+randomHex(6), a.ls.loopID)
 		isBot := rng.Float64() < a.cfg.BotRatio
+		ss := newSessionStats(t0, false)
 
 		var tTail time.Time
 		if isBot {
 			pages := botPages(rng, 1+rng.Intn(3))
 			for v, page := range pages {
 				at := t0.Add(time.Duration(v) * 40 * time.Millisecond)
+				ss.addPage(page, 0) // constant 40 ms burst → cv 0
 				queue = append(queue, subevent{
 					env: newEnv(EventPageView, sessID, at, a.ls.loopID,
 						a.pageView(sessID, page, rng))})
 				tTail = at
 			}
+			ss.setLast(tTail)
 		} else {
 			pages := abandonPages(rng, 1+rng.Intn(3))
 			t := t0
 			for _, page := range pages {
-				t = t.Add(time.Duration(1+rng.Intn(8)) * time.Minute)
+				gapMin := 1 + rng.Intn(8)
+				t = t.Add(time.Duration(gapMin) * time.Minute)
+				ss.addPage(page, float64(gapMin)*60)
 				queue = append(queue, subevent{
 					env: newEnv(EventPageView, sessID, t, a.ls.loopID,
 						a.pageView(sessID, page, rng))})
 				tTail = t
 			}
+			ss.setLast(tTail)
 		}
 
 		if rng.Float64() < 0.6 {
@@ -434,10 +574,17 @@ func (a *abandonSource) buildDay(rng *rand.Rand, dayIdx int) {
 				p := a.cfg.Products[rng.Intn(len(a.cfg.Products))]
 				value += a.cfg.Price[p]
 			}
+			ss.cartAdded = true
+			ss.cartValue = round2f(value)
 			queue = append(queue, subevent{
 				env: newEnv(EventCartAbandoned, sessID, at, a.ls.loopID,
 					CartAbandoned{SessionID: sessID, ItemsCount: 1 + rng.Intn(4), CartValue: round2f(value)})})
 		}
+
+		// Terminal marker for the completed (abandoned) session, emitted after
+		// any cart-abandon event and before the ground-truth label.
+		queue = append(queue, subevent{
+			env: sessionEndEnv(ss, sessID, "", a.ls.loopID, tTail.Add(time.Second+time.Millisecond))})
 
 		if isBot {
 			queue = append(queue, subevent{
@@ -575,4 +722,9 @@ func botPages(rng *rand.Rand, n int) []string {
 
 func round2f(v float64) float64 {
 	return math.Round(v*100) / 100
+}
+
+// round3 rounds to 3 decimal places (the corpus's duration_seconds precision).
+func round3(v float64) float64 {
+	return math.Round(v*1000) / 1000
 }

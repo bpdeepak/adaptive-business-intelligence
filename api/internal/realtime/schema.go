@@ -65,20 +65,30 @@ var schemaDDL = []string{
 	)`,
 
 	// Detected anomalies (online EWMA/z-score). `status` lifecycle supports the
-	// dashboard's open/dismissed banner.
+	// dashboard's open/dismissed banner. `detector` separates the two writer
+	// kinds that share this table: "statistical" (Phase 1 EWMA/z-score, carries
+	// z_score) and "model" (Phase 3 model-driven, rate-based — observed/expected
+	// are per-minute rates and z_score is NULL).
 	`CREATE TABLE IF NOT EXISTS gold.anomalies (
 		id          bigserial PRIMARY KEY,
 		metric      text NOT NULL,
+		detector    text NOT NULL DEFAULT 'statistical',
 		bucket_start timestamptz NOT NULL,
 		observed    double precision NOT NULL,
 		expected    double precision NOT NULL,
-		z_score     double precision NOT NULL,
+		z_score     double precision,
 		severity    text NOT NULL,
 		status      text NOT NULL DEFAULT 'open',
 		detected_at timestamptz NOT NULL DEFAULT now(),
 		resolved_at timestamptz,
 		dismissed_at timestamptz
 	)`,
+
+	// Phase 3 migration for databases where gold.anomalies already exists: add
+	// the detector column (existing rows are Phase 1 output) and lift the z_score
+	// NOT NULL constraint so model-driven anomalies can write NULL.
+	`ALTER TABLE gold.anomalies ADD COLUMN IF NOT EXISTS detector text NOT NULL DEFAULT 'statistical'`,
+	`ALTER TABLE gold.anomalies ALTER COLUMN z_score DROP NOT NULL`,
 
 	// Online detector accumulators, snapshotted so a server restart resumes the
 	// Welford/anomaly baseline instead of re-warming (a fresh 20-bucket warm-up
@@ -97,6 +107,7 @@ var schemaDDL = []string{
 	`CREATE INDEX IF NOT EXISTS idx_rt_metrics_bucket ON gold.realtime_metrics (bucket_start)`,
 	`CREATE INDEX IF NOT EXISTS idx_anomalies_status ON gold.anomalies (status)`,
 	`CREATE INDEX IF NOT EXISTS idx_anomalies_detected ON gold.anomalies (detected_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_anomalies_detector ON gold.anomalies (detector, status)`,
 }
 
 // EnsureSchema creates all realtime tables and indexes. Safe to call on every

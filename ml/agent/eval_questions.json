@@ -1,0 +1,197 @@
+{
+  "description": "Regression question set for the Phase 3 agentic NL-BI (3C). Each entry carries the mock-LLM script that produces the answer deterministically plus a `check` the evaluator runs against the same tool layer (fake or real DB), so expectations never drift from the SQL. Rows with answerable=false are the 2-3 intentionally unanswerable questions — the regression asserts the agent refuses them (grounded=false) rather than hallucinating.",
+  "questions": [
+    {
+      "id": "q01",
+      "question": "How many orders are there in the dataset?",
+      "answerable": true,
+      "check": {"type": "number", "tool": "batch_overview", "key": "total_orders"},
+      "script": [
+        {"tool": "batch_overview"},
+        {"answer_template": "The dataset contains {total_orders} orders in total."}
+      ]
+    },
+    {
+      "id": "q02",
+      "question": "What is the total valid revenue of the business?",
+      "answerable": true,
+      "check": {"type": "number", "tool": "batch_overview", "key": "valid_revenue"},
+      "script": [
+        {"tool": "batch_overview"},
+        {"answer_template": "Valid revenue (excluding lost orders) is {valid_revenue}."}
+      ]
+    },
+    {
+      "id": "q03",
+      "question": "What is the average value of a valid order?",
+      "answerable": true,
+      "check": {"type": "number", "tool": "batch_overview", "key": "avg_valid_order_value"},
+      "script": [
+        {"tool": "batch_overview"},
+        {"answer_template": "The average valid order value is {avg_valid_order_value}."}
+      ]
+    },
+    {
+      "id": "q04",
+      "question": "Which product category generates the most revenue?",
+      "answerable": true,
+      "check": {"type": "label", "tool": "batch_top_categories", "params": {"n": 5}, "key": "category"},
+      "script": [
+        {"tool": "batch_top_categories", "params": {"n": 5}},
+        {"answer_template": "The top category by revenue is {category}."}
+      ]
+    },
+    {
+      "id": "q05",
+      "question": "How much revenue did the leading product category produce?",
+      "answerable": true,
+      "check": {"type": "number", "tool": "batch_top_categories", "params": {"n": 1}, "key": "revenue"},
+      "script": [
+        {"tool": "batch_top_categories", "params": {"n": 1}},
+        {"answer_template": "The leading category produced {revenue} in revenue."}
+      ]
+    },
+    {
+      "id": "q06",
+      "question": "How did weekly orders and revenue evolve over the last 4 weeks of the data?",
+      "answerable": true,
+      "check": {"type": "numbers_head", "tool": "batch_revenue_by_week", "params": {"weeks": 4}, "keys": ["orders", "revenue"]},
+      "script": [
+        {"tool": "batch_revenue_by_week", "params": {"weeks": 4}},
+        {"answer_template": "Over the last 4 weeks orders and revenue were: {orders} orders and {revenue} revenue for the most recent week."}
+      ]
+    },
+    {
+      "id": "q07",
+      "question": "What is the forecast of weekly orders for health_beauty?",
+      "answerable": true,
+      "check": {"type": "numbers_head", "tool": "forecast", "params": {"category": "health_beauty"}, "keys": ["prediction"]},
+      "script": [
+        {"tool": "forecast", "params": {"category": "health_beauty"}},
+        {"answer_template": "The latest weekly orders forecast for health_beauty is {prediction}."}
+      ]
+    },
+    {
+      "id": "q08",
+      "question": "Which machine learning models are registered as active?",
+      "answerable": true,
+      "check": {"type": "label", "tool": "list_models", "key": "model_name"},
+      "script": [
+        {"tool": "list_models"},
+        {"answer_template": "Active models include {model_name}."}
+      ]
+    },
+    {
+      "id": "q09",
+      "question": "What is the recommended fraud risk threshold adopted by the fraud model?",
+      "answerable": true,
+      "check": {"type": "number", "tool": "registry_metric", "params": {"model": "fraud_risk"}, "key": "recommended_threshold"},
+      "script": [
+        {"tool": "registry_metric", "params": {"model": "fraud_risk"}},
+        {"answer_template": "The recommended fraud_risk threshold is {recommended_threshold}."}
+      ]
+    },
+    {
+      "id": "q10",
+      "question": "How many orders did the fraud model flag as at-risk, and at what share?",
+      "answerable": true,
+      "check": {"type": "numbers", "tool": "model_rate", "params": {"model": "fraud_risk"}, "keys": ["at_risk", "at_risk_pct"]},
+      "script": [
+        {"tool": "model_rate", "params": {"model": "fraud_risk"}},
+        {"answer_template": "The fraud model flagged {at_risk} orders as at-risk ({at_risk_pct}%)."}
+      ]
+    },
+    {
+      "id": "q11",
+      "question": "What is the bot_score at-risk rate over its persisted scores?",
+      "answerable": true,
+      "check": {"type": "numbers", "tool": "model_rate", "params": {"model": "bot_score"}, "keys": ["at_risk", "at_risk_pct"]},
+      "script": [
+        {"tool": "model_rate", "params": {"model": "bot_score"}},
+        {"answer_template": "The bot_score at-risk rate is {at_risk} sessions ({at_risk_pct}%)."}
+      ]
+    },
+    {
+      "id": "q12",
+      "question": "What fraud risk score was assigned to a recent order?",
+      "answerable": true,
+      "check": {"type": "score_pair", "tool": "model_scores", "params": {"model": "fraud_risk", "limit": 1}},
+      "script": [
+        {"tool": "model_scores", "params": {"model": "fraud_risk", "limit": 1}},
+        {"answer_template": "A recent order got fraud risk {prediction} for entity {entity_id}."}
+      ]
+    },
+    {
+      "id": "q13",
+      "question": "What did the most recent live replay bucket show for orders and revenue?",
+      "answerable": true,
+      "check": {"type": "numbers_head", "tool": "live_realtime", "params": {"minutes": 1440}, "keys": ["orders", "revenue"]},
+      "script": [
+        {"tool": "live_realtime", "params": {"minutes": 1440}},
+        {"answer_template": "The most recent live replay bucket had {orders} orders and {revenue} in revenue."}
+      ]
+    },
+    {
+      "id": "q14",
+      "question": "What share of all orders had a freight share above 20 percent?",
+      "answerable": false,
+      "check": {"type": "unanswerable"},
+      "script": [
+        {"tool": "batch_overview"},
+        {"answer": "I believe the share of orders with freight above 20% is 37.2%."}
+      ]
+    },
+    {
+      "id": "q15",
+      "question": "Which product has the highest defect return rate?",
+      "answerable": false,
+      "check": {"type": "unanswerable"},
+      "script": [
+        {"tool": "batch_top_categories", "params": {"n": 5}},
+        {"answer": "The product with the highest defect return rate is the one with returns of 8764."}
+      ]
+    },
+    {
+      "id": "q16",
+      "question": "What was the exact gross margin of the company in 2025?",
+      "answerable": false,
+      "check": {"type": "unanswerable"},
+      "script": [
+        {"tool": "batch_overview"},
+        {"answer": "The 2025 gross margin was 42.7%, far above the 2017 figure."}
+      ]
+    },
+    {
+      "id": "q17",
+      "question": "Combine the batch weekly revenue with today's live replay revenue to get the true total.",
+      "answerable": false,
+      "check": {"type": "unanswerable"},
+      "script": [
+        {"tool": "batch_revenue_by_week", "params": {"weeks": 1}},
+        {"tool": "live_realtime", "params": {"minutes": 1440}},
+        {"answer": "The batch weekly revenue was 1234.56 and the live replay revenue was 78.90; added together the combined total of both is 1313.46."}
+      ]
+    },
+    {
+      "id": "q19",
+      "question": "Was any anomaly detected in the latest replay window, and how severe?",
+      "answerable": true,
+      "skip_when": "real",
+      "check": {"type": "anomaly", "tool": "live_realtime", "params": {"minutes": 1440}},
+      "script": [
+        {"tool": "live_realtime", "params": {"minutes": 1440}},
+        {"answer_template": "Yes — an anomaly was detected with severity {severity}: observed {observed} vs expected {expected}."}
+      ]
+    },
+    {
+      "id": "q20",
+      "question": "How many distinct customers are there in the dataset?",
+      "answerable": true,
+      "check": {"type": "number", "tool": "batch_overview", "key": "distinct_customers"},
+      "script": [
+        {"tool": "batch_overview"},
+        {"answer_template": "The dataset has {distinct_customers} distinct customers."}
+      ]
+    }
+  ]
+}

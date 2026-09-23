@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
+	"abi/internal/agent"
 	"abi/internal/config"
 	grpcapi "abi/internal/grpcapi"
 	metricsv1 "abi/internal/grpcapi/metricsv1"
@@ -29,6 +30,7 @@ import (
 	"abi/internal/model"
 	"abi/internal/predict"
 	"abi/internal/realtime"
+	"abi/internal/scorewriter"
 	"abi/internal/store"
 	"abi/internal/stream"
 	"abi/internal/telemetry"
@@ -123,6 +125,49 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	predictCtx, predictCancel := context.WithCancel(ctx)
 	defer predictCancel()
 	go predictSvc.RunGaugeLoop(predictCtx, 30*time.Second)
+
+	// 5d. Phase 3 NL→BI agent: proxies the Python agent sidecar (ml/agent/
+	// server.py). Optional; empty ABI_AGENT_URL disables /api/v1/agent/query.
+	agentSvc := agent.NewService(agent.NewAgentClient(cfg.AgentURL), logger)
+	agentSvc.Instrument(reg)
+	agentSvc.Register(rootMux)
+	agentCtx, agentCancel := context.WithCancel(ctx)
+	defer agentCancel()
+	go agentSvc.RunGaugeLoop(agentCtx, 30*time.Second)
+
+	// 5c. Phase 3 stream score-writer: consumes order.placed + session.end
+	// through its own consumer group, assembles the batch-exact feature
+	// vectors, scores via the same sidecar (stream_score rows), and fires
+	// model-driven rate anomalies (detector='model'). It shares the in-process
+	// broadcaster so its anomalies surface on the same SSE/gRPC live banner;
+	// they are not written to ecommerce.anomalies (no consumer exists).
+	if err := scorewriter.EnsureSchema(ctx, pool); err != nil {
+		return err
+	}
+	swCl, err := kafka.Consumer(cfg.KafkaSeedBrokers, cfg.ConsumerGroupScoreWriter,
+		[]string{stream.TopicOrders, stream.TopicClicks})
+	if err != nil {
+		return fmt.Errorf("score-writer consumer: %w", err)
+	}
+	defer swCl.Close()
+	sw, err := scorewriter.New(ctx, scorewriter.Options{
+		Pool:        pool,
+		Client:      swCl,
+		Predict:     predictSvc,
+		Broadcaster: bc,
+		Log:         logger,
+		Speed:       cfg.SpeedMultiplier,
+		Slack:       cfg.ScoreWriterSlack,
+		Buffer:      cfg.ScoreWriterBuffer,
+		StateEvery:  cfg.ScoreWriterStateEvery,
+	})
+	if err != nil {
+		return fmt.Errorf("score-writer init: %w", err)
+	}
+	sw.Instrument(reg)
+	scoreCtx, scoreCancel := context.WithCancel(ctx)
+	defer scoreCancel()
+
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           rootMux,
@@ -153,7 +198,7 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	defer metricsCancel()
 	go metricsLoop(metricsCtx, logger, reg, cfg, aggregator, bc)
 
-	errCh := make(chan error, 4)
+	errCh := make(chan error, 5)
 	go func() {
 		logger.Info("http + SSE listening", "addr", cfg.HTTPAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -177,6 +222,16 @@ func run(logger *slog.Logger, cfg config.Config) error {
 		if err := aggregator.Run(ctx); err != nil {
 			errCh <- fmt.Errorf("aggregator: %w", err)
 		}
+	}()
+	go func() {
+		logger.Info("score-writer consuming", "group", cfg.ConsumerGroupScoreWriter)
+		if err := sw.Run(scoreCtx); err != nil {
+			errCh <- fmt.Errorf("score-writer: %w", err)
+		}
+	}()
+	go func() {
+		logger.Info("score-writer scoring", "group", cfg.ConsumerGroupScoreWriter)
+		sw.ScoreWorker(scoreCtx)
 	}()
 
 	select {
@@ -301,6 +356,7 @@ func refreshConsumerLag(ctx context.Context, logger *slog.Logger, reg *telemetry
 	}{
 		{cfg.ConsumerGroupBronze, stream.AllTopics},
 		{cfg.ConsumerGroupRT, []string{stream.TopicOrders, stream.TopicClicks}},
+		{cfg.ConsumerGroupScoreWriter, []string{stream.TopicOrders, stream.TopicClicks}},
 	}
 	for _, g := range groups {
 		lags, err := kafka.Lag(ctx, cfg.KafkaSeedBrokers, g.name, g.topics)

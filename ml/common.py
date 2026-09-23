@@ -92,6 +92,19 @@ def now_tag() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d.%H%M%S")
 
 
+def category_rank_from(df: pd.DataFrame, key_col: str, value_col: str) -> dict[str, int]:
+    """Category revenue-rank code map — the single shared formula underlying
+    the numeric `category_code` feature for the fraud and forecast families.
+
+    Categories are ordered by total `value_col` descending; the top category is
+    code 0. The result is persisted in the registry row's ``metrics`` as
+    ``category_rank`` so the serving layer (Go score-writer, forecast endpoint)
+    resolves names to codes exactly as the model saw them at train time — it is
+    a training-time artifact, never re-derived downstream."""
+    by_cat = df.groupby(key_col)[value_col].sum().sort_values(ascending=False)
+    return {c: i for i, c in enumerate(by_cat.index)}
+
+
 def register_model(
     model_name: str,
     model_version: str,

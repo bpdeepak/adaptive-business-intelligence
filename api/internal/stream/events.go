@@ -36,6 +36,7 @@ const (
 	EventOrderPlaced   = "order.placed"
 	EventPageView      = "page.view"
 	EventCartAbandoned = "cart.abandoned"
+	EventSessionEnd    = "session.end"
 	EventPriceChanged  = "price.changed"
 	EventTrainingLabel = "training.session_label"
 	EventAnomaly       = "anomaly.detected"
@@ -107,18 +108,29 @@ type OrderItem struct {
 	Quantity  int     `json:"quantity"`
 }
 
+// OrderPayment is one payment of an order event (silver.stg_order_payments).
+// The Phase 3 fraud feature assembler derives payment_count, installments_max
+// and the pay_* one-hot of the primary payment directly from these rows — the
+// batch feature builder's formulas, unmodified.
+type OrderPayment struct {
+	Type         string  `json:"payment_type"`
+	Installments int     `json:"payment_installments"`
+	Value        float64 `json:"payment_value"`
+}
+
 // OrderPlaced is the payload of EventOrderPlaced. `Status`/`IsLost` and
 // `PaymentValue` are finalized values from the historical dataset, so the
 // aggregator applies the exact same revenue definition as the batch layer
 // (status NOT IN ('canceled','unavailable') AND payment_value_total > 0).
 type OrderPlaced struct {
-	OrderID      string      `json:"order_id"`
-	CustomerID   string      `json:"customer_id"`
-	Status       string      `json:"order_status"`
-	PurchaseTime time.Time   `json:"order_purchase_timestamp"`
-	PaymentValue float64     `json:"payment_value_total"`
-	IsLost       bool        `json:"is_lost"`
-	Items        []OrderItem `json:"items"`
+	OrderID      string         `json:"order_id"`
+	CustomerID   string         `json:"customer_id"`
+	Status       string         `json:"order_status"`
+	PurchaseTime time.Time      `json:"order_purchase_timestamp"`
+	PaymentValue float64        `json:"payment_value_total"`
+	IsLost       bool           `json:"is_lost"`
+	Items        []OrderItem    `json:"items"`
+	Payments     []OrderPayment `json:"payments,omitempty"`
 }
 
 // Page types for clickstream events.
@@ -169,14 +181,38 @@ type SessionLabel struct {
 	IsConverting bool   `json:"is_converting"`
 }
 
+// SessionEnd is the payload of EventSessionEnd on ecommerce.clickstream.events —
+// the terminal marker for a *completed* session (both converting and abandoned).
+// It carries every statistic the Phase 2 bot classifier needs, pre-aggregated by
+// the producer so the score-writer never buffers pages or re-derives the
+// feature math: the field names map 1:1 onto the bot_score manifest features.
+type SessionEnd struct {
+	SessionID         string  `json:"session_id"`
+	CustomerID        string  `json:"customer_id,omitempty"`
+	IsConverting      int     `json:"is_converting"`
+	ClickCount        int     `json:"click_count"`
+	DurationSeconds   float64 `json:"duration_seconds"`
+	ClickIntervalCV   float64 `json:"click_interval_cv"`
+	HasSearch         int     `json:"has_search"`
+	HasProductPage    int     `json:"has_product_page"`
+	HasCartPage       int     `json:"has_cart_page"`
+	HasCheckoutPage   int     `json:"has_checkout_page"`
+	PageTypesDistinct int     `json:"page_types_distinct"`
+	CartAdded         int     `json:"cart_added"`
+	CartValue         float64 `json:"cart_value"`
+	HourOfDay         int     `json:"hour_of_day"`
+	IsWeekend         int     `json:"is_weekend"`
+}
+
 // AnomalyEvent is the payload of EventAnomaly on ecommerce.anomalies.
 type AnomalyEvent struct {
 	ID         int64     `json:"anomaly_id"`
 	Metric     string    `json:"metric"`
+	Detector   string    `json:"detector"`
 	BucketTime time.Time `json:"bucket_start"`
 	Observed   float64   `json:"observed"`
 	Expected   float64   `json:"expected"`
-	ZScore     float64   `json:"z_score"`
+	ZScore     float64   `json:"z_score,omitempty"`
 	Severity   string    `json:"severity"`
 	DetectedAt time.Time `json:"detected_at"`
 }

@@ -61,6 +61,13 @@
       <h2>Live 1-minute revenue <span class="hint">(recent buckets)</span></h2>
       <div class="chart-box chart-box-short"><canvas id="chartLive"></canvas></div>
     </div>
+    <div class="card">
+      <h2>Stream-scored fraud risk <span class="hint">(gold.predictions · stream)</span></h2>
+      <table class="risk-table" id="fraudFeed">
+        <thead><tr><th>Order</th><th>Risk</th><th>Conf.</th><th>Source</th><th>Scored</th></tr></thead>
+        <tbody><tr><td colspan="5" class="muted-cell">loading…</td></tr></tbody>
+      </table>
+    </div>
   </section>
 
   <main>
@@ -85,6 +92,24 @@
           <li>Loading…</li>
         </ul>
         <p class="hint" id="refreshTime"></p>
+      </div>
+    </section>
+
+    <section class="charts">
+      <div class="card span2">
+        <h2>
+          Weekly forecast vs backtest
+          <select id="forecastCat" class="cat-select" title="Product category"></select>
+        </h2>
+        <div class="band-strip" id="forecastBand" hidden></div>
+        <div class="chart-box"><canvas id="chartForecast"></canvas></div>
+      </div>
+      <div class="card span2">
+        <h2>Churn risk · leaderboard <span class="hint">(top customers by pending churn score)</span></h2>
+        <table class="risk-table">
+          <thead><tr><th>Customer</th><th>Churn risk</th><th>Confidence</th><th>Predicted</th></tr></thead>
+          <tbody id="churnBoard"><tr><td colspan="4" class="muted-cell">loading…</td></tr></tbody>
+        </table>
       </div>
     </section>
   </main>
