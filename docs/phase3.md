@@ -15,9 +15,10 @@ foundation:
   live stream-scored fraud feed, and model-anomaly awareness in the live banner.
 - **3C — agentic NL-BI**: a free, open-source-LLM question-answering layer with
   **grounding v2**, provenance-labeled tools, an honest-refusal contract and a
-  deterministic regression eval. (Anthropic/Claude is banned by stakeholder
-  decision — the agent runs against local **Ollama Qwen2.5-7B-Instruct**, with a
-  deterministic mock harness for evals.)
+  deterministic regression eval. A deliberate deployment constraint: **no vendor
+  LLM APIs** (Anthropic/Claude is out by stakeholder decision) — the agent runs
+  against local **Ollama Qwen2.5-7B-Instruct** (free, no per-token cost, no
+  data leaves the box), with a deterministic mock harness for evals.
 
 ## 1. Goals
 
@@ -35,22 +36,22 @@ foundation:
 5. **Grounding v2 agent**: answers are numeric-only-if-observed-or-derived,
    provenance is never mixed (batch + live are never summed), unanswerable
    questions are **refused honestly** after one bounded revision, and every
-   answer cites its sources. A 19-question eval set is a regression gate.
+   answer cites its sources. A 20-question eval set is a regression gate.
 6. Everything ships green: Go `build`/`vet`/`test`, `pytest ml/tests`, the
-   fake-DB eval (19/19) **and** the real-DB eval (18/18 + 1 skip).
+   fake-DB eval (20/20) **and** the real-DB eval (19/19 + 1 skip).
 
 ## 2. Environment & key decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Anthropic/Claude | **Banned** by stakeholder decision | the agent must run on a free, open-source LLM |
+| Anthropic/Claude | **Out of scope — deliberate constraint** (stakeholder decision) | the agent must run on a free, open-source LLM; this trade-off's risk is absorbed by the verification layer (grounding v2 + eval gate, §9) |
 | LLM backend | **Ollama + Qwen2.5-7B-Instruct (Q4_K_M)** via an OpenAI-compatible client | local, free, no telemetry; `ABI_LLM_BASE_URL` / `ABI_LLM_MODEL` override the defaults |
 | Agent latency | Qwen2.5-7B live on CPU: **2.0–5.0 s / grounded question** after model warmup, 0 revisions on hard cases | measured in §5; the same loop runs against the mock harness (`ABI_AGENT_MODE=mock`) for deterministic, no-model CI evals |
 | Agent serving | Python stdlib sidecar `ml/agent/server.py` (port **8094**, `ABI_AGENT_URL`), mirroring the Phase 2 `ml/serve.py` pattern | no framework dependency; optional for the Go API (503 when disabled) |
 | Tool surface | **No free-form SQL tool** — 9 fixed, parameterized, provenance-labeled tools | injection and write access become structurally impossible; every number the model can cite carries `batch` / `live_replay` / `registry` / `predictions` |
-| Grounding | **grounding v2** (R1–R4, §6): literal match, within-label derivations, batch/live mix rejection, score-entity tracing, hex-id-safe number extraction | falsifiability beats recall; the percentage-of-anything rule was removed because it accepts every number |
+| Grounding | **grounding v2** (R1–R4, §6): literal match, within-label derivations (sum / mean / **difference** — q21), batch/live mix rejection, score-entity tracing, hex-id-safe number extraction | falsifiability beats recall; the percentage-of-anything rule was removed because it accepts every number |
 | Refusal | one bounded **revision pass**, then `grounded:false, refused:true` | honest refusal is a feature: the model never bullshits when the tools can't support a claim |
-| Eval | `ml/agent/eval_questions.json` — 19 questions (3 unanswerable + a batch/live-sum trap) against **fake DB** (deterministic) and **real DB** (dev Postgres) | the fake is the CI regression gate; the real run validates every tool's SQL |
+| Eval | `ml/agent/eval_questions.json` — 20 questions (3 unanswerable + a batch/live-sum trap + a derived-difference question) against **fake DB** (deterministic) and **real DB** (dev Postgres) | the fake is the CI regression gate; the real run validates every tool's SQL |
 | Score persistence | all stream scores share one `gold.predictions` table, tagged by metadata source | one query surface for dashboard + agent; the `source` filter (`/api/v1/predictions?source=stream_score`) is the live-view discriminator |
 | Model anomalies | broadcast on the shared SSE/gRPC banner and **persisted** to `gold.anomalies` with `detector='model'`, `z_score NULL` | same banner as statistical anomalies; the detector column is the separation contract (§5) |
 
@@ -193,10 +194,13 @@ conversation:
 - **R1 — literal**: every extracted number must be *observed* in a tool row
   (including prose constants: 0.795 threshold, 0.5, 0.02, 0.01, 3.0, 0.03,
   2880× speed).
-- **R2 — derived (within one label only)**: the exact sum or arithmetic mean of
-  **two observed values from the same label**. Percentages-of-anything are
-  **not** derived (they accept every number). Crucially, derivation can never
-  mix `batch` + `live_replay`.
+- **R2 — derived (within one label only)**: the exact sum, arithmetic mean or
+  absolute difference of **two observed values from the same label** — a
+  comparison answer ("how much more / how much did it change") cites a gap the
+  tools never return directly, and the difference branch grounds it (eval q21
+  is the regression pin). Percentages-of-anything are **not** derived (they
+  accept every number). Crucially, derivation can never mix `batch` +
+  `live_replay`.
 - **R3 — provenance**: bidirectional regex rejects batch+live additive
   phrasings *before* the numeric check; the eval's q17 is the regression trap.
 - **R4 — entity scores**: any 32-hex entity token quoted in the answer must
@@ -223,17 +227,19 @@ dashboard/agent can see at a glance which surfaces a claim rests on.
 
 ### 6.5 Eval set (`eval_questions.json`) — the regression gate
 
-19 questions: 15 answerable (grounded facts + derivations + tool labels) and
+20 questions: 16 answerable (grounded facts + derivations + tool labels) and
 **4 unanswerable** (q14 gross-margin-invention, q15 defect-return-rate
 invention, q16 product-percentage invention, **q17 batch+live sum trap**) —
 plus q19 (anomaly citation) which runs in the deterministic fake suite only,
 because "was an anomaly fired?" legitimately depends on what the latest replay
-epoch did (in this dev DB it produced none).
+epoch did (in this dev DB it produced none). q21 (revenue gap between the top
+two categories) pins the R2 **difference** branch: the gap is never an observed
+value, so the grounder must derive it.
 
 Gates:
 - `uv run --group ml python -m ml.agent.eval_agent --db fake --llm mock` →
-  **19 passed, 0 failed** (CI-deterministic).
-- `… --db real --llm mock` against the dev DB → **18 passed, 0 failed, 1 skip**
+  **20 passed, 0 failed** (CI-deterministic).
+- `… --db real --llm mock` against the dev DB → **19 passed, 0 failed, 1 skip**
   (validates every tool against real SQL and Decimal columns).
 
 ## 7. Verification
@@ -248,17 +254,26 @@ Gates:
 | Agent grounding R1–R4 + hex/thousand-separator/prose-date extraction | `ml/tests/test_agent_grounding.py` |
 | Agent eval end-to-end (refusal, revision cap, batch/live rejection, contract) | `ml/tests/test_agent_eval.py` |
 | Go agent client/service contract + metrics | `api/internal/agent/agent_test.go` |
-| Tool-layer SQL against a live Postgres | `eval_agent --db real` (18/18) |
+| Tool-layer SQL against a live Postgres | `eval_agent --db real` (19/19 + 1 skip) |
 
 ### 7.2 Evidence (this run)
 
-- Real-DB facts used by the eval: total orders **99,441**; valid revenue
-  **16,008,872.12** (sum over non-lost) with AOV 160.26 using the tool's valid
-  subset (**15,739,137.01**, AOV 163.01); distinct customers **96,096**;
-  fraud at-risk **221 / 19,889** (1.11%) at the registry's 0.795 threshold;
-  top category `bed_bath_table` (**1,711,258.08**); live buckets are the latest
-  replay epoch; `gold.anomalies` pre-migration rows are Phase-1 statistical
-  (no detector column).
+- Real-DB facts used by the eval (definitions pinned here so the numbers are
+  reproducible — the revenue figure had a mislabeled-definition paper cut under
+  review, fixed this round):
+
+  | Figure | Value | Definition |
+  |---|---|---|
+  | total orders | **99,441** | `COUNT(*)` over `gold.fct_orders` |
+  | valid orders | **98,207** | the `NOT is_lost` subset |
+  | valid revenue | **15,739,137.01** | `SUM(payment_value_total)` restricted to `NOT is_lost` — the tool's `valid_revenue` (a previous doc said "sum over non-lost" while the SQL summed *all* orders: 16,008,872.12) |
+  | AOV | **160.26** | valid revenue ÷ valid orders, same `NOT is_lost` predicate on numerator and denominator (previously the numerator summed all orders → 163.01) |
+  | distinct customers | **96,096** | `COUNT(DISTINCT customer_unique_id)` |
+  | fraud at-risk | **221 / 19,889 (1.11%)** | at the registry's 0.795 threshold |
+  | top category | `bed_bath_table`, **1,711,258.08** | `batch_top_categories` revenue |
+
+  Live buckets are the latest replay epoch; `gold.anomalies` pre-migration rows
+  are Phase-1 statistical (no detector column).
 - A psycopg3 subtlety the real run caught: NUMERIC columns arrive as `Decimal`,
   which the observed-values walker must cast like floats — the fake (floats)
   had masked it.
@@ -278,15 +293,21 @@ Gates:
   day-of-month `17` as a claim — a 1–31 directly after a month name is now
   dropped before extraction.
 - **Model anomalies fired and persisted on the live run**: after ~90 min of
-  2880× replay the score-writer wrote **309 `detector='model'` rows** —
-  `bot_score_rate` observed 0.071–0.40 vs the 0.02 baseline (all
-  `severity=elevated`, one per bucket) — while the *global* stream-score
-  positive rate stayed on-target (bot 1.89% vs 2% baseline, fraud 0.36% vs
-  0.97%). The trigger therefore verifies the full 3A write path (windowed-rate
-  math, rate-track persistence, `detector='model'` insert, banner metrics)
-  and shows that in quiet replay hours sparse 5-minute windows make small
-  counts cross the 3× threshold — a real signal for the Phase 4 drift-monitoring
-  roadmap, not a code defect.
+  2880× replay the score-writer wrote **309 `detector='model'` rows** — **268
+  severe** (>5× baseline) and **41 elevated** (3–5×), *not* all elevated (the
+  earlier draft understated them: `rate > SevereRateMultiplier * baseRate` was
+  routinely true) — all `bot_score_rate`, observed 0.071–0.40 vs the 0.02
+  baseline, one per 5-minute bucket. Reconciliation: 268 + 41 = 309 ≈ 0.6%
+  of the ~51,840 five-minute bucket slots in the replayed epoch (90 wall-min ×
+  2880× ≈ 180 simulated days). The *global* stream-score positive rate stayed
+  on-target throughout (bot 1.89% vs 2% baseline, fraud 0.36% vs 0.97%), so the
+  trigger verifies the full 3A write path (windowed-rate math, rate-track
+  persistence, `detector='model'` insert, banner metrics). Review teardown: in
+  quiet replay the sparse early windows held only 1–10 observations, so small
+  counts crossed the 3× line — a small-sample lull, not a real breach. Fix
+  applied: `MinRateSamples` 5 → **20** (§4) so a busy-window breach still
+  fires while lull noise is silenced; the lull-window story stays a Phase 4
+  drift-monitoring item, not a code defect.
 
 ## 8. Ops
 
@@ -336,6 +357,18 @@ OpenAI-compatible endpoint), then run the agent sidecar with
 - **R4 is recall-limited**: it detects fabricated scores for observed entities
   and refuses unknown-entity citations, but does not positive-verify prose
   claims that carry no number.
+- **Stream-stat restart safety is verified, not changed**: the realtime
+  aggregator's Welford baseline survives restarts — `SaveDetectorState` runs
+  after every flush and `LoadDetectorState`/`restoreBaseline` replay the last
+  snapshot at boot ("aggregator: detector baseline restored, metrics:2", with
+  a round-trip test at `integration_test.go`) — so a consumer restart never
+  zeroes the mean/variance history or re-deduces drift. No code change was
+  needed on review.
+- **The local-LLM choice is deliberate, and safe because of the verification
+  layer**: a less capable base model is a conscious trade-off (self-hosted,
+  free, no per-token cost, no vendor API) whose risk is absorbed by the
+  grounder + the eval gate — the acceptance test is on the agent's tool chain
+  and provenance invariants, not on the model's prose.
 - **Agent window anchoring**: `live_realtime` describes the *latest replay
   epoch*, which is the truthful view for a replay system; a real-time (not
   replay) deployment would re-anchor to wall-clock.

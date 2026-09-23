@@ -90,7 +90,7 @@ _BATCH_OVERVIEW_SQL = """
 SELECT COUNT(*)::int                                   AS total_orders,
        SUM(CASE WHEN NOT is_lost THEN 1 ELSE 0 END)::int AS valid_orders,
        ROUND(SUM(CASE WHEN NOT is_lost THEN payment_value_total ELSE 0 END)::numeric, 2) AS valid_revenue,
-       ROUND(SUM(payment_value_total)::numeric /
+       ROUND(SUM(CASE WHEN NOT is_lost THEN payment_value_total ELSE 0 END)::numeric /
              NULLIF(SUM(CASE WHEN NOT is_lost THEN 1 ELSE 0 END), 0), 2)            AS avg_valid_order_value,
        ROUND(SUM(freight_total)::numeric /
              NULLIF(SUM(items_gross_total + freight_total), 0) * 100, 2)             AS freight_share_pct,

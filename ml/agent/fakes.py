@@ -77,7 +77,7 @@ def _route(sql: str, params: Any) -> tuple[list[str], list[tuple[Any, ...]]]:
     if "COUNT(DISTINCT customer_unique_id)" in sql and "model_registry" not in sql:
         return (["total_orders", "valid_orders", "valid_revenue", "avg_valid_order_value",
                  "freight_share_pct", "distinct_customers"],
-                [(99441, 91306, 16008872.12, 160.26, 16.24, 96096)])
+                [(99441, 98207, 15739137.01, 160.26, 16.24, 96096)])
     if "DATE_TRUNC('week'" in sql:
         return (["week_start", "orders", "revenue"],
                 [("2018-09-17", 1, 0.0), ("2018-09-24", 3, 0.0),

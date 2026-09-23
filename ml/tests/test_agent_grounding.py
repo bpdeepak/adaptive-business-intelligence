@@ -31,6 +31,31 @@ def test_mean_of_two_observed_grounded() -> None:
     assert r.grounded, r.reason
 
 
+def test_difference_of_two_observed_grounded() -> None:
+    # R2 difference branch: the gap is NOT an observed value — it must be
+    # derived (q21 is the eval-level pin for this).
+    o = obs(rows=[{"top_revenue": 1711258.08, "second_revenue": 1653730.45}])
+    r = grounding.ground_answer("The gap between the two is 57527.63.", [o])
+    assert r.grounded, r.reason
+
+
+def test_difference_signed_prose_grounded() -> None:
+    o = obs(rows=[{"this_week": 120.0, "last_week": 90.0}])
+    r = grounding.ground_answer("Revenue rose from 90 to 120, an increase of 30.", [o])
+    assert r.grounded, r.reason
+
+
+def test_difference_across_labels_not_grounded() -> None:
+    # Two single-valued observations, one batch one live_replay: no label holds
+    # the pair needed for a within-label derivation, and R3's additive phrasing
+    # is absent here (the review's cross-label trap), so 60 must stay unmatched.
+    b = obs(label=tools.BATCH, rows=[{"revenue": 100.0}])
+    lv = obs(label=tools.LIVE_REPLAY, rows=[{"revenue": 40.0}])
+    r = grounding.ground_answer("The gap between batch and live revenue was 60.", [b, lv])
+    assert not r.grounded
+    assert 60.0 in r.unmatched
+
+
 def test_invented_number_not_grounded() -> None:
     o = obs(rows=[{"total_orders": 99441, "avg_valid_order_value": 160.26}])
     r = grounding.ground_answer("I believe the share above 20% is 37.2%.", [o])

@@ -192,6 +192,16 @@
         {"tool": "batch_overview"},
         {"answer_template": "The dataset has {distinct_customers} distinct customers."}
       ]
+    },
+    {
+      "id": "q21",
+      "question": "How much more revenue does the leading product category generate than the second-ranked category?",
+      "answerable": true,
+      "check": {"type": "derived", "tool": "batch_top_categories", "params": {"n": 2}, "key": "revenue"},
+      "script": [
+        {"tool": "batch_top_categories", "params": {"n": 2}},
+        {"answer_template": "The leading category generated {revenue} in revenue and the runner-up {last_revenue} — a gap of {diff_revenue}."}
+      ]
     }
   ]
 }

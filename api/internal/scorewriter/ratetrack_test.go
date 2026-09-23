@@ -53,6 +53,26 @@ func TestNoTriggerBelowMinSamples(t *testing.T) {
 	}
 }
 
+func TestLullWindowBelowMinSamplesNeverFires(t *testing.T) {
+	// Phase 3 review pin: at MinRateSamples=5, quiet-replay windows holding
+	// only 1–10 observations crossed the 3× line on small-sample lulls (309
+	// spurious rows across the ~180 simulated days). The 5 → 20 bump keeps a
+	// sparse window silent even when it is *all* positive, while a genuinely
+	// busy window (≥ MinRateSamples samples, one 5-minute bucket) still fires
+	// exactly once.
+	rt := rtWith(0.01)
+	start := time.Date(2023, 6, 15, 10, 0, 0, 0, time.UTC)
+	if fired := observeN(rt, start, MinRateSamples-1, 0.9); fired != 0 {
+		t.Fatalf("sparse window of %d all-positive fired %d times, want 0 "+
+			"(lull noise must stay silent)", MinRateSamples-1, fired)
+	}
+	rt2 := rtWith(0.01)
+	if fired := observeN(rt2, start, MinRateSamples, 0.9); fired != 1 {
+		t.Fatalf("busy window of %d all-positive fired %d, want exactly 1",
+			MinRateSamples, fired)
+	}
+}
+
 func TestTriggerAtMinSamples(t *testing.T) {
 	rt := rtWith(0.01)
 	start := time.Date(2023, 6, 15, 10, 0, 0, 0, time.UTC)

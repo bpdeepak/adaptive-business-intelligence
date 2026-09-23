@@ -5,9 +5,9 @@ Rules (all enforced here, deliberately simple + testable):
 * R1  Literal — the number appears (within tolerance) among the values the
      tools actually returned, OR in the prose-constants table.
 * R2  Derived — the number is a documented construction over observed values:
-     the exact sum of two observed values, or the arithmetic mean of two
-     observed values. (A proportion-of-anything rule is deliberately absent:
-     it accepts *any* number, which would make grounding vacuous.)
+     the exact sum, arithmetic mean or absolute difference of two observed
+     values. (A proportion-of-anything rule is deliberately absent: it accepts
+     *any* number, which would make grounding vacuous.)
 * R3  Provenance — the answer must never claim a figure that sums batch and
      live_replay series. The pattern check rejects "combined/replay+batch"
      phrasings before any numeric check runs. Since every tool row is labeled,
@@ -163,11 +163,13 @@ def _match_derived(candidate: float, by_label: dict[str, list[float]]) -> bool:
     """R2: a documented construction over observed values — WITHIN one label.
 
     Supported (deliberately narrow — falsifiability beats recall): the exact
-    sum of two observed values, or the arithmetic mean of two observed values.
-    Values are grouped by provenance; batch and live_replay numbers may never
-    be combined into a derivation. A proportion-of-anything rule is NOT
-    supported: it accepts any number (every value is *some* percentage of some
-    other value), which would make grounding vacuous.
+    sum, arithmetic mean or absolute difference of two observed values (the
+    difference branch answers comparison questions like "how much changed /
+    how much more than": eval q21 is the regression pin). Values are grouped by
+    provenance; batch and live_replay numbers may never be combined into a
+    derivation. A proportion-of-anything rule is NOT supported: it accepts any
+    number (every value is *some* percentage of some other value), which would
+    make grounding vacuous.
     """
     for label, vals in by_label.items():
         n = len(vals)
@@ -175,7 +177,11 @@ def _match_derived(candidate: float, by_label: dict[str, list[float]]) -> bool:
             continue
         for i in range(n):
             for j in range(i + 1, n):
-                if _close(candidate, vals[i] + vals[j]) or _close(candidate, (vals[i] + vals[j]) / 2.0):
+                if (
+                    _close(candidate, vals[i] + vals[j])
+                    or _close(candidate, (vals[i] + vals[j]) / 2.0)
+                    or _close(candidate, abs(vals[i] - vals[j]))
+                ):
                     return True
     return False
 

@@ -78,7 +78,7 @@ agent-mock:
 agent-serve:
 	uv run --group ml python ml/agent/server.py --mode live
 
-# Regression gate: the 19-question eval against the deterministic fake DB.
+# Regression gate: the 20-question eval against the deterministic fake DB.
 agent-eval:
 	uv run --group ml python -m ml.agent.eval_agent --db fake --llm mock
 

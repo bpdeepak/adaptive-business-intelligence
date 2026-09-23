@@ -19,7 +19,7 @@ banner; the dashboard gains forecast confidence bands, a churn leaderboard and
 a live fraud feed; and a free open-source LLM (`ml/agent`, Ollama + Qwen2.5-7B)
 answers natural-language questions with **grounding v2** — only observed or
 derived numbers, batch/live never summed, honest refusal after one bounded
-revision, and a 19-question regression eval.
+revision, and a 20-question regression eval.
 
 | Layer | What ships |
 |---|---|
@@ -31,7 +31,7 @@ revision, and a 19-question regression eval.
 | Serving | Go REST API + SSE live stream + gRPC :8090 (live metrics), embedded dashboard with live tiles + anomaly banner; **Phase 2** predict surface (`/api/v1/model-registry`, `/predictions[/latest]`, `/score`, `/models/health`) served from Postgres, with an optional Python scoring sidecar (`127.0.0.1:8093`) |
 | Predictive (Phase 2) | `ml/` Python stack (uv `ml` group): LightGBM + XGBoost trained with strict time splits, SHAP `TreeExplainer` explanations on every prediction, `gold.model_registry` (5 active versions), `gold.predictions` (42k+ backtest rows + live scores, each with explanation jsonb), per-category forecast confidence bands, versioned joblib artifacts in `artifacts/`, stdlib HTTP sidecar `ml/serve.py` |
 | Stream scoring (Phase 3) | `cmd/server` score-writer consumes the replay, assembles batch-exact feature vectors in Go (19-feature fraud spec as the single cross-language source), scores through the same sidecar, persists `source="stream_score"` rows, and fires **model rate anomalies** (`detector='model'`, 5-min window >3× baseline, `z_score NULL`) onto the SSE banner + `gold.anomalies` |
-| Agentic BI (Phase 3) | `ml/agent` NL-BI sidecar (stdlib HTTP :8094): 9 provenance-labeled tools (`batch` / `live_replay` / `registry` / `predictions`), grounding v2 (R1 literal · R2 within-label sum/mean · R3 batch/live-mix ban · R4 score-entity trace), one bounded revision then honest refusal, and a 19-question deterministic eval (fake DB + mock LLM) mirrored against the real DB; Go API `POST /api/v1/agent/query` + metrics |
+| Agentic BI (Phase 3) | `ml/agent` NL-BI sidecar (stdlib HTTP :8094): 9 provenance-labeled tools (`batch` / `live_replay` / `registry` / `predictions`), grounding v2 (R1 literal · R2 within-label sum/mean/diff · R3 batch/live-mix ban · R4 score-entity trace), one bounded revision then honest refusal, and a 20-question deterministic eval (fake DB + mock LLM) mirrored against the real DB; Go API `POST /api/v1/agent/query` + metrics |
 | Dashboard | Vanilla JS + Chart.js: KPI cards, daily charts, top categories, 7D/30D/90D/All windows, **live revenue/orders/sessions tiles, anomaly banner (statistical + model rate), replay-speed badge — plus Phase 3 forecast confidence band, churn-risk leaderboard, stream-scored fraud feed** |
 
 ## Architecture
@@ -112,7 +112,7 @@ ml/serve.py :8093 ──► gold.predictions (metadata.source="stream_score")
 NL-BI:
 dashboard ──► Go POST /api/v1/agent/query ──► ml/agent/server.py :8094 ──► Ollama Qwen2.5-7B (or mock)
    9 provenance-labeled tools · grounding v2 (R1–R4) · ≤1 revision → honest refusal
-   eval gate: 19 questions · fake DB (CI) 19/19 · real DB 18/18 + 1 skip
+   eval gate: 20 questions · fake DB (CI) 20/20 · real DB 19/19 + 1 skip
 ```
 
 Two Phase 3 invariants worth calling out: **provenance labels travel with
@@ -211,7 +211,7 @@ make train                           # backtest + register models + sidecar_mode
 make serve-models                    # scoring sidecar on 127.0.0.1:8093
 
 # 5. Phase 3: agent eval + sidecar (see docs/phase3.md §8)
-make agent-eval                      # deterministic 19-question gate (fake DB + mock LLM)
+make agent-eval                      # deterministic 20-question gate (fake DB + mock LLM)
 make agent-test                      # ml unit tests + the same gate
 make agent-mock                      # agent sidecar on 127.0.0.1:8094 (no LLM required)
 make agent-serve                     # agent sidecar, live mode (Ollama/OpenAI-compatible)
@@ -316,7 +316,7 @@ should fetch before answering metric questions.
   rate anomalies** into `gold.anomalies` (`detector='model'`, >3× baseline over
   a 5-minute window), **prediction UI** (forecast confidence band, churn-risk
   leaderboard, fraud-score column on the live feed), and a **grounded NL-BI
-  agent** (provenance-labeled tools, grounding v2, honest refusal, 19-question
+  agent** (provenance-labeled tools, grounding v2, honest refusal, 20-question
   regression eval) backed by a free open-source LLM (Ollama Qwen2.5-7B).
   **Complete and verified** (`docs/phase3.md`): the live sidecar answers
   grounded questions against the local model at ~2–5 s each (§8.1).

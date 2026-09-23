@@ -148,27 +148,58 @@ class MockLLM:
         return ChatResult(content=self.fallback_answer)
 
     @staticmethod
+    def _rows_from_render(content: str) -> list[dict[str, str]]:
+        """Re-parse a rendered tool observation into row dicts (the `{k}=v`
+        token grammar used in `_resolve_answer`'s value filling)."""
+        rows: list[dict[str, str]] = []
+        for line in content.splitlines():
+            if "=" not in line or line.lstrip().startswith("[tool"):
+                continue
+            row: dict[str, str] = {}
+            for token in line.split(","):
+                if "=" not in token:
+                    continue
+                k, _, v = token.partition("=")
+                k, v = k.strip(), v.strip()
+                if k and v:
+                    row[k] = v
+            if row:
+                rows.append(row)
+        return rows
+
+    @staticmethod
     def _resolve_answer(step: dict[str, Any], messages: list[dict[str, Any]]) -> str:
         template = step.get("answer_template")
         if not template:
             return step.get("answer", "")
         values: dict[str, Any] = {}
+        latest_rows: list[dict[str, str]] = []  # rows of the most recent tool call
         for m in messages:
             if m.get("role") != "tool":
                 continue
-            for line in (m.get("content") or "").splitlines():
-                if "=" not in line or line.lstrip().startswith("[tool"):
-                    continue
-                for token in line.split(","):
-                    if "=" not in token:
-                        continue
-                    k, _, v = token.partition("=")
-                    k = k.strip()
-                    v = v.strip()
+            rows = MockLLM._rows_from_render(m.get("content") or "")
+            if rows:
+                latest_rows = rows
+            for row in rows:
+                for k, v in row.items():
                     # Skip empty / NULL column pads from union-row renders so a
                     # real value from a later row wins (setdefault order).
-                    if k and v and v not in ("None", "null", "NULL"):
+                    if v not in ("None", "null", "NULL"):
                         values.setdefault(k, v)
+        # Multi-row comparisons: the second row's value under `last_<key>` and
+        # the absolute row0−row1 difference under `diff_<key>` (q21 pins the
+        # difference branch; the gap is never observed, so grounding must derive
+        # it via R2).
+        if len(latest_rows) >= 2:
+            row0, row1 = latest_rows[0], latest_rows[1]
+            for k in set(row0) & set(row1):
+                try:
+                    base = float(row0[k])
+                    other = float(row1[k])
+                except ValueError:
+                    continue
+                values[f"last_{k}"] = row1[k]
+                values[f"diff_{k}"] = f"{abs(base - other):.2f}"
         try:
             return template.format(**values)
         except (KeyError, ValueError):

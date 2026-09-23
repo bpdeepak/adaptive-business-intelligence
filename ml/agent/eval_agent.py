@@ -120,6 +120,23 @@ def check_question(entry: dict[str, Any], answer: str, ctx: tools.ToolContext) -
                 if not any(_close(h, float(r[k])) for h in hits):
                     return False, f"missing {k}={float(r[k])} in answer"
         return True, f"{len(anom)} anomaly rows cited"
+    if kind == "derived":
+        # A number the tools never return directly (e.g. the revenue gap
+        # between the top two categories): re-run the same tool, take the
+        # absolute difference of the first two rows' key, and require it in the
+        # answer. Mirrors the grounder's R2 difference branch (q21).
+        rows = tool_rows(ctx, q["tool"], q.get("params"))
+        if len(rows) < 2:
+            return False, f"tool {q['tool']} returned fewer than 2 rows (derived check)"
+        op = q.get("op", "diff")
+        if op != "diff":
+            return False, f"unsupported derived op {op!r}"
+        a, b = float(rows[0][q["key"]]), float(rows[1][q["key"]])
+        expected = abs(a - b)
+        hits = _numbers_in(answer)
+        if not any(_close(h, expected) for h in hits):
+            return False, f"expected derived diff {expected} in answer; numbers found: {hits}"
+        return True, f"derived diff {expected} present"
     if kind == "regex":
         return bool(re.search(q["pattern"], answer)), f"regex {q['pattern']!r}"
     if kind == "unanswerable":

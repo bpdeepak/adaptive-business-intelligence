@@ -13,8 +13,11 @@ const (
 	RateWindowSecs = 5 * 60
 	// MinRateSamples is the minimum window population before a rate anomaly can
 	// fire — a cold window is statistically meaningless (3A contract: no
-	// single-prediction anomalies, ever).
-	MinRateSamples = 5
+	// single-prediction anomalies, ever). Raised 5 → 20 on the Phase 3 review:
+	// at 5, quiet-replay windows holding only 1–10 observations crossed the 3×
+	// line on small-sample lulls; 20 keeps a busy-window breach (the signal)
+	// while silencing lull noise.
+	MinRateSamples = 20
 	// RateAnomalyMultiplier is the trigger: windowed at-risk rate > 3x baseline.
 	RateAnomalyMultiplier = 3.0
 	// SevereRateMultiplier escalates severity to "severe".
