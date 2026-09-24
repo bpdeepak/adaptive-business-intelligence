@@ -118,40 +118,52 @@ def register_model(
     features: list[str],
     trained_on: dict[str, Any],
     trained_window: dict[str, str] | None = None,
+    status: str = "active",
+    drift_baseline: dict[str, Any] | None = None,
 ) -> None:
     """Upsert one row into gold.model_registry (contract for the Go API).
 
     Registering a new version supersedes any other active version of the same
-    model, so exactly one version per model is `active` at a time.
+    model, so exactly one version per model is `active` at a time — UNLESS
+    `status="candidate"`: a retrain worker registers a candidate that never
+    supersedes the serving version and needs a human flip to go live.
+
+    `drift_baseline` stores the per-feature reference distributions (computed
+    by feature_distribution_baseline on the training matrix) that Phase 4's
+    monitor compares live/stream feature vectors against.
     """
     ensure_serving_tables()
     with conn() as c:
-        c.execute(
-            """
-            UPDATE gold.model_registry
-               SET status = 'superseded'
-             WHERE model_name = %s
-               AND model_version <> %s
-               AND status = 'active'
-            """,
-            (model_name, model_version),
-        )
+        if status == "active":
+            c.execute(
+                """
+                UPDATE gold.model_registry
+                   SET status = 'superseded'
+                 WHERE model_name = %s
+                   AND model_version <> %s
+                   AND status = 'active'
+                """,
+                (model_name, model_version),
+            )
         c.execute(
             """
             INSERT INTO gold.model_registry
                 (model_name, model_version, status, framework, task, grain,
-                 artifact_path, params, metrics, features, trained_on, trained_window)
-            VALUES (%s, %s, 'active', %s, %s, %s, %s,
-                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb)
+                 artifact_path, params, metrics, features, trained_on, trained_window,
+                 drift_baseline)
+            VALUES (%s, %s, %s, %s, %s, %s, %s,
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb)
             ON CONFLICT (model_name, model_version) DO UPDATE SET
                 status = EXCLUDED.status,
                 artifact_path = EXCLUDED.artifact_path,
                 metrics = EXCLUDED.metrics,
-                trained_window = EXCLUDED.trained_window
+                trained_window = EXCLUDED.trained_window,
+                drift_baseline = EXCLUDED.drift_baseline
             """,
             (
                 model_name,
                 model_version,
+                status,
                 framework,
                 task,
                 grain,
@@ -161,8 +173,45 @@ def register_model(
                 json.dumps(features),
                 json.dumps(trained_on, default=_json_default),
                 json.dumps(trained_window or {}, default=_json_default),
+                json.dumps(drift_baseline or {}, default=_json_default),
             ),
         )
+
+
+def feature_distribution_baseline(
+    df: pd.DataFrame,
+    features: list[str] | None = None,
+    n_bins: int = 10,
+    min_samples: int = 20,
+) -> dict[str, Any]:
+    """Per-feature reference distributions over a TRAINING matrix — the Phase 4
+    drift baseline (gold.model_registry.drift_baseline).
+
+    Each feature is quantized into `n_bins` equal-width bins over its [q0.01,
+    q0.99] training range (outlier-robust; constant features get one wide bin);
+    the stored proportions are the distribution the monitor PSI comparisons
+    measure against. Only features with >= min_samples non-null values are kept;
+    the exact column names are shared with the Go score-writer's stream feature
+    vectors, so stream PSI and batch PSI use the same keys.
+    """
+    import numpy as np
+
+    feats = features or list(df.columns)
+    out: dict[str, Any] = {}
+    for f in feats:
+        col = pd.to_numeric(df[f], errors="coerce").dropna().to_numpy(dtype=float)
+        if len(col) < min_samples:
+            continue
+        lo, hi = float(np.quantile(col, 0.01)), float(np.quantile(col, 0.99))
+        if hi - lo < 1e-9:  # constant feature: widen to a single usable bin
+            lo, hi = float(col.min()), float(col.max())
+            if hi - lo < 1e-9:
+                hi = lo + 1.0
+        counts, _ = np.histogram(col, bins=n_bins, range=(lo, hi))
+        total = float(counts.sum())
+        props = [float(c) / total if total else 0.0 for c in counts]
+        out[f] = {"min": lo, "max": hi, "bins": props, "n_bins": n_bins, "n": int(total)}
+    return out
 
 
 def _json_default(o: Any) -> Any:

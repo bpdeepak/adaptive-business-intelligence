@@ -1,5 +1,5 @@
 # ABI — Phase 1 dev targets (Linux/CI). On Windows prefer scripts/*.ps1.
-.PHONY: infra-up infra-down data load dbt build-docs server producer app test integration-test smoke bootstrap smoke-check ml-sync ml-features train serve-models
+.PHONY: infra-up infra-down data load dbt build-docs server producer app test integration-test smoke bootstrap smoke-check ml-sync ml-features train serve-models monitor monitor-worker
 
 infra-up:
 	docker compose up -d --wait
@@ -67,6 +67,18 @@ train:
 # Serve registered models over the stdlib scoring sidecar (POST /score).
 serve-models:
 	uv run --group ml python ml/serve.py
+
+# --- Phase 4: model governance & monitoring (ml/monitor) ---
+
+# PSI drift + decay monitor: one pass over stream + batch feature vectors,
+# appends findings to gold.model_drift (the Go API serves them + fires events).
+monitor:
+	uv run --group ml python -m ml.monitor.drift_check
+
+# Consume gold.retrain_requests (written by the approved `retrain_model`
+# action) and retrain candidate versions. One-shot; add --watch to poll.
+monitor-worker:
+	uv run --group ml python -m ml.monitor.retrain_worker
 
 # --- Phase 3: agentic NL-BI (ml/agent) ---
 

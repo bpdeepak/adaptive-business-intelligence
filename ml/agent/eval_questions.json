@@ -202,6 +202,61 @@
         {"tool": "batch_top_categories", "params": {"n": 2}},
         {"answer_template": "The leading category generated {revenue} in revenue and the runner-up {last_revenue} — a gap of {diff_revenue}."}
       ]
+    },
+    {
+      "id": "q22",
+      "question": "Which feature of which model currently shows critical drift, and at what PSI?",
+      "answerable": true,
+      "skip_when": "real",
+      "check": {"type": "number", "tool": "get_model_drift", "key": "psi"},
+      "script": [
+        {"tool": "get_model_drift"},
+        {"answer_template": "The {model_name} model shows {status} drift on {feature} with PSI {psi}."}
+      ]
+    },
+    {
+      "id": "q23",
+      "question": "What is the risk tier of the pending retrain-model governance action?",
+      "answerable": true,
+      "skip_when": "real",
+      "check": {"type": "label", "tool": "get_pending_actions", "key": "risk_tier"},
+      "script": [
+        {"tool": "get_pending_actions"},
+        {"answer_template": "There is a pending {action} for {entity} with risk tier {risk_tier}; it awaits a human decision."}
+      ]
+    },
+    {
+      "id": "q24",
+      "question": "By how much does the fraud model's velocity PSI exceed the churn model's order-count PSI?",
+      "answerable": true,
+      "skip_when": "real",
+      "check": {"type": "derived", "tool": "get_model_drift", "op": "diff", "key": "psi"},
+      "script": [
+        {"tool": "get_model_drift"},
+        {"answer_template": "The fraud velocity PSI is {psi} and the churn order-count PSI is {last_psi} — the gap is {diff_psi}."}
+      ]
+    },
+    {
+      "id": "q25",
+      "question": "What is the latest audit transition of the most recently decided governance action?",
+      "answerable": true,
+      "skip_when": "real",
+      "check": {"type": "label", "tool": "get_action_history", "key": "last_transition"},
+      "script": [
+        {"tool": "get_action_history", "params": {"limit": 5}},
+        {"answer_template": "The most recently decided action (#{id}, {action}) has audit trail ending at transition {last_transition}."}
+      ]
+    },
+    {
+      "id": "q26",
+      "question": "Who rejected the retrain action and with what rationale?",
+      "answerable": false,
+      "skip_when": "real",
+      "check": {"type": "unanswerable"},
+      "script": [
+        {"tool": "get_action_history", "params": {"limit": 5}},
+        {"answer": "I can't reconstruct that from the available data: the deciding analyst and the stated rationale live in the audit log, which the read-only agent tools do not expose. Guessing at a justification weight of 0.731 would be pure invention."}
+      ]
     }
   ]
 }

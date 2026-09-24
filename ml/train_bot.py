@@ -73,6 +73,9 @@ def make_model(train: pd.DataFrame) -> LGBMClassifier:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Train the bot-vs-human session classifier")
     ap.add_argument("--skip-persist", action="store_true")
+    ap.add_argument("--version", default=None, help="explicit model version tag (default: now_tag)")
+    ap.add_argument("--candidate", action="store_true",
+                    help="register as status='candidate' (never auto-promoted)")
     args = ap.parse_args()
 
     df = load_data()
@@ -96,7 +99,12 @@ def main() -> int:
     if args.skip_persist:
         return 0
 
-    version = common.now_tag()
+    version = args.version or common.now_tag()
+
+    # Phase 4 drift baseline: per-feature reference distributions of the
+    # TRAINING matrix — same keys the Go score-writer persists into session
+    # gold.predictions.features rows, so stream PSI measures against this.
+    baseline = common.feature_distribution_baseline(train, FEATURES)
     artifact = common.save_artifact(
         MODEL_NAME, version, model,
         {"features": FEATURES, "metrics": {k: round(v, 4) for k, v in metrics.items()}},
@@ -119,6 +127,8 @@ def main() -> int:
                     "bot_rate_train": round(float(train["is_synthetic_bot"].mean()), 4)},
         trained_window={"start": str(train["session_date"].min().date()),
                         "end": str(test["session_date"].max().date())},
+        status="candidate" if args.candidate else "active",
+        drift_baseline=baseline,
     )
 
     written = evalwrite.persist_classifier_predictions(

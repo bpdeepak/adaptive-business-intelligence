@@ -196,13 +196,26 @@ def persist_backtest_predictions(
 def main() -> int:
     ap = argparse.ArgumentParser(description="Train + backtest the category-week forecast")
     ap.add_argument("--skip-persist", action="store_true", help="backtest only, no registry/predictions writes")
+    ap.add_argument("--version", default=None, help="explicit model version tag (default: now_tag)")
+    ap.add_argument("--candidate", action="store_true",
+                    help="register as status='candidate' (never auto-promoted)")
     args = ap.parse_args()
 
     df, rank = load_data()
     print(f"feature rows: {len(df):,} across {df['category'].nunique()} categories "
           f"[{df['week_start'].min()} .. {df['week_start'].max()}]")
 
-    version = common.now_tag()
+    version = args.version or common.now_tag()
+
+    # Phase 4 drift baseline: per-feature reference distributions of the
+    # TRAINING matrix, over the columns that exist in gold.feature_forecast_weekly
+    # and are re-measurable in a comparable window. `category_code` is derived at
+    # predict time (not a mart column) and `year` is excluded because a rolling
+    # window of the newest weeks is dominated by the latest calendar year by
+    # construction — its PSI is systematic noise, and retraining the same full
+    # history cannot fix it.
+    drift_features = [f for f in FEATURES if f not in ("category_code", "year")]
+    drift_baseline = common.feature_distribution_baseline(df, drift_features)
     for target, model_name in (( "revenue","forecast_category_weekly_revenue"), ("orders", "forecast_category_weekly_orders")):
         print(f"\n=== {model_name} (target={target}) ===")
         recs = rolling_origin_records(df, target)
@@ -252,6 +265,8 @@ def main() -> int:
             features=FEATURES,
             trained_on={"target": target, "n_rows": int(len(df)), "n_categories": int(df["category"].nunique())},
             trained_window={"start": str(df["week_start"].min()), "end": str(df["week_start"].max())},
+            status="candidate" if args.candidate else "active",
+            drift_baseline=drift_baseline,
         )
         written = persist_backtest_predictions(
             recs, model_name, version,

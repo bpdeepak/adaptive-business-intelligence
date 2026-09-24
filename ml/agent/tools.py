@@ -27,6 +27,8 @@ BATCH = "batch"
 LIVE_REPLAY = "live_replay"
 REGISTRY = "registry"
 PREDICTIONS = "predictions"
+ACTIONS = "actions"
+MODEL_HEALTH = "model_health"
 
 # Fixed caps: tools never return more than this many rows.
 MAX_ROWS = 50
@@ -319,6 +321,63 @@ def _score_stats(ctx: ToolContext, params: dict[str, Any]) -> list[dict[str, Any
             return [dict(zip(cols, cur.fetchone()))]
 
 
+_PENDING_ACTIONS_SQL = """
+SELECT id, action, COALESCE(entity, '') AS entity, risk_tier, rule,
+       to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+FROM gold.action_queue
+WHERE status = 'pending'
+ORDER BY id
+LIMIT %s
+"""
+
+_ACTION_HISTORY_SQL = """
+SELECT q.id, q.action, COALESCE(q.entity, '') AS entity, q.risk_tier, q.status, q.rule,
+       COALESCE(to_char(q.decided_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '') AS decided_at,
+       (SELECT l.transition FROM gold.action_audit_log l WHERE l.action_id = q.id
+         ORDER BY l.id DESC LIMIT 1) AS last_transition
+FROM gold.action_queue q
+WHERE q.status <> 'pending'
+ORDER BY q.id DESC
+LIMIT %s
+"""
+
+_MODEL_DRIFT_SQL = """
+SELECT model_name, feature, ROUND(psi::numeric, 4)::float8 AS psi,
+       status, kind,
+       to_char(computed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS computed_at
+FROM gold.model_drift
+ORDER BY computed_at DESC, id DESC
+LIMIT %s
+"""
+
+
+def _pending_actions(ctx: ToolContext, params: dict[str, Any]) -> list[dict[str, Any]]:
+    limit = min(int(params.get("limit", 20)), MAX_ROWS)
+    with ctx.connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_PENDING_ACTIONS_SQL, (limit,))
+            cols = [d.name for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def _action_history(ctx: ToolContext, params: dict[str, Any]) -> list[dict[str, Any]]:
+    limit = min(int(params.get("limit", 20)), MAX_ROWS)
+    with ctx.connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_ACTION_HISTORY_SQL, (limit,))
+            cols = [d.name for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def _model_drift(ctx: ToolContext, params: dict[str, Any]) -> list[dict[str, Any]]:
+    limit = min(int(params.get("limit", 20)), MAX_ROWS)
+    with ctx.connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_MODEL_DRIFT_SQL, (limit,))
+            cols = [d.name for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
 # Tool registry. Order matters only for discoverability in prompts.
 TOOL_SPECS: list[ToolSpec] = [
     ToolSpec(
@@ -386,6 +445,27 @@ TOOL_SPECS: list[ToolSpec] = [
         parameters={"minutes": {"type": "integer", "description": "lookback in minutes from the latest replay bucket (default 30)"}},
         label=LIVE_REPLAY,
         run=_live_realtime,
+    ),
+    ToolSpec(
+        name="get_pending_actions",
+        description="Governance actions still awaiting a human decision (gold.action_queue, status=pending): id, action, entity, risk tier, rule, created_at. Approvals/rejections happen on the dashboard, not through this agent.",
+        parameters={"limit": {"type": "integer", "description": "max rows (default 20)"}},
+        label=ACTIONS,
+        run=_pending_actions,
+    ),
+    ToolSpec(
+        name="get_action_history",
+        description="Decided governance actions and their last audit transition (proposed → approved/rejected → executed/failed): id, action, entity, status, rule, decided_at.",
+        parameters={"limit": {"type": "integer", "description": "max rows (default 20)"}},
+        label=ACTIONS,
+        run=_action_history,
+    ),
+    ToolSpec(
+        name="get_model_drift",
+        description="Latest model-health findings from the Phase 4 monitor (gold.model_drift): per-feature PSI (ok/warning/critical), forecast/churn decay, model + feature + computed_at.",
+        parameters={"limit": {"type": "integer", "description": "max rows (default 20)"}},
+        label=MODEL_HEALTH,
+        run=_model_drift,
     ),
 ]
 

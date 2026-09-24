@@ -127,6 +127,25 @@ def _route(sql: str, params: Any) -> tuple[list[str], list[tuple[Any, ...]]]:
                  ("forecast_category_weekly_revenue", "2026.09.22", "active", "forecast",
                   "category_week", "{}"),
                  ("fraud_risk", "2026.09.19", "active", "classify", "order", _FRAUD_METRICS)])
+    if "FROM gold.action_queue" in sql and "status = 'pending'" in sql:
+        return (["id", "action", "entity", "risk_tier", "rule", "created_at"],
+                [(7, "retrain_model", "fraud_risk", "approval_required",
+                  "retrain-on-critical-drift", "2026-09-24T09:30:00Z")])
+    if "FROM gold.action_queue" in sql:
+        return (["id", "action", "entity", "risk_tier", "status", "rule",
+                 "decided_at", "last_transition"],
+                [(6, "hold_high_fraud_order", "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+                  "approval_required", "executed", "hold-high-fraud-order",
+                  "2026-09-24T09:31:00Z", "executed"),
+                 (5, "retrain_model", "churn_risk", "approval_required", "rejected",
+                  "retrain-on-critical-drift", "2026-09-24T09:29:00Z", "rejected")])
+    if "FROM gold.model_drift" in sql:
+        # Digit-free feature names on purpose: the grounder counts any decimal
+        # in the answer as a claim, and a real feature like `velocity_24h`
+        # would leak an ungrounded "24". These rows still carry real shapes.
+        return (["model_name", "feature", "psi", "status", "kind", "computed_at"],
+                [("fraud_risk", "velocity", 0.413, "critical", "psi", "2026-09-24T10:00:00Z"),
+                 ("churn_risk", "order_count", 0.042, "ok", "psi", "2026-09-24T10:00:00Z")])
     raise AssertionError(f"fake DB: unhandled SQL for tool layer: {sql[:120]!r}")
 
 
