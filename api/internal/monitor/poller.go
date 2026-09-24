@@ -9,9 +9,11 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"abi/internal/events"
@@ -110,7 +112,9 @@ FROM gold.model_drift WHERE id > $1 ORDER BY id`, watermark)
 		key := model + "|" + computedAt
 		r, ok := runs[key]
 		if !ok {
-			r = &driftRun{model: model, version: version, computedAt: computedAt}
+			// A run with only healthy findings must still report "ok": the
+			// worst-status merge only overwrites when a worse status arrives.
+			r = &driftRun{model: model, version: version, computedAt: computedAt, worstStatus: "ok"}
 			runs[key] = r
 		}
 		r.features = append(r.features, map[string]any{
@@ -173,6 +177,11 @@ func (p *Poller) readWatermark(ctx context.Context) (int64, error) {
 	err := p.pool.QueryRow(ctx, `
 SELECT COALESCE((value->>'drift_watermark')::bigint, 0)
 FROM gold.monitor_state WHERE key = 'drift'`).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Fresh state: never polled before — start from the beginning. The
+		// first poll writes the row, so this is the bootstrap path.
+		return 0, nil
+	}
 	if err != nil {
 		return 0, fmt.Errorf("read monitor watermark: %w", err)
 	}

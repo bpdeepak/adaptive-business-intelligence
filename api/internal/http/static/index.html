@@ -112,6 +112,31 @@
         </table>
       </div>
     </section>
+
+    <section class="charts gov">
+      <div class="card span2">
+        <h2>Approval queue <span class="hint">(pending actions · human in the loop)</span></h2>
+        <table class="risk-table">
+          <thead><tr><th>ID</th><th>Action</th><th>Entity</th><th>Risk</th><th>Rule</th><th>Created</th><th>Decision</th></tr></thead>
+          <tbody id="approvalQueue"><tr><td colspan="7" class="muted-cell">loading…</td></tr></tbody>
+        </table>
+        <div class="trace-box" id="actionTrace" hidden></div>
+      </div>
+      <div class="card span2">
+        <h2>Action history <span class="hint">(decided · immutable audit)</span></h2>
+        <table class="risk-table">
+          <thead><tr><th>ID</th><th>Action</th><th>Entity</th><th>Status</th><th>Rule</th><th>Decided</th><th>Trace</th></tr></thead>
+          <tbody id="actionHistory"><tr><td colspan="7" class="muted-cell">loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="card span2">
+        <h2>Model health <span class="hint">(PSI drift + decay · gold.model_drift)</span></h2>
+        <table class="risk-table">
+          <thead><tr><th>Model</th><th>Feature</th><th>PSI</th><th>Status</th><th>Kind</th><th>Computed</th></tr></thead>
+          <tbody id="driftBoard"><tr><td colspan="6" class="muted-cell">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
   </main>
 
   <footer class="footer">

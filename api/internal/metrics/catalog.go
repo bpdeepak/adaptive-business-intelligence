@@ -40,11 +40,19 @@ const (
 	// gold.predictions produced by a versioned model in gold.model_registry.
 	// It is never additive with the batch or live_replay sources.
 	SourceModel = "model"
+	// SourceGovernance marks approval-queue state in gold.action_queue: what a
+	// playbook PROPOSED and what a human decided. These are counts of decisions,
+	// not business figures — never additive with any other source.
+	SourceGovernance = "governance"
+	// SourceMonitoring marks model-health findings in gold.model_drift: per-
+	// feature PSI and forecast/churn decay measurements. They describe model
+	// inputs and error trends, not business value.
+	SourceMonitoring = "monitoring"
 )
 
 // Version is bumped whenever a definition changes. Keep it in sync with the
 // `Metric definitions` table in docs/phase0.md (section 4) and docs/phase1.md.
-const Version = "1.3.0"
+const Version = "1.4.0"
 
 // Default returns the Phase 0 catalog.
 func Default() Catalog {
@@ -302,6 +310,69 @@ func Default() Catalog {
 					"Persisted test predictions are a sample; live scoring is available through POST /api/v1/score.",
 				},
 			},
+			{
+				Name:        "governance_pending_actions",
+				Label:       "Pending governed actions",
+				Source:      SourceGovernance,
+				Description: "Playbook proposals awaiting a human decision on the approval queue. Every row is a concrete 'do something' suggestion (hold an order, retrain a model, draft an order) derived from a domain event; nothing executes until a human approves it (or an allow-listed auto tier records an explicit auto-approval).",
+				Population:  "proposals in gold.action_queue",
+				Grain:       "action (id)",
+				Aggregation: "count of gold.action_queue rows with status='pending'",
+				Unit:        "actions",
+				SourceTable: "gold.action_queue",
+				Tags:        []string{"governance", "phase4"},
+				Notes: []string{
+					"Proposals are deduplicated: one row per (playbook rule, trigger scope); a replayed event can never flood the queue.",
+					"Every transition (proposed → approved/rejected → executed → outcome) is an immutable row in gold.action_audit_log tying actor, reason, and payload to one action id.",
+				},
+			},
+			{
+				Name:        "governance_decided_actions",
+				Label:       "Decided governed actions",
+				Source:      SourceGovernance,
+				Description: "Playbook proposals that have been decided (approved, rejected, or auto-approved), including their execution outcome. Counts of decisions — not business figures — useful for reviewing how often the platform proposed versus what humans actually allowed.",
+				Population:  "proposals in gold.action_queue",
+				Grain:       "action (id)",
+				Aggregation: "count of gold.action_queue rows with status != 'pending'",
+				Unit:        "actions",
+				SourceTable: "gold.action_queue + gold.action_audit_log",
+				Tags:        []string{"governance", "phase4"},
+				Notes: []string{
+					"The immutable audit log (gold.action_audit_log) is the source of truth for the decision trail; the queue row is the current state, the audit rows are the history.",
+				},
+			},
+			{
+				Name:        "model_drift_psi",
+				Label:       "Per-feature model input drift (PSI)",
+				Source:      SourceMonitoring,
+				Description: "Population Stability Index of one model feature: how far the recent input distribution has shifted from the distribution the model was trained on. Bands (ok <0.10, warning 0.10–0.20, critical >0.20) drive the retrain-on-critical-drift playbook proposal. NaN PSI maps to ok; infinite to critical.",
+				Population:  "one (active model, feature, run) row in gold.model_drift",
+				Grain:       "model feature (computed_at)",
+				Aggregation: "10-bin PSI of recent samples vs the training-matrix histogram stored in the registry drift_baseline",
+				Unit:        "PSI (dimensionless)",
+				SourceTable: "gold.model_drift (kind='psi')",
+				Tags:        []string{"monitoring", "phase4", "drift"},
+				Notes: []string{
+					"Stream models (fraud_risk, bot_score) sample the feature vectors the Go score-writer persists in gold.predictions.features; batch models (churn_risk, forecasts) sample their feature marts.",
+					"Baselines exclude features that are not re-measurable in a comparable window (category_code is not a mart column; year is constant within any rolling window) — measuring what can't be measured comparably would produce pure noise.",
+					"Findings are advisory: the playbook PROPOSES a retrain; a human approves or rejects it with a recorded reason.",
+				},
+			},
+			{
+				Name:        "model_forecast_decay",
+				Label:       "Forecast accuracy decay",
+				Source:      SourceMonitoring,
+				Description: "Current WAPE of the newest rolling-origin backtest window for a forecast model versus the baseline WMAPE it registered at training time. Crosses the 1.5x deterioration bound when the model's recent error meaningfully exceeds its own trained behavior.",
+				Population:  "one (active forecast model, run) row in gold.model_drift",
+				Grain:       "model (computed_at)",
+				Aggregation: "WAPE over the most recent backtest window vs registry metrics.wmape; status from the 1.5x deterioration boundary",
+				Unit:        "ratio (current/baseline WAPE)",
+				SourceTable: "gold.model_drift (kind='forecast_decay')",
+				Tags:        []string{"monitoring", "phase4", "drift"},
+				Notes: []string{
+					"Same advisory posture as model_drift_psi: a decay finding can raise the retrain-on-critical-drift proposal, but never silently acts.",
+				},
+			},
 		},
 		Notes: []string{
 			"Dataset: Olist Brazilian E-Commerce, 2016-09-04 → 2018-09-03 (purchase dates).",
@@ -312,6 +383,7 @@ func Default() Catalog {
 			"Realtime metrics (Phase 1) describe a compressed REPLAY of the same orders; they are bounded to their own gold.realtime_metrics table and are never added to the batch gold.daily_* totals.",
 			"Every metric carries a required `source` field: \"batch\" vs \"live_replay\". Never add or compare figures across the two sources; treat the split as part of the contract.",
 			"Phase 2 adds a third source, \"model\": forecast/risk scores in gold.predictions produced by versioned models in gold.model_registry. Model outputs are never additive with batch or live_replay figures; always cite the model version and its backtest metrics.",
+			"Phase 4 adds \"governance\" (approval-queue state: counts of proposals and decisions, not business figures) and \"monitoring\" (model health: per-feature PSI and forecast decay). Both are observability sources — maps of the system — and are never additive with batch, live_replay, or model figures.",
 		},
 	}
 }

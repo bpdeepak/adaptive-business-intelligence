@@ -541,4 +541,163 @@ refreshOpenAnomalies();
 loadModelRisk();
 startFraudFeed();
 
+/* ------------------------------------------------------------------ */
+/* Phase 4 · governance: approval queue, action history, model health  */
+/* ------------------------------------------------------------------ */
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function statusPill(s) {
+  return `<span class="status-pill pill-${escapeHtml(s || "unknown")}">${escapeHtml(s || "unknown")}</span>`;
+}
+
+async function decide(id, reject, reason, input) {
+  const verb = reject ? "reject" : "approve";
+  let res;
+  try {
+    res = await fetch(`/api/v1/actions/${id}/${verb}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    });
+  } catch (err) {
+    if (input) { input.placeholder = "server unreachable"; input.classList.add("bad-input"); }
+    return;
+  }
+  if (res.ok) {
+    if (input) { input.value = ""; input.classList.remove("bad-input"); }
+    loadApprovalQueue();
+    loadActionHistory();
+    return;
+  }
+  let msg = `HTTP ${res.status}`;
+  try { msg = (await res.json()).error || msg; } catch { /* keep msg */ }
+  if (input) { input.placeholder = msg; input.classList.add("bad-input"); }
+}
+
+async function loadApprovalQueue() {
+  const tbody = document.getElementById("approvalQueue");
+  let rows = [];
+  try {
+    const env = await getJSON("/api/v1/actions?status=pending&limit=50");
+    rows = env.data || [];
+  } catch { /* fall through */ }
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="7" class="muted-cell">no pending actions — approval queue is clear</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map((a) =>
+    `<tr data-id="${a.id}">` +
+    `<td class="id-cell">#${a.id}</td>` +
+    `<td>${escapeHtml(a.action)}</td>` +
+    `<td class="id-cell">${shortID(a.entity)}</td>` +
+    `<td>${statusPill(a.risk_tier)}</td>` +
+    `<td class="id-cell">${escapeHtml(a.rule)}</td>` +
+    `<td class="time-cell">${(a.created_at || "").slice(0, 16).replace("T", " ")}</td>` +
+    `<td class="action-cell">` +
+    `<input class="reason-input" placeholder="reason…" />` +
+    `<button class="btn-action approve" data-decision="approve">Approve</button>` +
+    `<button class="btn-action reject" data-decision="reject">Reject</button>` +
+    `</td></tr>`
+  ).join("");
+}
+
+async function loadActionHistory() {
+  const tbody = document.getElementById("actionHistory");
+  let rows = [];
+  try {
+    const env = await getJSON("/api/v1/actions?limit=100");
+    rows = env.data || [];
+  } catch { /* fall through */ }
+  rows = rows.filter((a) => a.status !== "pending").slice(0, 25);
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="7" class="muted-cell">no decided actions yet</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map((a) =>
+    `<tr data-id="${a.id}">` +
+    `<td class="id-cell">#${a.id}</td>` +
+    `<td>${escapeHtml(a.action)}</td>` +
+    `<td class="id-cell">${shortID(a.entity)}</td>` +
+    `<td>${statusPill(a.status)}</td>` +
+    `<td class="id-cell">${escapeHtml(a.rule)}</td>` +
+    `<td class="time-cell">${((a.decided_at || a.executed_at || a.created_at) || "").slice(0, 16).replace("T", " ")}</td>` +
+    `<td class="action-cell"><button class="btn-action trace" data-trace="${a.id}">trace</button></td>` +
+    `</tr>`
+  ).join("");
+}
+
+async function loadModelDrift() {
+  const tbody = document.getElementById("driftBoard");
+  let rows = [];
+  try {
+    const env = await getJSON("/api/v1/model-drift?limit=60");
+    rows = env.data || [];
+  } catch { /* fall through */ }
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="muted-cell">no drift measurements yet — run <code>make monitor</code></td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map((r) =>
+    `<tr>` +
+    `<td class="id-cell">${escapeHtml(r.model)}</td>` +
+    `<td>${escapeHtml(r.feature)}</td>` +
+    `<td class="score-cell">${r.psi.toFixed(4)}</td>` +
+    `<td>${statusPill(r.status)}</td>` +
+    `<td>${escapeHtml(r.kind)}</td>` +
+    `<td class="time-cell">${(r.computed_at || "").slice(0, 16).replace("T", " ")}</td>` +
+    `</tr>`
+  ).join("");
+}
+
+document.getElementById("approvalQueue").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button[data-decision]");
+  if (!btn) return;
+  const tr = ev.target.closest("tr[data-id]");
+  const input = tr.querySelector(".reason-input");
+  const reason = input.value.trim();
+  if (!reason) { input.classList.add("bad-input"); return; }
+  decide(Number(tr.dataset.id), btn.dataset.decision === "reject", reason, input);
+});
+
+document.getElementById("actionHistory").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-trace]");
+  if (!btn) return;
+  const box = document.getElementById("actionTrace");
+  box.hidden = false;
+  box.innerHTML = `<span class="muted-cell">loading trace…</span>`;
+  try {
+    const env = await getJSON(`/api/v1/actions/${btn.dataset.trace}/trace`);
+    const t = env.data || {};
+    const audit = t.audit || [];
+    const act = t.action || {};
+    box.innerHTML =
+      `<div class="trace-head"><h3>Trace · action #${act.id} <span class="hint">(${escapeHtml(act.rule || "")})</span></h3>` +
+      `<button class="btn-action close-trace" type="button">close</button></div>` +
+      audit.map((e) =>
+        `<div class="trace-row">` +
+        `<span class="trace-trans">${escapeHtml(e.transition)}</span>` +
+        `<span class="trace-actor">${escapeHtml(e.actor)}</span>` +
+        `<span class="trace-at">${((e.at || "").slice(0, 19) || "").replace("T", " ")}</span>` +
+        (e.reason ? `<span class="trace-reason">“${escapeHtml(e.reason)}”</span>` : "") +
+        (e.detail ? `<code class="trace-detail">${escapeHtml(JSON.stringify(e.detail))}</code>` : "") +
+        `</div>`
+      ).join("");
+  } catch {
+    box.innerHTML = `<span class="muted-cell">trace unavailable</span>`;
+  }
+});
+
+document.getElementById("actionTrace").addEventListener("click", (ev) => {
+  if (ev.target.closest(".close-trace")) ev.target.closest(".close-trace").parentElement.hidden = true;
+});
+
+loadApprovalQueue();
+loadActionHistory();
+loadModelDrift();
+setInterval(() => { loadApprovalQueue(); loadActionHistory(); loadModelDrift(); }, 20000);
+
 load();

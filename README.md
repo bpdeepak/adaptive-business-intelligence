@@ -19,7 +19,13 @@ banner; the dashboard gains forecast confidence bands, a churn leaderboard and
 a live fraud feed; and a free open-source LLM (`ml/agent`, Ollama + Qwen2.5-7B)
 answers natural-language questions with **grounding v2** — only observed or
 derived numbers, batch/live never summed, honest refusal after one bounded
-revision, and a 20-question regression eval.
+revision, and a 20-question regression eval. **Phase 4 governs the machine**:
+a domain event bus + declarative playbook engine (`config/playbooks.yml`) that
+*proposes* actions onto an approval queue; humans approve or reject with a
+mandatory reason and every transition lands in an immutable audit log; a
+drift/decay monitor (PSI over training baselines + forecast decay) turns
+critical findings into governed retrain proposals whose worker trains
+**candidates** — promotions stay a deliberate human flip.
 
 | Layer | What ships |
 |---|---|
@@ -32,7 +38,9 @@ revision, and a 20-question regression eval.
 | Predictive (Phase 2) | `ml/` Python stack (uv `ml` group): LightGBM + XGBoost trained with strict time splits, SHAP `TreeExplainer` explanations on every prediction, `gold.model_registry` (5 active versions), `gold.predictions` (42k+ backtest rows + live scores, each with explanation jsonb), per-category forecast confidence bands, versioned joblib artifacts in `artifacts/`, stdlib HTTP sidecar `ml/serve.py` |
 | Stream scoring (Phase 3) | `cmd/server` score-writer consumes the replay, assembles batch-exact feature vectors in Go (19-feature fraud spec as the single cross-language source), scores through the same sidecar, persists `source="stream_score"` rows, and fires **model rate anomalies** (`detector='model'`, 5-min window >3× baseline, `z_score NULL`) onto the SSE banner + `gold.anomalies` |
 | Agentic BI (Phase 3) | `ml/agent` NL-BI sidecar (stdlib HTTP :8094): 9 provenance-labeled tools (`batch` / `live_replay` / `registry` / `predictions`), grounding v2 (R1 literal · R2 within-label sum/mean/diff · R3 batch/live-mix ban · R4 score-entity trace), one bounded revision then honest refusal, and a 20-question deterministic eval (fake DB + mock LLM) mirrored against the real DB; Go API `POST /api/v1/agent/query` + metrics |
-| Dashboard | Vanilla JS + Chart.js: KPI cards, daily charts, top categories, 7D/30D/90D/All windows, **live revenue/orders/sessions tiles, anomaly banner (statistical + model rate), replay-speed badge — plus Phase 3 forecast confidence band, churn-risk leaderboard, stream-scored fraud feed** |
+| Dashboard | Vanilla JS + Chart.js: KPI cards, daily charts, top categories, 7D/30D/90D/All windows, **live revenue/orders/sessions tiles, anomaly banner (statistical + model rate), replay-speed badge — plus Phase 3 forecast confidence band, churn-risk leaderboard, stream-scored fraud feed — plus the Phase 4 approval queue (approve/reject with reason), action history + trace, and model-health board** |
+| Governance (Phase 4) | `api/internal/events` (typed bus, publish-after-write) + `api/internal/playbook` (YAML rules, validated at boot, `dedup_key` UNIQUE) → `gold.action_queue` (approval_required default, auto allow-list for informational rows) + `gold.action_audit_log` (append-only, FK to the queue, every transition has actor/reason/payload) + `gold.retrain_requests` consumed by `ml/monitor/retrain_worker.py` (trains candidates, never auto-promotes); `ml/monitor` PSI/decay pipeline writes `gold.model_drift`, bridged to Go by a watermark-based poller (F5: the table is the contract) |
+| Monitoring (Phase 4) | `ml/monitor/{psi,drift_check,retrain_worker}.py`: 10-bin PSI vs training-matrix `drift_baseline` (ok <0.10 / warning 0.10–0.20 / critical >0.20; NaN→ok, inf→critical), stream PSI from the persisted `features` jsonb (fraud/bot) and batch PSI from the feature marts (churn/forecast), forecast decay vs trained WMAPE (1.5× bound); `make monitor` / `make monitor-worker`; `GET /api/v1/model-drift` |
 
 ## Architecture
 
@@ -121,12 +129,43 @@ every number** (`batch` is the historical layer, `live_replay` is the replay's
 from `gold.predictions`** (the grounder verifies entity-score claims against
 observed rows). Full detail: `docs/phase3.md`.
 
+## Governance & drift monitoring (Phase 4)
+
+```
+event producers (score-writer, aggregator, drift poller)
+   │ publish typed events AFTER their DB writes (never before)
+   ▼
+playbook engine  ──  config/playbooks.yml (validated at boot, no code)
+   │ conditions over event payloads (tiny pure expression language)
+   ▼                 ┌────────────────────────────────────────────┐
+gold.action_queue ──►│ approval_required default · auto allow-list │
+   │  dedup_key = rule|scope (UNIQUE)                              │
+   ▼ human approve/reject (mandatory reason, actor)                │
+gold.action_audit_log  ◄── append-only: proposed/approved/rejected/ │
+   │                        executed/outcome, each with payload    └┘
+   ▼ approved
+executor registry  ───► gold.retrain_requests ──► ml/monitor/retrain_worker.py
+   (simulated effects)     │                        │ trains <tag>.retrain<action_id>
+   hold_order_flags        ▼                        ▼
+   bot_session_log   gold.model_registry (status='candidate') + audit 'outcome'
+
+ml/monitor/drift_check.py (make monitor) ──► gold.model_drift
+   stream PSI  ← gold.predictions.features (fraud/bot)      Go poller (watermark)
+   batch PSI   ← feature marts (churn/forecast)             merges one event per
+   forecast decay ← newest backtest WAPE vs trained WMAPE    (model, computed_at)
+```
+
+The Phase 4 posture is **"propose, don't silently act"**: every rule can only
+propose, and the queue, the immutable audit trail, and the candidate-only
+retrain worker make the human's call the only way anything actually changes.
+Full detail: `docs/phase4.md`.
+
 ## Repository layout
 
 ```
 ├── docker-compose.yml        # Postgres + MinIO + Redpanda, healthchecked
 ├── pyproject.toml            # uv project: dbt-core, dbt-postgres, boto3, psycopg (+ `ml` group)
-├── Makefile                  # infra/test/app/integration-test/smoke + ml-sync/ml-features/train/serve-models and Phase 3 agent targets (agent-eval/agent-mock/agent-serve/agent-test)
+├── Makefile                  # infra/test/app/integration-test/smoke + ml-sync/ml-features/train/serve-models and Phase 3 agent targets (agent-eval/agent-mock/agent-serve/agent-test) + Phase 4 monitor targets (monitor/monitor-worker)
 ├── .github/workflows/ci.yml  # CI: compose up → load → dbt → vet/unit/integration → smoke
 ├── scripts/
 │   ├── bootstrap.ps1         # infra → data → bronze → dbt → docs → build (Windows)
@@ -138,20 +177,24 @@ observed rows). Full detail: `docs/phase3.md`.
 │   └── download_olist.py     # stdlib downloader with byte-size verification
 ├── loader/loader.py          # CSV → MinIO bronze → Postgres bronze.* (COPY + lineage cols)
 ├── dbt/                      # dbt project (profile, macros, sources incl. realtime gold tables)
-├── ml/                       # Phase 2/3 Python: feature builders, trainers, SHAP explainer,
+├── ml/                       # Phase 2/3/4 Python: feature builders, trainers, SHAP explainer,
 │                            #   registry/prediction writers, serving sidecar (serve.py),
-│                            #   NL-BI agent (agent/ — tools, grounding v2, eval, mock LLM), tests
+│                            #   NL-BI agent (agent/ — tools, grounding v2, eval, mock LLM),
+│                            #   Phase 4 monitor (monitor/ — psi, drift_check, retrain_worker), tests
 ├── artifacts/                # derived (gitignored): versioned model joblibs + serving
 │                            #   manifest, written by `make train` — regenerate, don't commit
 ├── api/                      # Go module: cmd/{server,producer,api} + internal/{stream,realtime,
-│                            #   predict,agent,kafka,grpcapi,config,http,metrics,model,store,telemetry}
+│                            #   predict,agent,kafka,grpcapi,config,http,metrics,model,store,telemetry,
+│                            #   events,playbook,actions,monitor} (Phase 4 governance core)
 └── docs/
     ├── phase0.md             # Phase 0 decisions, schema dictionary, metric definitions
     ├── phase1.md             # Phase 1 event contract, realtime schema, anomaly detection, ops
     ├── phase2.md             # Phase 2 model cards (verified metrics), registry/predictions
     │                         #   contracts, sidecar API, ops, deferrals
-    └── phase3.md             # Phase 3 stream score-writer, rate anomalies, dashboard panels,
-                              #   agent grounding v2 + eval gate, ops
+    ├── phase3.md             # Phase 3 stream score-writer, rate anomalies, dashboard panels,
+    │                         #   agent grounding v2 + eval gate, ops
+    └── phase4.md             # Phase 4 event bus + playbook, approval queue + audit log,
+                              #   drift/decay monitoring, retrain-as-governed-action, demo
 ```
 
 ## Quickstart (Windows)
@@ -183,10 +226,15 @@ uv run --group ml python ml/train_all.py  # backtest + register 4 models + write
 uv run --group ml python ml/serve.py      # sidecar http://127.0.0.1:8093 (phase 2 scoring)
 
 # 6. Phase 3: NL-BI agent (run the eval gate, then serve it; mock needs no LLM)
-uv run --group ml python -m ml.agent.eval_agent --db fake --llm mock   # expect 19 passed
+uv run --group ml python -m ml.agent.eval_agent --db fake --llm mock   # expect 25 passed
 uv run --group ml python ml/agent/server.py --mode mock                # agent on :8094
 # after installing Ollama (winget install Ollama.Ollama; ollama pull qwen2.5:7b-instruct),
 # restart the agent with --mode live. The Go API exposes POST /api/v1/agent/query.
+
+# 7. Phase 4: monitoring + governed retrain (server + producer already running)
+uv run --group ml python -m ml.monitor.drift_check      # writes gold.model_drift (or: make monitor)
+uv run --group ml python -m ml.monitor.retrain_worker   # consumes approved retrain_requests
+# approve/reject proposals on the dashboard "Approval queue" (or POST /api/v1/actions/{id}/approve|reject)
 ```
 
 Linux/CI equivalents:
@@ -211,10 +259,14 @@ make train                           # backtest + register models + sidecar_mode
 make serve-models                    # scoring sidecar on 127.0.0.1:8093
 
 # 5. Phase 3: agent eval + sidecar (see docs/phase3.md §8)
-make agent-eval                      # deterministic 20-question gate (fake DB + mock LLM)
+make agent-eval                      # deterministic 25-question gate (fake DB + mock LLM)
 make agent-test                      # ml unit tests + the same gate
 make agent-mock                      # agent sidecar on 127.0.0.1:8094 (no LLM required)
 make agent-serve                     # agent sidecar, live mode (Ollama/OpenAI-compatible)
+
+# 6. Phase 4: monitoring + governed retrain (see docs/phase4.md §9)
+make monitor                         # drift + decay check -> gold.model_drift
+make monitor-worker                  # consumes approved retrain_requests; trains candidates
 ```
 
 The Go API treats the sidecar as optional: without it `POST /api/v1/score`
@@ -275,6 +327,18 @@ Every push/PR to `main` also runs the full pipeline in CI: `docker compose up -d
   by unit tests.
 - **ML tests:** `uv run --group ml python -m pytest ml/tests -q` green
   (backtest metric maths incl. single-class guard).
+- **Phase 4 governance, verified live:** the full loop ran end to end — an
+  injected critical PSI finding (churn_risk, `detail.injected=true`) was picked
+  up by the Go drift poller, `retrain-on-critical-drift` proposed
+  `retrain_model`, a human approved with a reason, the executor enqueued
+  `gold.retrain_requests`, and `ml/monitor/retrain_worker.py` trained candidate
+  `20260924.050835.retrain15` (never auto-promoted) and wrote the audit
+  `outcome`; a second proposal (bootstrap-window bot_score critical) was
+  rejected with a recorded reason and never executed. The immutable trail
+  `proposed → approved → executed → outcome` is served by
+  `GET /api/v1/actions/{id}/trace`. Monitor integration tests pin the poller's
+  bootstrap, worst-status merge, and watermark resume; the actions integration
+  tests pin the execution guard (no executor without a prior audited decision).
 
 ## Metric definitions
 
@@ -294,9 +358,9 @@ so the split is structural, not a prose caveat; the realtime rows above are
 `live_replay` and are **never additive** with the batch totals.
 
 This dictionary is served **programmatically** at `GET /api/v1/metrics`
-(`api/internal/metrics/catalog.go`, versioned — currently **v1.3.0**, which adds
-the Phase 2 `model` source) — the machine-readable semantic layer that agents
-should fetch before answering metric questions.
+(`api/internal/metrics/catalog.go`, versioned — currently **v1.4.0**, which adds
+the Phase 4 `governance` and `monitoring` sources) — the machine-readable
+semantic layer that agents should fetch before answering metric questions.
 
 ## Roadmap
 
@@ -320,10 +384,17 @@ should fetch before answering metric questions.
   regression eval) backed by a free open-source LLM (Ollama Qwen2.5-7B).
   **Complete and verified** (`docs/phase3.md`): the live sidecar answers
   grounded questions against the local model at ~2–5 s each (§8.1).
-- **Phase 4** — conversational agents, subscriptions, alerting; drift monitoring
-  and drift-triggered retraining of the Phase 2 models.
+- **Phase 4 (this phase)** — governance: the event bus + playbook engine
+  (`config/playbooks.yml` propose-only), the human-in-the-loop approval queue
+  with an append-only audit log, the simulated action registry, drift/decay
+  monitoring (PSI vs training baselines + forecast decay) with
+  retrain-as-governed-action, and the API/dashboard/agent surfaces.
+  **Complete and verified** (`docs/phase4.md`): the full loop ran live —
+  critical drift → proposal → approve → worker-trained candidate
+  (reject path shown too), with the audit trail served by
+  `/api/v1/actions/{id}/trace`.
 - **Phase 5** — Deployment: Docker image (already provided in `api/Dockerfile`),
   observability, horizontal scaling of consumers.
 
-See `docs/phase0.md`, `docs/phase1.md`, `docs/phase2.md`, and `docs/phase3.md`
-for full detail.
+See `docs/phase0.md`, `docs/phase1.md`, `docs/phase2.md`, `docs/phase3.md`, and
+`docs/phase4.md` for full detail.

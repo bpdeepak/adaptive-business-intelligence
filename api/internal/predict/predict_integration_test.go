@@ -136,14 +136,29 @@ func TestPredictRegistryListsActiveModels(t *testing.T) {
 	if !ok || len(entries) == 0 {
 		t.Fatalf("data = %#v, want a non-empty registry listing", env.Data)
 	}
-	first := entries[0].(map[string]any)
-	for _, key := range []string{"model_name", "model_version", "status", "task", "grain", "artifact_path"} {
-		if _, ok := first[key]; !ok {
-			t.Fatalf("registry entry missing %q: %v", key, first)
+	// The registry lists every version with its status; Phase 4 candidates
+	// (status='candidate', never auto-promoted) are expected in the listing,
+	// so the assertion is state-independent: known statuses only, and at
+	// least one active model (live sessions run training/retrains).
+	statuses := map[string]bool{}
+	for _, e := range entries {
+		entry := e.(map[string]any)
+		for _, key := range []string{"model_name", "model_version", "status", "task", "grain", "artifact_path"} {
+			if _, ok := entry[key]; !ok {
+				t.Fatalf("registry entry missing %q: %v", key, entry)
+			}
+		}
+		statuses[entry["status"].(string)] = true
+	}
+	for s := range statuses {
+		switch s {
+		case "active", "superseded", "candidate": // known registry statuses
+		default:
+			t.Fatalf("registry entry has unexpected status %q", s)
 		}
 	}
-	if first["status"] != "active" {
-		t.Fatalf("expected only active models listed, got %v", first["status"])
+	if !statuses["active"] {
+		t.Fatalf("registry listing has no active model (statuses: %v)", statuses)
 	}
 }
 
