@@ -1,0 +1,98 @@
+# Phase 4 — governance playbooks.
+#
+# Declarative Business-AI action policy. A rule reads: when an event of
+# `trigger` arrives whose `condition` holds, propose `action` on the approval
+# queue. `risk_tier` decides whether a human must approve it (`approval_required`,
+# the default posture) or the allow-list runs it immediately (`auto`, only for
+# reversible / informational effects with no revenue exposure).
+#
+# Everything here is config, not code: changing policy is a diff to this file,
+# and every rule is compiled + validated at server boot (a typo aborts startup).
+# Conditions use a tiny pure expression language — paths into the event
+# payload (`prediction.score`), literals, comparisons, arithmetic, && / || / !,
+# parentheses. No function calls, no side effects; unknown fields fail closed.
+#
+# Live now (their producers exist — the score-writer, the anomaly aggregator,
+# the drift poller):
+#   * hold-high-fraud-order        order_scored → approval_required hold
+#   * log-midband-bot-session      session_scored → auto informational note
+#   * retrain-on-critical-drift    drift_computed → approval_required retrain
+#
+# Dormant (`enabled: false`, kept parseable + validated on purpose): the
+# churn retention + stockout rules wait for Phase 5 producers — a scheduled
+# churn-scoring job (`churn_scored`) and a forecast worker (`forecast_updated`).
+# Flipping one `enabled` value is the whole activation; no code changes.
+version: 1
+rules:
+  - name: hold-high-fraud-order
+    trigger: order_scored
+    description: >-
+      A fraud prediction at or above the recommended threshold holds the order
+      for human review. The immutable gold.fct_orders row is never touched —
+      only the flag table changes, and every transition is audited. The queue
+      is the fraud-control surface an agent can enumerate and act on.
+    condition: "prediction.model == 'fraud_risk' && prediction.score >= registry.recommended_threshold"
+    action: hold_order_for_review
+    risk_tier: approval_required
+    enabled: true
+
+  - name: log-midband-bot-session
+    trigger: session_scored
+    description: >-
+      A bot score at or above the at-risk line (0.5) but below the alarming
+      band (0.7) gets an informational note from the auto allow-list. No value
+      changes hands, so no human approval is warranted; the event log row is
+      the pattern for future low-risk automations.
+    condition: "prediction.model == 'bot_score' && prediction.score >= 0.5 && prediction.score < 0.7"
+    action: log_event_note
+    params:
+      kind: bot_midband
+    risk_tier: auto
+    enabled: true
+
+  - name: retrain-on-critical-drift
+    trigger: drift_computed
+    description: >-
+      When the monitoring pipeline reports a critical drift or decay finding
+      for a serving model, propose a retrain. Approval is required because
+      swapping the artifact that serves live traffic is a decision that leaves
+      an audit trail; approved requests land in gold.retrain_requests and the
+      Python worker registers a candidate (never promoted silently).
+    condition: "drift.status == 'critical'"
+    action: retrain_model
+    risk_tier: approval_required
+    enabled: true
+
+  # --- Dormant Phase 5 rules (producers pending; see header) ---------------
+  - name: propose-retention-offer-high-churn
+    trigger: churn_scored
+    description: >-
+      DORMANT (needs a scheduled churn-scoring job). A customer whose churn
+      score crosses the retention bar is proposed a retention offer.
+    condition: "prediction.model == 'churn_risk' && prediction.score >= 0.70"
+    action: propose_retention_offer
+    risk_tier: approval_required
+    enabled: false
+
+  - name: nudge-low-risk-churn
+    trigger: churn_scored
+    description: >-
+      DORMANT (needs a scheduled churn-scoring job). Low churn risk gets an
+      automated nudge from the auto allow-list.
+    condition: "prediction.model == 'churn_risk' && prediction.score < 0.30"
+    action: log_retention_email
+    risk_tier: auto
+    enabled: false
+
+  - name: draft-po-on-weak-forecast
+    trigger: forecast_updated
+    description: >-
+      DORMANT (needs a forecast worker). When a weekly forecast point estimate
+      falls below the category's 4-week realized average, propose a restock
+      purchase order for the week ahead.
+    condition: "forecast.point_estimate < forecast.recent_avg * 1.1"
+    action: draft_purchase_order
+    params:
+      quantity: 0
+    risk_tier: approval_required
+    enabled: false

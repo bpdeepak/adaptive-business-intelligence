@@ -173,3 +173,105 @@ func TestRateTrackerSnapshotRestore(t *testing.T) {
 		t.Error("restored tracker re-fired in the same bucket")
 	}
 }
+
+// --- Phase 4: banner hysteresis (persist on first breach, surface when the
+// breach persists across ConsecutiveWindowsRequired adjacent 5-minute
+// buckets). ---
+
+// feedBucket feeds `n` samples of `value` across one 5-minute bucket starting
+// at t (aligned to RateWindowSecs boundaries) and returns the fired anomalies.
+func feedBucket(rt *RateTracker, bucketStart time.Time, n int, value float64) []*model.Anomaly {
+	var fired []*model.Anomaly
+	for i := 0; i < n; i++ {
+		if anom := rt.Observe(bucketStart.Add(time.Duration(i)*time.Second), value); anom != nil {
+			fired = append(fired, anom)
+		}
+	}
+	return fired
+}
+
+func TestConsecutiveWindowsHysteresis(t *testing.T) {
+	rt := rtWith(0.01) // 3x = 0.03
+	t0 := time.Unix(RateWindowSecs, 0).UTC()
+
+	// Bucket 1: all-positive → first finding, NOT surfaced (consecutive=1).
+	b1 := feedBucket(rt, t0, 25, 0.9)
+	if len(b1) != 1 {
+		t.Fatalf("bucket 1 fired %d, want exactly 1", len(b1))
+	}
+	if b1[0].Surfaced {
+		t.Error("first breached bucket must be persisted but NOT surfaced")
+	}
+	if rt.Snapshot().Consecutive != 1 {
+		t.Errorf("consecutive = %d after first bucket, want 1", rt.Snapshot().Consecutive)
+	}
+
+	// Bucket 2: adjacent all-positive → consecutive=2 → surfaced.
+	b2 := feedBucket(rt, t0.Add(RateWindowSecs*time.Second), 25, 0.9)
+	if len(b2) != 1 {
+		t.Fatalf("bucket 2 fired %d, want exactly 1", len(b2))
+	}
+	if !b2[0].Surfaced {
+		t.Error("second consecutive breached bucket must be surfaced")
+	}
+	if rt.Snapshot().Consecutive != 2 {
+		t.Errorf("consecutive = %d after second bucket, want 2", rt.Snapshot().Consecutive)
+	}
+}
+
+func TestHysteresisResetsAfterHealthyBucket(t *testing.T) {
+	rt := rtWith(0.01)
+	t0 := time.Unix(RateWindowSecs, 0).UTC()
+
+	feedBucket(rt, t0, 25, 0.9)                                 // bucket 1: fires, streak=1
+	feedBucket(rt, t0.Add(RateWindowSecs*time.Second), 25, 0.9) // bucket 2: fires, streak=2 (surfaced)
+	// Bucket 3 enters with bucket 2's positives still in the trailing window,
+	// so it fires one more breach (streak=3) before the negatives take over.
+	feedBucket(rt, t0.Add(2*RateWindowSecs*time.Second), 25, 0.1)
+	if rt.Snapshot().Consecutive != 3 {
+		t.Errorf("consecutive entering healthy tail = %d, want 3 (trailing positives still elevated)",
+			rt.Snapshot().Consecutive)
+	}
+
+	// Bucket 4: a fully populated all-negative window — the breach did not
+	// persist across it, so the streak resets to zero.
+	feedBucket(rt, t0.Add(3*RateWindowSecs*time.Second), 25, 0.1)
+	if rt.Snapshot().Consecutive != 0 {
+		t.Errorf("consecutive after a fully healthy bucket = %d, want 0 (reset)",
+			rt.Snapshot().Consecutive)
+	}
+
+	// Bucket 5: a fresh breach after the reset starts the streak over at 1 —
+	// NOT surfaced, even though it is the fourth breach overall.
+	b5 := feedBucket(rt, t0.Add(4*RateWindowSecs*time.Second), 25, 0.9)
+	if len(b5) != 1 {
+		t.Fatalf("bucket 5 fired %d, want exactly 1", len(b5))
+	}
+	if b5[0].Surfaced {
+		t.Error("breach after a healthy bucket must restart the streak (not surfaced)")
+	}
+	if rt.Snapshot().Consecutive != 1 {
+		t.Errorf("consecutive = %d after the reset breach, want 1", rt.Snapshot().Consecutive)
+	}
+}
+
+func TestHysteresisStreakRestoresFromSnapshot(t *testing.T) {
+	rt := rtWith(0.01)
+	t0 := time.Unix(RateWindowSecs, 0).UTC()
+	feedBucket(rt, t0, 25, 0.9)                                     // streak=1, not surfaced
+	feedBucket(rt, t0.Add(RateWindowSecs*time.Second), 25, 0.9)     // streak=2, surfaced
+
+	trace := rt.Snapshot()
+	if trace.Consecutive != 2 {
+		t.Fatalf("snapshot consecutive = %d, want 2", trace.Consecutive)
+	}
+
+	// A restarted tracker restoring the trace continues the streak: a breach
+	// in the next adjacent bucket is immediately surfaced.
+	rt2 := rtWith(0.01)
+	rt2.Restore(trace)
+	b3 := feedBucket(rt2, t0.Add(2*RateWindowSecs*time.Second), 25, 0.9)
+	if len(b3) != 1 || !b3[0].Surfaced {
+		t.Error("restored streak should surface the next adjacent breach")
+	}
+}

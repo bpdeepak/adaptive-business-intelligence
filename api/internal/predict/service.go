@@ -232,6 +232,7 @@ func (s *Service) ScoreAndPersist(ctx context.Context, modelName, entityID strin
 		Confidence:   resp.Confidence,
 		Explanation:  resp.Explanation,
 		Metadata:     metadata,
+		Features:     features,
 	})
 	if err != nil {
 		return resp, 0, fmt.Errorf("persist prediction: %w", err)

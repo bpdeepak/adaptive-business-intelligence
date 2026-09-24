@@ -65,6 +65,10 @@ type Anomaly struct {
 	Severity    string  `json:"severity"`
 	Status      string  `json:"status"`
 	DetectedAt  string  `json:"detected_at"`
+	// Surfaced is Phase 4 hysteresis: true once a rate-based anomaly has
+	// persisted across ConsecutiveWindowsRequired buckets and is allowed on
+	// the SSE banner. Every anomaly row is persisted regardless of this flag.
+	Surfaced bool `json:"surfaced,omitempty"`
 }
 
 // MetricsUpdate is one push on the SSE/gRPC live stream. The first update after

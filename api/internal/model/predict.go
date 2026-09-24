@@ -14,13 +14,15 @@ type ModelRegistryEntry struct {
 	ArtifactPath  string          `json:"artifact_path"`
 	Features      []string        `json:"features"`
 	Metrics       json.RawMessage `json:"metrics,omitempty"`
+	DriftBaseline json.RawMessage `json:"drift_baseline,omitempty"`
 	TrainedWindow json.RawMessage `json:"trained_window,omitempty"`
 	CreatedAt     string          `json:"created_at"`
 }
 
 // Prediction is one explainable model output from gold.predictions. The
 // explanation payload always carries the SHAP feature contributions for
-// classifiers (and the global ranking for forecasts).
+// classifiers (and the global ranking for forecasts). Features holds the
+// model's input vector (stream-scored rows only; batch rows keep []).
 type Prediction struct {
 	ID           int64           `json:"id"`
 	ModelName    string          `json:"model_name"`
@@ -34,6 +36,7 @@ type Prediction struct {
 	UpperBound   *float64        `json:"upper_bound,omitempty"`
 	Explanation  json.RawMessage `json:"explanation,omitempty"`
 	Metadata     json.RawMessage `json:"metadata,omitempty"`
+	Features     json.RawMessage `json:"features,omitempty"`
 }
 
 // ScoreRequest is the POST /api/v1/score body: score one entity through the

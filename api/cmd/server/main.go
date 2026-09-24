@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -22,12 +23,16 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	"abi/internal/agent"
+	"abi/internal/actions"
 	"abi/internal/config"
+	"abi/internal/events"
 	grpcapi "abi/internal/grpcapi"
 	metricsv1 "abi/internal/grpcapi/metricsv1"
 	httpapi "abi/internal/http"
 	"abi/internal/kafka"
 	"abi/internal/model"
+	"abi/internal/monitor"
+	"abi/internal/playbook"
 	"abi/internal/predict"
 	"abi/internal/realtime"
 	"abi/internal/scorewriter"
@@ -66,6 +71,16 @@ func run(logger *slog.Logger, cfg config.Config) error {
 		return err
 	}
 	logger.Info("predict schema ensured")
+
+	// Phase 4 governance + monitoring tables (idempotent on every boot).
+	if err := actions.EnsureSchema(ctx, pool); err != nil {
+		return err
+	}
+	logger.Info("actions schema ensured")
+	if err := monitor.EnsureSchema(ctx, pool); err != nil {
+		return err
+	}
+	logger.Info("monitor schema ensured")
 
 	st, err := store.NewPostgresStore(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -109,9 +124,41 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	reg := telemetry.NewRegistry()
 	aggregator.Instrument(reg)
 
+	// 4c. Phase 4 governance reactor: one in-process domain bus, the playbook
+	// engine turning domain events into governed proposals, the action
+	// registry owning the approval queue + immutable audit log, and a drift
+	// poller bridging the Python monitoring pipeline (gold.model_drift) onto
+	// the bus. Wired before any consumer starts so the engine misses nothing.
+	bus := events.New()
+	aggregator.SetEvents(bus)
+
+	actionsSvc := actions.New(pool, logger)
+
+	rules, err := loadPlaybooks(cfg.PlaybookPath)
+	if err != nil {
+		return err
+	}
+	engine, err := playbook.NewEngine(bus, actionsSvc, rules, logger)
+	if err != nil {
+		return fmt.Errorf("playbook engine: %w", err)
+	}
+	govCtx, govCancel := context.WithCancel(ctx)
+	defer govCancel()
+	go func() {
+		if err := engine.Run(govCtx); err != nil {
+			logger.Error("playbook engine stopped", "error", err)
+		}
+	}()
+
+	poller := monitor.NewPoller(pool, bus, logger.Info)
+	driftCtx, driftCancel := context.WithCancel(ctx)
+	defer driftCancel()
+	go func() { _ = poller.Run(driftCtx, cfg.DriftPollEvery) }()
+
 	// 5. HTTP (REST + SSE + dashboard + /metrics).
 	srv := httpapi.New(st, logger)
 	srv.AttachLive(feed)
+	srv.AttachActions(actionsSvc)
 	rootMux := http.NewServeMux()
 	rootMux.Handle("/", srv)
 	rootMux.Handle("GET /metrics", reg.Handler())
@@ -122,6 +169,7 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	predictSvc := predict.NewService(pool, predict.NewScoreClient(cfg.ScoreURL), logger)
 	predictSvc.Instrument(reg)
 	predictSvc.Register(rootMux)
+	srv.AttachPredict(predictSvc)
 	predictCtx, predictCancel := context.WithCancel(ctx)
 	defer predictCancel()
 	go predictSvc.RunGaugeLoop(predictCtx, 30*time.Second)
@@ -160,6 +208,7 @@ func run(logger *slog.Logger, cfg config.Config) error {
 		Slack:       cfg.ScoreWriterSlack,
 		Buffer:      cfg.ScoreWriterBuffer,
 		StateEvery:  cfg.ScoreWriterStateEvery,
+		Events:      bus,
 	})
 	if err != nil {
 		return fmt.Errorf("score-writer init: %w", err)
@@ -248,6 +297,21 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	grpcSrv.GracefulStop()
 	logger.Info("server stopped")
 	return nil
+}
+
+// loadPlaybooks resolves + loads the governance policy file. The server runs
+// from the repo root in dev, but the binary may also be started from api/;
+// the second candidate covers that. Either way a missing or invalid playbook
+// is a boot failure, never a 3am surprise.
+func loadPlaybooks(path string) ([]playbook.Rule, error) {
+	if _, err := os.Stat(path); err == nil {
+		return playbook.LoadRules(path)
+	}
+	alt := filepath.Join("..", path)
+	if _, err := os.Stat(alt); err == nil {
+		return playbook.LoadRules(alt)
+	}
+	return nil, fmt.Errorf("playbook file not found (tried %q and %q)", path, alt)
 }
 
 // seedBroadcaster publishes the stored recent buckets as the broadcaster's

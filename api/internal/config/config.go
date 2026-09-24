@@ -66,6 +66,15 @@ type Config struct {
 	// (ml/agent/server.py). Empty disables the NL→BI endpoint; /api/v1/agent/*
 	// then answers 503 with a clear message.
 	AgentURL string
+	// PlaybookPath is the YAML governance policy file (config/playbooks.yml).
+	// The playbook engine refuses to boot when this file is missing or a rule
+	// fails validation — misconfiguration is not a runtime surprise.
+	PlaybookPath string
+	// DriftPollEvery is how often the server polls gold.model_drift for rows
+	// the ml/monitor pipeline wrote since the last poll, so new critical
+	// findings turn into DriftComputed events (and, via the playbook, retrain
+	// proposals). A DB watermark keeps it restart-safe.
+	DriftPollEvery time.Duration
 }
 
 // FromEnv builds a Config from environment variables with sane defaults.
@@ -92,6 +101,8 @@ func FromEnv() Config {
 		ScoreWriterBuffer:        intenv("ABI_SCOREWRITER_BUFFER", 100_000),
 		ScoreWriterStateEvery:    surecenv("ABI_SCOREWRITER_STATE_EVERY", 30),
 		AgentURL:                 getenv("ABI_AGENT_URL", "http://127.0.0.1:8094"),
+		PlaybookPath:             getenv("ABI_PLAYBOOK_PATH", "config/playbooks.yml"),
+		DriftPollEvery:           surecenv("ABI_DRIFT_POLL_EVERY", 60),
 	}
 }
 

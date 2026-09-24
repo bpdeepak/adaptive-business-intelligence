@@ -33,17 +33,21 @@ type InsertPredictionParams struct {
 	UpperBound   *float64
 	Explanation  json.RawMessage
 	Metadata     json.RawMessage
+	// Features is the model's input vector for this prediction (persisted so
+	// Phase 4 drift monitoring can compare live feature distributions against
+	// the registry's training-time drift_baseline). Batch rows keep it empty.
+	Features map[string]float64
 }
 
 const predictionCols = `
     id, model_name, model_version, grain, entity_id, predicted_at,
-    prediction, confidence, lower_bound, upper_bound, explanation, metadata`
+    prediction, confidence, lower_bound, upper_bound, explanation, metadata, features`
 
 // ListRegistry returns every registered model version, newest last.
 func (s *Service) ListRegistry(ctx context.Context) ([]model.ModelRegistryEntry, error) {
 	const q = `
 SELECT model_name, model_version, status, framework, task, grain,
-       artifact_path, features, metrics, trained_window, created_at
+       artifact_path, features, metrics, drift_baseline, trained_window, created_at
 FROM gold.model_registry
 ORDER BY model_name, created_at`
 
@@ -56,17 +60,18 @@ ORDER BY model_name, created_at`
 	out := make([]model.ModelRegistryEntry, 0, 8)
 	for rows.Next() {
 		var e model.ModelRegistryEntry
-		var features, metrics, trainedWindow []byte
+		var features, metrics, driftBaseline, trainedWindow []byte
 		var createdAt time.Time
 		if err := rows.Scan(&e.ModelName, &e.ModelVersion, &e.Status, &e.Framework,
 			&e.Task, &e.Grain, &e.ArtifactPath, &features, &metrics,
-			&trainedWindow, &createdAt); err != nil {
+			&driftBaseline, &trainedWindow, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan registry: %w", err)
 		}
 		if len(features) > 0 {
 			_ = json.Unmarshal(features, &e.Features)
 		}
 		e.Metrics = json.RawMessage(metrics)
+		e.DriftBaseline = json.RawMessage(driftBaseline)
 		e.TrainedWindow = json.RawMessage(trainedWindow)
 		e.CreatedAt = createdAt.UTC().Format(time.RFC3339)
 		out = append(out, e)
@@ -132,17 +137,23 @@ func (s *Service) InsertPrediction(ctx context.Context, p InsertPredictionParams
 	if len(metadata) == 0 {
 		metadata = json.RawMessage(`{}`)
 	}
+	features := []byte(`[]`)
+	if len(p.Features) > 0 {
+		if b, err := json.Marshal(p.Features); err == nil {
+			features = b
+		}
+	}
 	const q = `
 INSERT INTO gold.predictions
     (model_name, model_version, grain, entity_id, prediction, confidence,
-     lower_bound, upper_bound, explanation, metadata)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb)
+     lower_bound, upper_bound, explanation, metadata, features)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb)
 RETURNING id`
 
 	var id int64
 	err := s.pool.QueryRow(ctx, q, p.ModelName, p.ModelVersion, p.Grain, p.EntityID,
 		p.Prediction, p.Confidence, p.LowerBound, p.UpperBound,
-		string(explanation), string(metadata)).Scan(&id)
+		string(explanation), string(metadata), string(features)).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("insert prediction: %w", err)
 	}
@@ -354,6 +365,56 @@ WHERE status = 'active'`).Scan(&n)
 	return n, nil
 }
 
+// DriftRow is one (model, feature, computed_at) drift/decay finding from
+// gold.model_drift, as the model-health surface returns it.
+type DriftRow struct {
+	Model        string  `json:"model"`
+	ModelVersion string  `json:"model_version"`
+	ComputedAt   string  `json:"computed_at"`
+	Feature      string  `json:"feature"`
+	PSI          float64 `json:"psi"`
+	Status       string  `json:"status"`
+	Kind         string  `json:"kind"`
+}
+
+// ListDrift returns the most recent model_drift findings, optionally filtered
+// by model. This is the model-health surface behind GET /api/v1/model-drift
+// and the agent's get_model_drift tool.
+func (s *Service) ListDrift(ctx context.Context, model string, limit int) ([]DriftRow, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	query := `
+SELECT model_name, model_version,
+       to_char(computed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+       feature, psi, status, kind
+FROM gold.model_drift`
+	args := []any{}
+	if model != "" {
+		query += " WHERE model_name = $1"
+		args = append(args, model)
+	}
+	args = append(args, limit)
+	query += fmt.Sprintf(" ORDER BY computed_at DESC, id DESC LIMIT $%d", len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list model drift: %w", err)
+	}
+	defer rows.Close()
+
+	out := []DriftRow{}
+	for rows.Next() {
+		var d DriftRow
+		if err := rows.Scan(&d.Model, &d.ModelVersion, &d.ComputedAt, &d.Feature,
+			&d.PSI, &d.Status, &d.Kind); err != nil {
+			return nil, fmt.Errorf("scan drift row: %w", err)
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 type rows interface {
 	Next() bool
 	Scan(dest ...any) error
@@ -366,16 +427,17 @@ func scanPredictions(rows rows) ([]model.Prediction, error) {
 		var p model.Prediction
 		var predictedAt time.Time
 		var lower, upper *float64
-		var explanation, metadata []byte
+		var explanation, metadata, features []byte
 		if err := rows.Scan(&p.ID, &p.ModelName, &p.ModelVersion, &p.Grain, &p.EntityID,
 			&predictedAt, &p.Prediction, &p.Confidence, &lower, &upper,
-			&explanation, &metadata); err != nil {
+			&explanation, &metadata, &features); err != nil {
 			return nil, fmt.Errorf("scan prediction: %w", err)
 		}
 		p.PredictedAt = predictedAt.UTC().Format(time.RFC3339)
 		p.LowerBound, p.UpperBound = lower, upper
 		p.Explanation = json.RawMessage(explanation)
 		p.Metadata = json.RawMessage(metadata)
+		p.Features = json.RawMessage(features)
 		out = append(out, p)
 	}
 	return out, rows.Err()

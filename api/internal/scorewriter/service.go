@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"abi/internal/events"
 	"abi/internal/model"
 	"abi/internal/predict"
 	"abi/internal/realtime"
@@ -33,6 +34,7 @@ type Service struct {
 	log     *slog.Logger
 	predict *predict.Service
 	bc      *realtime.Broadcaster
+	events  *events.Bus // Phase 4 governance bus; nil disables event publishing
 
 	refs   *References
 	asm    *FraudAssembler
@@ -62,6 +64,7 @@ type Options struct {
 	Slack       time.Duration // event-time disorder tolerance (default 2 min)
 	Buffer      int           // score-queue capacity (default 100_000)
 	StateEvery  time.Duration // restart-state snapshot cadence (default 30s)
+	Events      *events.Bus   // Phase 4 governance bus (nil disables publishing)
 }
 
 // New constructs the service: loads the reference tables, restores the last
@@ -101,6 +104,7 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 		reg:        telemetry.NewRegistry(), // overridden by Instrument() in main
 		speed:      opts.Speed,
 		stateEvery: opts.StateEvery,
+		events:     opts.Events,
 	}
 	// The sidecar is optional (empty ABI_SCORE_URL). When disabled the
 	// score-writer keeps assembling + advancing its rings (batch parity) but
@@ -313,16 +317,45 @@ func (s *Service) scoreOne(ctx context.Context, j scoreJob) {
 		return
 	}
 	s.counter("abi_score_writer_scored_total", "Predictions scored and persisted from the stream.").Inc()
-	if rt := s.rates[j.model]; rt != nil {
+	rt := s.rates[j.model]
+	if rt != nil {
 		if anom := rt.Observe(j.evt, resp.Prediction); anom != nil {
 			s.persistModelAnomaly(ctx, anom)
 		}
 	}
+	// Phase 4: publish the scored prediction onto the governance bus AFTER the
+	// DB write (the bus is advisory; the persisted row is the authoritative
+	// record). The playbook engine holds orders / files notes from these.
+	if s.events != nil && rt != nil {
+		evType := events.TypeSessionScored
+		if j.grain == "order" {
+			evType = events.TypeOrderScored
+		}
+		s.events.Publish(events.Event{
+			Type: evType,
+			At:   j.evt,
+			Payload: map[string]any{
+				"prediction": map[string]any{
+					"model":      j.model,
+					"entity_id":  j.entity,
+					"score":      resp.Prediction,
+					"confidence": resp.Confidence,
+					"threshold":  rt.Threshold(),
+				},
+				"registry": map[string]any{
+					"recommended_threshold": rt.Threshold(),
+					"positive_rate":         rt.Baseline(),
+				},
+			},
+		})
+	}
 }
 
 // persistModelAnomaly writes a model-driven anomaly (detector='model',
-// z_score stays NULL — rate anomalies carry no z-score) and surfaces it on the
-// shared SSE/gRPC broadcaster with the last known live bucket as context.
+// z_score stays NULL — rate anomalies carry no z-score) and, when the
+// ConsecutiveWindowsRequired hysteresis has been met, surfaces it on the
+// shared SSE/gRPC broadcaster. Every fired anomaly is persisted regardless of
+// Surfaced — the finding is durable; only the banner is gated.
 func (s *Service) persistModelAnomaly(ctx context.Context, anom *model.Anomaly) {
 	var out model.Anomaly
 	err := s.pool.QueryRow(ctx, `
@@ -339,9 +372,40 @@ RETURNING id, metric, detector,
 		s.log.Error("scorewriter: persist model anomaly", "metric", anom.Metric, "error", err)
 		return
 	}
+	out.Surfaced = anom.Surfaced
 	s.counter("abi_model_anomalies_total", "Model-driven (detector=model) anomalies persisted.").Inc()
 	s.log.Warn("scorewriter: model anomaly fired",
-		"metric", out.Metric, "observed", out.Observed, "expected", out.Expected)
+		"metric", out.Metric, "observed", out.Observed, "expected", out.Expected,
+		"surfaced", out.Surfaced)
+
+	// Phase 4: the anomaly is also a domain fact for the playbook engine
+	// (published after the DB row so evidence is durable even if the bus drops).
+	if s.events != nil {
+		s.events.Publish(events.Event{
+			Type: events.TypeAnomalyDetected,
+			At:   time.Now().UTC(),
+			Payload: map[string]any{
+				"anomaly": map[string]any{
+					"metric":       out.Metric,
+					"detector":     out.Detector,
+					"bucket_start": out.BucketStart,
+					"observed":     out.Observed,
+					"expected":     out.Expected,
+					"severity":     out.Severity,
+					"status":       out.Status,
+					"surfaced":     out.Surfaced,
+				},
+			},
+		})
+	}
+
+	// Only a sustained (surfaced) breach alarms the room; a first-bucket blip
+	// stays on the record but not on the banner.
+	if !out.Surfaced {
+		s.log.Info("scorewriter: model anomaly persisted, not surfaced (hysteresis)",
+			"metric", out.Metric, "bucket_start", out.BucketStart)
+		return
+	}
 
 	// Surface on the shared banner without disturbing the current live bucket.
 	last := s.bc.Last()

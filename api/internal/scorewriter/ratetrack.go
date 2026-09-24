@@ -22,6 +22,13 @@ const (
 	RateAnomalyMultiplier = 3.0
 	// SevereRateMultiplier escalates severity to "severe".
 	SevereRateMultiplier = 5.0
+	// ConsecutiveWindowsRequired is the Phase 4 hysteresis: an anomaly is
+	// persisted to gold.anomalies on the first fired window (the finding is
+	// durable and traceable), but it only surfaces on the SSE banner after the
+	// breach persists across this many consecutive 5-minute windows — a
+	// one-bucket blip still gets recorded, it just doesn't alarm the room.
+	// Amended Plan §7 (new feature, not a Phase 3 carry-forward).
+	ConsecutiveWindowsRequired = 2
 )
 
 // rateObs is one scored prediction inside the trailing window.
@@ -34,6 +41,7 @@ type rateObs struct {
 type RateTrace struct {
 	Obs         []rateObs `json:"obs"`
 	LastTrigger int64     `json:"last_trigger,omitempty"`
+	Consecutive int       `json:"consecutive,omitempty"`
 }
 
 // RateTracker watches the at-risk rate (score >= recommended threshold) of one
@@ -48,6 +56,7 @@ type RateTracker struct {
 	threshold   float64
 	obs         []rateObs
 	lastTrigger int64
+	consecutive int
 }
 
 // NewRateTracker builds a tracker for one model over its baseline/threshold.
@@ -60,6 +69,13 @@ func NewRateTracker(model string, cfg ModelConfig) *RateTracker {
 	}
 }
 
+// Threshold returns the model's recommended decision threshold (used in the
+// order_scored/session_scored event payloads the playbook sees).
+func (rt *RateTracker) Threshold() float64 { return rt.threshold }
+
+// Baseline returns the model's batch positive rate baseline.
+func (rt *RateTracker) Baseline() float64 { return rt.baseRate }
+
 // Restore replaces the tracker's window with a persisted trace.
 func (rt *RateTracker) Restore(trace *RateTrace) {
 	if trace == nil {
@@ -67,17 +83,20 @@ func (rt *RateTracker) Restore(trace *RateTrace) {
 	}
 	rt.obs = trace.Obs
 	rt.lastTrigger = trace.LastTrigger
+	rt.consecutive = trace.Consecutive
 }
 
 // Snapshot returns the current window + last trigger for persistence.
 func (rt *RateTracker) Snapshot() *RateTrace {
-	return &RateTrace{Obs: rt.obs, LastTrigger: rt.lastTrigger}
+	return &RateTrace{Obs: rt.obs, LastTrigger: rt.lastTrigger, Consecutive: rt.consecutive}
 }
 
 // Observe folds one scored prediction at event time `t`. It returns a non-nil
 // anomaly exactly when the trailing 5-minute at-risk rate fires for a fresh
 // window bucket (one anomaly per 5-minute bucket, not per prediction). The
-// returned anomaly is fully formed except for the persistence id.
+// returned anomaly is fully formed except for the persistence id; Surfaced is
+// false on the first fired bucket and true once the breach has persisted for
+// ConsecutiveWindowsRequired consecutive windows (the banner hysteresis).
 func (rt *RateTracker) Observe(t time.Time, prediction float64) *model.Anomaly {
 	secs := float64(t.Unix())
 	rt.obs = append(rt.obs, rateObs{T: secs, Pos: prediction >= rt.threshold})
@@ -87,41 +106,52 @@ func (rt *RateTracker) Observe(t time.Time, prediction float64) *model.Anomaly {
 		first++
 	}
 	rt.obs = rt.obs[first:]
+	bucket := int64(secs) / RateWindowSecs
 
-	if len(rt.obs) < MinRateSamples {
-		return nil
-	}
-	var positive int
-	for _, o := range rt.obs {
-		if o.Pos {
-			positive++
+	if len(rt.obs) >= MinRateSamples {
+		var positive int
+		for _, o := range rt.obs {
+			if o.Pos {
+				positive++
+			}
+		}
+		rate := float64(positive) / float64(len(rt.obs))
+		if rate > RateAnomalyMultiplier*rt.baseRate {
+			if bucket == rt.lastTrigger {
+				return nil // one anomaly per 5-minute bucket
+			}
+			// Hysteresis: consecutive counts only adjacent window buckets.
+			if bucket == rt.lastTrigger+1 {
+				rt.consecutive++
+			} else {
+				rt.consecutive = 1
+			}
+			rt.lastTrigger = bucket
+
+			severity := "elevated"
+			if rate > SevereRateMultiplier*rt.baseRate {
+				severity = "severe"
+			}
+			return &model.Anomaly{
+				Metric:      rt.model + "_rate",
+				Detector:    "model",
+				BucketStart: time.Unix(bucket*RateWindowSecs, 0).UTC().Format(time.RFC3339),
+				Observed:    round2(rate),
+				Expected:    rt.baseRate,
+				ZScore:      0, // rate-based anomalies carry no z-score (stays NULL in the DB)
+				Severity:    severity,
+				Status:      "open",
+				DetectedAt:  time.Now().UTC().Format(time.RFC3339),
+				Surfaced:    rt.consecutive >= ConsecutiveWindowsRequired,
+			}
+		}
+		// A populated window that passed without firing breaks the streak
+		// (the anomaly did not persist across windows).
+		if bucket != rt.lastTrigger {
+			rt.consecutive = 0
 		}
 	}
-	rate := float64(positive) / float64(len(rt.obs))
-	if rate <= RateAnomalyMultiplier*rt.baseRate {
-		return nil
-	}
-	bucket := int64(secs) / RateWindowSecs
-	if bucket == rt.lastTrigger {
-		return nil // one anomaly per 5-minute bucket
-	}
-	rt.lastTrigger = bucket
-
-	severity := "elevated"
-	if rate > SevereRateMultiplier*rt.baseRate {
-		severity = "severe"
-	}
-	return &model.Anomaly{
-		Metric:      rt.model + "_rate",
-		Detector:    "model",
-		BucketStart: time.Unix(bucket*RateWindowSecs, 0).UTC().Format(time.RFC3339),
-		Observed:    round2(rate),
-		Expected:    rt.baseRate,
-		ZScore:      0, // rate-based anomalies carry no z-score (stays NULL in the DB)
-		Severity:    severity,
-		Status:      "open",
-		DetectedAt:  time.Now().UTC().Format(time.RFC3339),
-	}
+	return nil
 }
 
 func round2(v float64) float64 {

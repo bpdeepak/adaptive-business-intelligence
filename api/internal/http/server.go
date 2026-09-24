@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"time"
 
+	"abi/internal/actions"
+	"abi/internal/predict"
 	"abi/internal/realtime"
 	"abi/internal/store"
 )
@@ -23,6 +25,10 @@ type Server struct {
 	mux   *http.ServeMux
 	// live is optional: when attached, SSE + realtime endpoints activate.
 	live *realtime.LiveFeed
+	// actions + predict are Phase 4 surfaces (approval queue + model health);
+	// while nil their endpoints 503 (see AttachActions / AttachPredict).
+	actions *actions.Service
+	predict *predict.Service
 }
 
 // New builds a Server around a Store. Realtime endpoints register but return
@@ -59,6 +65,13 @@ func (s *Server) routes() *http.ServeMux {
 	mux.Handle("GET /api/v1/realtime/metrics", s.middleware(s.handleRealtimeMetrics))
 	mux.Handle("GET /api/v1/anomalies", s.middleware(s.handleAnomalies))
 	mux.Handle("POST /api/v1/anomalies/{id}/dismiss", s.middleware(s.handleDismissAnomaly))
+
+	// Phase 4 governance + model-health surfaces.
+	mux.Handle("GET /api/v1/actions", s.middleware(s.handleListActions))
+	mux.Handle("GET /api/v1/actions/{id}/trace", s.middleware(s.handleTraceAction))
+	mux.Handle("POST /api/v1/actions/{id}/approve", s.middleware(s.handleApproveAction))
+	mux.Handle("POST /api/v1/actions/{id}/reject", s.middleware(s.handleRejectAction))
+	mux.Handle("GET /api/v1/model-drift", s.middleware(s.handleModelDrift))
 	return mux
 }
 

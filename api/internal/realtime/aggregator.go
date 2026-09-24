@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"abi/internal/events"
 	"abi/internal/model"
 	"abi/internal/stream"
 	"abi/internal/telemetry"
@@ -35,6 +36,10 @@ type Aggregator struct {
 
 	detector   *Detector
 	flushEvery time.Duration
+
+	// evBus is the Phase 4 governance bus; nil disables event publishing
+	// (unit tests are unaffected).
+	evBus *events.Bus
 
 	tel *telemetry.Registry // optional Prometheus sink (nil-safe)
 
@@ -75,6 +80,11 @@ func NewAggregator(pool *pgxpool.Pool, cl, anomPub *kgo.Client, bc *Broadcaster,
 func (a *Aggregator) Instrument(reg *telemetry.Registry) {
 	a.tel = reg
 }
+
+// SetEvents attaches the Phase 4 governance bus. After an anomaly is written
+// to gold.anomalies it is published as an anomaly_detected domain event so the
+// playbook engine can propose governed actions from statistical findings too.
+func (a *Aggregator) SetEvents(bus *events.Bus) { a.evBus = bus }
 
 // Baseline returns the detector's current accumulator states (for observability
 // of warm-up progress and for snapshot persistence).
@@ -282,6 +292,26 @@ func (a *Aggregator) flushAndDetect(ctx context.Context) error {
 		}
 		a.anomaliesDetected().Inc()
 		lastAnom = anom
+		// Phase 4: after the durable row exists, publish the anomaly onto the
+		// governance bus so the playbook engine sees statistical findings too.
+		if a.evBus != nil {
+			a.evBus.Publish(events.Event{
+				Type: events.TypeAnomalyDetected,
+				At:   time.Now().UTC(),
+				Payload: map[string]any{
+					"anomaly": map[string]any{
+						"metric":       anom.Metric,
+						"detector":     anom.Detector,
+						"bucket_start": anom.BucketStart,
+						"observed":     anom.Observed,
+						"expected":     anom.Expected,
+						"severity":     anom.Severity,
+						"status":       anom.Status,
+						"surfaced":     true, // statistical anomalies surface as they fire (no hysteresis)
+					},
+				},
+			})
+		}
 		if err := a.publishAnomaly(ctx, anom); err != nil {
 			a.log.Error("aggregator: publish anomaly", "error", err)
 		}
