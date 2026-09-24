@@ -158,10 +158,13 @@ func (r *Reconciler) Once(ctx context.Context) error {
 func (r *Reconciler) scanPredictions(ctx context.Context, cursor int64) ([]events.Event, int64, error) {
 	// Preload registry thresholds per (model, version) so the reconstructed
 	// event carries the same recommended_threshold the rule compares against.
+	// The threshold lives in model_registry.metrics (written by the training
+	// pipeline as backtest.recommended_threshold), NOT params — the same
+	// column the live score-writer's rate trackers and the agent SQL read.
 	type threshKey struct{ model, version string }
 	thresh := map[threshKey]float64{}
 	tr, err := r.pool.Query(ctx, `
-SELECT model_name, model_version, COALESCE((params->>'recommended_threshold')::float8, 0)
+SELECT model_name, model_version, COALESCE((metrics->>'recommended_threshold')::float8, 0)
 FROM gold.model_registry`)
 	if err != nil {
 		return nil, cursor, fmt.Errorf("query model_registry: %w", err)

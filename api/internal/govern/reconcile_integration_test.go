@@ -88,14 +88,18 @@ func TestReconcileBackfillsProposalsFromPersistedRows(t *testing.T) {
 
 	// The fraud/bot rules pin the model name, so predictions must use the real
 	// model names — but a unique version keeps this run isolated from live
-	// registry rows. Registry threshold: 0.80.
+	// registry rows. Registry threshold: 0.80, written to metrics (the
+	// production contract: train_all writes backtest.recommended_threshold
+	// into model_registry.metrics, and both the reconciler and the agent SQL
+	// read metrics->>'recommended_threshold'; params holds hyperparameters
+	// only).
 	saveWatermark(t, pool)
 	if _, err := pool.Exec(ctx, `
 INSERT INTO gold.model_registry
-  (model_name, model_version, status, framework, task, grain, artifact_path, params)
+  (model_name, model_version, status, framework, task, grain, artifact_path, params, metrics)
 VALUES
-  ('fraud_risk', $1, 'active', 'fake', 'classification', 'order', '/tmp/fake', $2::jsonb),
-  ('bot_score',  $1, 'active', 'fake', 'classification', 'session', '/tmp/fake', $2::jsonb)`,
+  ('fraud_risk', $1, 'active', 'fake', 'classification', 'order', '/tmp/fake', '{}'::jsonb, $2::jsonb),
+  ('bot_score',  $1, 'active', 'fake', 'classification', 'session', '/tmp/fake', '{}'::jsonb, $2::jsonb)`,
 		ver, `{"recommended_threshold": 0.80}`); err != nil {
 		t.Fatalf("insert registry rows: %v", err)
 	}

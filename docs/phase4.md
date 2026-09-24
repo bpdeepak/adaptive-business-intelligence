@@ -330,9 +330,10 @@ as the source of truth and *re-derives* proposals from persisted rows:
 
 - Scans `gold.predictions` (`metadata->>'source' = 'stream_score'`) and
   `gold.model_drift` above a persisted cursor and reconstructs the exact event
-  each row should have produced (prediction + registry threshold per model
-  version; drift merged per (model, computed_at), worst status wins — identical
-  shape to the poller, so dedup keys align).
+  each row should have produced (prediction + registry threshold resolved per
+  exact model version from `gold.model_registry.metrics` — the same column the
+  live rate trackers read; drift merged per (model, computed_at), worst status
+  wins — identical shape to the poller, so dedup keys align).
 - Feeds every reconstructed event through the **same decision path as the live
   bus** — exported `playbook.Engine.Handle` (one propose code path; conditions
   still decide; dedup keys make re-proposal a no-op).
