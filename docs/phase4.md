@@ -143,6 +143,7 @@ registry directly.
 | `GET  /api/v1/actions?status=&limit=` | `{data:[ActionRow…]}` — queue state + history |
 | `POST /api/v1/actions/{id}/approve` | `{reason, actor}` → status `approved`, then auto-executes |
 | `POST /api/v1/actions/{id}/reject` | `{reason, actor}` → status `rejected`, never executes |
+| `POST /api/v1/actions/{id}/retry` | re-runs a `failed` execution under its original approval (§10.4) |
 | `GET  /api/v1/actions/{id}/trace` | `{data:{action, audit:[…]}}` — full decision trail |
 
 Reasons are mandatory on human decisions; an approval without a reason is not an
@@ -266,6 +267,150 @@ gate; the real-DB run validates the live SQL.
 - **Promote a candidate**: flip `status='candidate' → 'active'` in
   `gold.model_registry` deliberately; the retrain worker never does it.
 - **Tune the poller**: `ABI_DRIFT_POLL_EVERY` (seconds, default 60).
+- **Tune the reconciliation backstop**: the governance reconciler (§10.2) runs
+  on the same `ABI_RECONCILE_EVERY` period as the realtime reconcile (default
+  60s); its restart-safe cursor lives in `gold.governance_state`.
 - **Live demo scenario**: `docs/phase4-demo.sql` (if present) documents the
   injected critical-drift row used to exercise the loop; rows carry
   `detail.injected=true` so the board stays honest.
+
+## 10. Post-review hardening pass (carry-forward status + H1–H4)
+
+This section records the second review cycle on top of the completed phase: the
+carry-forward status for both earlier review rounds (with commit anchors), and
+the four hardening items the follow-up review produced (drop-proof proposal
+delivery, dedup scope, failed→retry, boot-time field checks). All landed in
+commit `35db6c2` on top of the Phase 4 base.
+
+### 10.1 Carry-forward status — two review cycles, all landed
+
+**Cycle 1 — Phase 3 review carry-forwards** (delivered in `f0b5ac8`, a separate
+pre-Phase-4 pass; each verified with code evidence before Phase 4 started):
+
+| # | Item | Where it lives | Verification |
+|---|---|---|---|
+| 1 | Welford restart-safety | `api/internal/realtime/aggregator.go` (`restoreBaseline`/`saveBaseline`, `detector_state.go`) | roundtrip test: a restarted aggregator resumes same detectors |
+| 2 | Model-rate banner quiet-period | `api/internal/scorewriter/ratetrack.go` — `MinRateSamples` 5 → **20** | `ratetrack_test.go` pins the quiet-replay window regression |
+| 3 | Grounding R2 differences (abs) | `ml/agent/grounding.py` — `_match_derived` uses `abs(a−b)`; MockLLM emits `{diff_…}/{last_…}` | eval q21 (`derived` kind) green in both fake + real runs |
+| 4 | Revenue definitions | `ml/agent/tools.py` — AOV = `SUM(…)/COUNT(…)` with `NOT is_lost`; truth `avg_valid_order_value = 160.26` | real eval q03 green; `docs/phase3.md` §7.2 |
+
+**Cycle 2 — Phase 4 spec review findings (F1–F8)** (all in the 4A–4E commits
+`de99a89`, `93a17c2`, `820de3c`; enumerated in the phase header above):
+
+| F | Item | Where it lives | Verification |
+|---|---|---|---|
+| F1 | `features` jsonb on `gold.model_drift` | `api/internal/predict/schema.sql` | `ml/tests/test_monitor_psi.py` |
+| F2 | Stream/batch PSI split | monitor merge + rank logic (`api/internal/monitor`, `ml/monitor`) | PSI semantics tests |
+| F3 | Dormant events declared as engine contract | `api/internal/events/bus.go` (`forecast_updated`, `churn_scored`) | dormant rules pass boot, never arm |
+| F4 | Hysteresis: worst-status run merge + durable watermark | `api/internal/monitor/poller.go` | `poller_integration_test.go` (bootstrap, merge, watermark, restart) |
+| F5 | `gold.model_drift` table is the Go↔Python contract | `api/internal/monitor` package doc | monitor + integrate tests |
+| F6 | `retrain_requests` + candidate-only worker | `gold.retrain_requests` + `ml/monitor/retrain_worker.py` | live loop demo (trained `20260924.050835.retrain15`, never auto-promoted) |
+| F7 | `dedup_key UNIQUE` | `gold.action_queue` `uq_action_queue_dedup` | `TestDedupKeyPreventsQueueFlood` |
+
+Standing invariants carried across both cycles (regression-pinned): observed /
+derived numbers only, batch+live never summed, ≤1 bounded revision, derivations
+within one provenance label, "propose, don't silently act", candidates never
+auto-promote, `skip_when: "real"` eval guard, dedup UNIQUE, schema/config
+fail-closed at boot.
+
+### 10.2 H1 — at-least-once proposal delivery: the reconciliation backstop (`api/internal/govern`)
+
+**Why it exists.** The in-process domain bus is fan-out / drop-slow-consumer by
+design (the same contract as the Phase 1 SSE broadcaster). For the dashboard
+that is cosmetic; for governance it is not. This was demonstrated live during
+the Phase 4 demo: the replay producer replayed ~11,000 scored sessions while the
+engine's propose path (one DB round-trip per event) could not keep up with the
+producer rate, and the 64-slot buffer overflowed — **zero** scoring-triggered
+proposals survived *and nothing visibly broke*: every prediction row was safe in
+Postgres. A dropped `order_scored`/`session_scored`/`drift_computed` event costs
+nothing visible and silently costs the proposal itself.
+
+**Design.** `api/internal/govern/reconcile.go` — a period job that treats the DB
+as the source of truth and *re-derives* proposals from persisted rows:
+
+- Scans `gold.predictions` (`metadata->>'source' = 'stream_score'`) and
+  `gold.model_drift` above a persisted cursor and reconstructs the exact event
+  each row should have produced (prediction + registry threshold per model
+  version; drift merged per (model, computed_at), worst status wins — identical
+  shape to the poller, so dedup keys align).
+- Feeds every reconstructed event through the **same decision path as the live
+  bus** — exported `playbook.Engine.Handle` (one propose code path; conditions
+  still decide; dedup keys make re-proposal a no-op).
+- Recovery is visible: a proposal created by reconciliation carries
+  `payload.reconciled=true` inside its persisted trigger evidence, so the audit
+  trail shows it was backfilled, not delivered live.
+- Restart-safe: cursors live in `gold.governance_state` (key `'reconcile'`,
+  one per scan source), written only after a fully successful pass — a pass
+  with proposal-storage failures refuses to advance its cursor and retries next
+  tick (`Engine.Handle` returns the failure count for exactly this).
+- Only triggers with an enabled rule are scanned (armed-rule set from the same
+  rules passed to the engine).
+- Runs on `ABI_RECONCILE_EVERY` (default `60s`), the same period as the Phase 1
+  realtime reconcile loop — both are "re-derive truth from the DB" backstops.
+
+**Honest boundary.** The reconciler catches drop-slow-consumer and restart gaps.
+It does not defend against Postgres being unavailable during its own pass — at
+that point the whole layer is degraded, and the engine logs every storage
+failure loudly.
+
+**Test** (`govern/reconcile_integration_test.go`): rows inserted straight into
+`gold.predictions`/`gold.model_drift` with **no bus event ever published** are
+proposed by one `Once` pass (hold pending, auto mid-band note executed end to
+end, critical-drift retrain pending), below-threshold rows propose nothing, a
+second pass adds nothing (idempotency), a fresh row after the first pass is
+picked up on the next (cursor advance), and the hold row's trigger evidence
+carries `reconciled=true`.
+
+### 10.3 H2 — dedup scope is per trigger instance
+
+`dedupKey` for scored events is now `rule | prediction.entity_id |
+prediction.id` (the persisted prediction row id, published by the score-writer
+on every scored event). Entity-only dedup had a silent-vaccination bug: an
+entity flagged, reviewed and released could never be flagged again, even when a
+*later* scoring crossed the threshold once more. Instance-scoping means one
+prediction row can never propose twice, while each new scoring of the entity is
+its own trigger occurrence. Drift (`rule|model|feature|computed_at`) and
+anomaly (`rule|metric|bucket_start`) were already instance-scoped and are
+unchanged. Tested in `playbook/engine_test.go`
+(`TestDedupKeyScopedToTriggerInstance`) and the govern integration test's dedup
+assertion.
+
+### 10.4 H3 — failed → retry (a failed execution is not terminal)
+
+`status='failed'` is an outcome, not a grave: `POST /api/v1/actions/{id}/retry`
+re-runs a failed execution **under its original approval**. No new human
+decision is needed — the `approved`/`auto_approved` audit row remains the
+authority — and the executor guard in `execute()` still applies on every
+attempt. The retry appends a `retrying` transition, so the trail reads
+`proposed → approved → failed → retrying → executed` (or `… → retrying →
+failed` with the fresh outcome when it fails again; the row stays visible and
+retryable). The dashboard renders a **retry** button on failed history rows.
+State machine via `actions.Service.Retry`; tested in
+`actions/integration_test.go` with a transiently-failing executor (recovers on
+retry) and a permanently-failing one (stays `failed`).
+
+### 10.5 H4 — boot-time condition field validation (typos abort startup)
+
+The expression evaluator has always failed closed at *evaluation* time on a
+field the event does not carry. That is a good second line but not enough: a
+parse-valid typo (`prediction.scrore`…) compiles, boots, and silently never
+fires — forever. The playbook compiler now cross-checks every path a condition
+references against a per-event-type payload schema
+(`api/internal/playbook/schema.go`), so a wrong field name aborts startup the
+way a malformed expression does. Dormant rules are parsed and field-validated
+too (finally matching `config/playbooks.yml`'s "kept parseable + validated on
+purpose" claim), without being armed or action-checked. Runtime fail-closed for
+optional-but-absent fields stays the second line. Tests:
+`TestBootRejectsUnknownConditionField` (typo fails `NewEngine`),
+`TestRuntimeFailClosedWhenSchemaFieldAbsentFromPayload`.
+
+### 10.6 Updated gates (post-hardening)
+
+- `go build ./...`, `go vet ./...`, `go test ./...`, `go test -tags integration ./...` — green (incl. the new govern reconciler + retry integration suites).
+- Python: `uv run --group ml python -m pytest ml/tests -q` — **64 passed**.
+- Agent eval: `--db fake --llm mock` — **25/25**; `--db real --llm mock` — **19 passed / 0 failed / 6 skipped**, re-run green. (q12 is *data-racy*
+  against a live, actively-scoring DB: `model_scores` orders by
+  `predicted_at DESC`, so a score landing between the answer and the check can
+  flip the expected head row; observed once, passed on immediate re-run,
+  unrelated to post-phase changes. Candidates for a future `limit N > 1`
+  R1-golden pin.)

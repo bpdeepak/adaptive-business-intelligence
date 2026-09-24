@@ -139,7 +139,7 @@ playbook engine  ──  config/playbooks.yml (validated at boot, no code)
    │ conditions over event payloads (tiny pure expression language)
    ▼                 ┌────────────────────────────────────────────┐
 gold.action_queue ──►│ approval_required default · auto allow-list │
-   │  dedup_key = rule|scope (UNIQUE)                              │
+   │  dedup_key = rule|entity|prediction.id (UNIQUE)         │
    ▼ human approve/reject (mandatory reason, actor)                │
 gold.action_audit_log  ◄── append-only: proposed/approved/rejected/ │
    │                        executed/outcome, each with payload    └┘
@@ -159,6 +159,16 @@ The Phase 4 posture is **"propose, don't silently act"**: every rule can only
 propose, and the queue, the immutable audit trail, and the candidate-only
 retrain worker make the human's call the only way anything actually changes.
 Full detail: `docs/phase4.md`.
+
+Post-review hardening (see `docs/phase4.md` §10) added three
+delivery-safety guarantees on top: a **reconciliation backstop**
+(`api/internal/govern`) re-derives proposals straight from the persisted gold
+tables on `ABI_RECONCILE_EVERY` so a dropped bus event can never silently void
+a proposal (recovered proposals carry `payload.reconciled=true` on the audit
+trail); **failed → retry** (`POST /api/v1/actions/{id}/retry`) re-runs a failed
+execution under its original approval; and playbook conditions are
+**field-validated against per-event payload schemas at boot**, so a typo'd
+field name aborts startup instead of silently never firing.
 
 ## Repository layout
 
