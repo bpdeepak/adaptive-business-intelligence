@@ -808,3 +808,54 @@ that was silent data loss (the same 65,535 limit as the aggregator upsert fixed 
 re-queues everything not written, in order, for the next tick. Tests:
 `bronze_writer_integration_test.go` (a 6,000-row batch lands; a failed flush keeps all
 rows and a retry lands them exactly once).
+
+### 11.20 Fraud model retrained on the corrected features (2026-09-24)
+
+Only the fraud family was retrained: churn, bot and forecast features contain no
+epoch-second windows, so superseding them would have churned three unaffected versions.
+Steps on the dev database: `ml/build_fraud_features.py` (full table, corrected windows),
+then `ml/train_fraud.py`, which registered **`20260924.174626`** as `active` and marked
+`20260924.045434` `superseded`. The sidecar manifest was regenerated. Results are in
+phase2 §4.3: AUC 0.851 → 0.817, lift@5 % 19.96× → 17.14×, threshold 0.81 → **0.835**.
+Parity against dev passes.
+
+**Still to do when the stack restarts:**
+* **Restart the sidecar.** It loads the manifest at boot.
+* **Restart the server.** The score-writer loads thresholds at boot; until then it
+  compares against 0.81.
+* **Review existing pending hold proposals.** They were created by the pre-fix model,
+  so the reviewer should know that. They are left for a human decision, not
+  auto-rejected, because rejecting them is itself a governance decision.
+* **Scope of past impact on dev:** one executed hold and 17 pending hold proposals, 8 of
+  them duplicates (§11.4).
+
+### 11.21 Policy: `gold.predictions` retention (decided, not yet implemented)
+
+`gold.predictions` has no retention: 131k+ rows and growing with every stream-scored
+order and session. It is model *evidence*: the Go API, the agent, the drift monitor and
+the governance reconciler all read it. So the policy follows the same principle as the
+audit log: **archive, never silently delete**.
+
+| Rows | Hot retention in `gold.predictions` | Then |
+|---|---|---|
+| Held-out test predictions (`metadata ? 'label'`) of a registered version | while the version exists in `gold.model_registry` | archived with the version if it is ever removed |
+| `metadata.source = 'stream_score'` | **30 days** by `created_at` | moved to `gold.predictions_archive` (same shape) |
+| `metadata.source = 'live_score'` (REST) | **90 days** | archived |
+| Any row whose `id` is cited in a still-`pending` or `failed` action's trigger evidence | kept hot until that action is decided or succeeds | archived |
+
+Rules the job must follow when built:
+1. **Move, don't delete.** Use one transaction per chunk: insert into the archive, then
+   delete from hot. Chunk with the same ≤1,000-row discipline as the realtime writers.
+2. **Never archive above the reconciler's cursor.** Only move rows with
+   `id <= gold.governance_state['reconcile'].predictions`. Otherwise a row could vanish
+   before it was ever considered for a proposal.
+3. **Account for every run.** Each run writes one `gold.event_log` row (`kind='retention'`)
+   with the source, id range and row count. The archive can then be reconciled against the
+   hot table.
+4. **Keep the drift monitor's sampling window hot.** 30 days is far more than its newest
+   5,000 rows.
+5. **Tell agent readers.** The agent's `model_scores` / `model_rate` tools read hot rows
+   only, and their descriptions must say so once the job exists.
+
+Implementation is deferred. The numbers above are the decision, so the job can be built
+without re-deciding them under pressure.
