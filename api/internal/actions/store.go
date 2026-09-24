@@ -185,6 +185,45 @@ VALUES ($1, 'auto_approved', 'playbook-engine', 'allow-list auto tier', '"auto"'
 	return s.execute(ctx, id, "playbook-engine")
 }
 
+// Retry re-runs a failed execution. The original human 'approved' (or
+// allow-list 'auto_approved') transition remains the authority — retrying a
+// transient executor failure after a human already decided requires no new
+// approval — and the retry adds a 'retrying' audit row so the trail shows the
+// failure was noticed and re-attempted. Execute() still enforces the same
+// governance invariant on every attempt.
+func (s *Service) Retry(ctx context.Context, id int64, actor string) error {
+	if actor == "" {
+		actor = "system"
+	}
+	var status string
+	err := s.pool.QueryRow(ctx,
+		`SELECT status FROM gold.action_queue WHERE id = $1`, id).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%w: id %d", ErrInvalidState, id)
+	}
+	if err != nil {
+		return err
+	}
+	if status != StatusFailed {
+		return fmt.Errorf("%w: id %d status=%s (retry requires a failed execution)", ErrInvalidState, id, status)
+	}
+	if _, err := s.pool.Exec(ctx, `
+INSERT INTO gold.action_audit_log (action_id, transition, actor, reason)
+VALUES ($1, 'retrying', $2, 'user-initiated retry of a failed execution')`, id, actor); err != nil {
+		return fmt.Errorf("audit retrying: %w", err)
+	}
+	// Re-arm execution. 'approved' is the execution-authority state; the
+	// original approval transition is still on the log, so the guard in
+	// execute() passes. A failed retry lands back on 'failed' with the fresh
+	// error in the outcome — the human can retry again.
+	if _, err := s.pool.Exec(ctx, `
+UPDATE gold.action_queue SET status = 'approved'
+WHERE id = $1 AND status = 'failed'`, id); err != nil {
+		return fmt.Errorf("re-arm failed action: %w", err)
+	}
+	return s.execute(ctx, id, actor)
+}
+
 // execute runs one action's executor — but ONLY when the governance invariant
 // holds: an approved or auto_approved transition already exists on the audit
 // log for this action. This is the single most important guard in the phase:

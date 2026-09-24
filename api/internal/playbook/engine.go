@@ -35,17 +35,23 @@ type compiledRule struct {
 
 // NewEngine compiles the rules and returns a ready engine. Unknown actions in
 // the policy file are rejected here (fail-closed at boot, not at 3am when the
-// rule fires).
+// rule fires). Every rule — including dormant ones, per config/playbooks.yml's
+// "kept parseable + validated on purpose" — is parsed and cross-checked
+// against the event's declared payload schema (schema.go), so a typo'd field
+// name is a boot failure, never a rule that silently never fires.
 func NewEngine(bus *events.Bus, svc Proposer, rules []Rule, log *slog.Logger) (*Engine, error) {
 	e := &Engine{bus: bus, actions: svc, log: log}
 	for _, r := range rules {
-		if !r.Enabled {
-			e.log.Info("playbook: rule dormant", "rule", r.Name, "reason", "enabled: false")
-			continue
-		}
 		n, err := Parse(r.Condition)
 		if err != nil {
 			return nil, fmt.Errorf("playbook %q: %w", r.Name, err)
+		}
+		if err := validateRuleFields(r, n); err != nil {
+			return nil, err
+		}
+		if !r.Enabled {
+			e.log.Info("playbook: rule dormant", "rule", r.Name, "reason", "enabled: false")
+			continue
 		}
 		if !svc.Has(r.Action) {
 			return nil, fmt.Errorf("playbook %q references unknown action %q", r.Name, r.Action)
@@ -66,13 +72,17 @@ func (e *Engine) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case ev := <-ch:
-			e.handle(ctx, ev)
+			e.Handle(ctx, ev)
 		}
 	}
 }
 
-// handle evaluates every rule for one event and proposes matches.
-func (e *Engine) handle(ctx context.Context, ev events.Event) {
+// Handle evaluates every rule for one event and proposes matches. It returns
+// the number of propose attempts that failed at the storage layer, so the
+// reconciliation backstop (api/internal/govern) can refuse to advance its
+// cursor when a pass did not fully land. The live bus loop ignores the count.
+func (e *Engine) Handle(ctx context.Context, ev events.Event) int {
+	failures := 0
 	for _, c := range e.rules {
 		if c.rule.Trigger != string(ev.Type) {
 			continue
@@ -88,14 +98,17 @@ func (e *Engine) handle(ctx context.Context, ev events.Event) {
 		if b, isBool := ok.(bool); !isBool || !b {
 			continue
 		}
-		e.propose(ctx, c.rule, ev)
+		if err := e.propose(ctx, c.rule, ev); err != nil {
+			failures++
+		}
 	}
+	return failures
 }
 
 // propose records the proposal (+ audit 'proposed'), then routes by tier:
 // auto allow-list executes immediately via AutoApproveAndExecute; everything
 // else waits for a human.
-func (e *Engine) propose(ctx context.Context, r Rule, ev events.Event) {
+func (e *Engine) propose(ctx context.Context, r Rule, ev events.Event) error {
 	id, err := e.actions.Propose(ctx, actions.Proposal{
 		Action:   r.Action,
 		Entity:   entityOf(ev),
@@ -107,21 +120,22 @@ func (e *Engine) propose(ctx context.Context, r Rule, ev events.Event) {
 	})
 	if err != nil {
 		e.log.Error("playbook: propose failed", "rule", r.Name, "error", err)
-		return
+		return err
 	}
 	if id == 0 {
 		e.log.Debug("playbook: duplicate trigger, no new proposal", "rule", r.Name)
-		return
+		return nil
 	}
 	if r.RiskTier == actions.RiskAuto {
 		if err := e.actions.AutoApproveAndExecute(ctx, id); err != nil {
 			e.log.Error("playbook: auto action failed", "rule", r.Name, "action_id", id, "error", err)
-			return
+			return err
 		}
 		e.log.Info("playbook: allow-list auto action executed", "rule", r.Name, "action_id", id)
-		return
+		return nil
 	}
 	e.log.Info("playbook: action awaiting approval", "rule", r.Name, "action_id", id)
+	return nil
 }
 
 // entityOf resolves the subject of an event for the queue row.
@@ -140,12 +154,20 @@ func entityOf(ev events.Event) string {
 }
 
 // dedupKey uniquely identifies (rule, trigger instance) so a replayed or
-// re-firing event can never stack duplicate proposals.
+// re-firing event can never stack duplicate proposals. Scored events scope on
+// the entity PLUS the persisted prediction id — each scoring instance is its
+// own trigger occurrence, so an entity that was flagged, reviewed and released
+// can be legitimately re-flagged when a later scoring crosses the threshold
+// again (the first incident never silently vaccinates the entity). Drift and
+// anomaly events were already instance-scoped (computed_at / bucket_start).
 func dedupKey(rule string, ev events.Event) string {
 	scope := ""
 	switch ev.Type {
 	case events.TypeOrderScored, events.TypeSessionScored, events.TypeChurnScored:
 		scope = actions.StringField(ev.Payload, "prediction.entity_id")
+		if pid := actions.StringField(ev.Payload, "prediction.id"); pid != "" {
+			scope += "|" + pid
+		}
 	case events.TypeAnomalyDetected:
 		scope = actions.StringField(ev.Payload, "anomaly.metric") + "|" +
 			actions.StringField(ev.Payload, "anomaly.bucket_start")

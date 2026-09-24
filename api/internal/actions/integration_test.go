@@ -179,6 +179,94 @@ func TestApproveAuthorizesExactlyOneExecution(t *testing.T) {
 	}
 }
 
+// TestRetryReRunsAFailedExecution: a failed execution is not terminal — Retry
+// re-runs it under the original approval (no new human decision), recording a
+// 'retrying' audit row, and the executor is still gated by the same invariant.
+func TestRetryReRunsAFailedExecution(t *testing.T) {
+	pool := testActionsPool(t)
+	svc := New(pool, slog.New(slog.DiscardHandler))
+
+	failOnce := true
+	svc.Register("flaky", func(_ context.Context, _ Context) (Result, error) {
+		if failOnce {
+			failOnce = false
+			return Result{}, fmt.Errorf("simulated transient executor failure")
+		}
+		return Result{OK: true, Detail: map[string]any{"attempt": "second"}}, nil
+	})
+
+	id, err := svc.Propose(context.Background(), Proposal{
+		Action: "flaky", Entity: "e-retry", RiskTier: RiskApprovalRequired,
+		Rule: "test", DedupKey: uniqueDedup(t),
+		Params:  map[string]any{},
+		Trigger: triggerEvidenceForTest(t.Name()),
+	})
+	if err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	t.Cleanup(func() { cleanupAction(t, pool, id) })
+
+	if err := svc.Approve(context.Background(), id, "demo: test retry", "alice@abi"); err == nil {
+		t.Fatal("Approve must surface the executor failure (approval auto-executes synchronously)")
+	}
+	// First execution failed: status='failed', the error is in the outcome,
+	// and the human decision (approved) is already on the trail.
+	if row, _, _ := svc.Trace(context.Background(), id); row.Status != StatusFailed {
+		t.Fatalf("after failing execute: status = %s, want failed", row.Status)
+	}
+
+	if err := svc.Retry(context.Background(), id, "tester"); err != nil {
+		t.Fatalf("Retry: %v", err)
+	}
+	row, _, err := svc.Trace(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Trace: %v", err)
+	}
+	if row.Status != StatusExecuted {
+		t.Fatalf("after retry: status = %s, want executed", row.Status)
+	}
+	if got := auditTransitions(t, pool, id); fmt.Sprint(got) != "[proposed approved failed retrying executed]" {
+		t.Fatalf("audit = %v, want [proposed approved failed retrying executed]", got)
+	}
+	// The retry is not a blank check: a retry on an already-executed action is
+	// refused, and the fresh attempt was still governed.
+	if err := svc.Retry(context.Background(), id, "tester"); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("retry on executed: err = %v, want ErrInvalidState", err)
+	}
+}
+
+// TestRetryFailsClosedWhenStillFailing: a retry that fails again lands back on
+// 'failed' with the fresh error — the row stays visible, the human can retry
+// again, and every attempt is on the trail.
+func TestRetryFailsClosedWhenStillFailing(t *testing.T) {
+	pool := testActionsPool(t)
+	svc := New(pool, slog.New(slog.DiscardHandler))
+	svc.Register("always-broken", func(_ context.Context, _ Context) (Result, error) {
+		return Result{}, fmt.Errorf("permanent executor failure")
+	})
+
+	id, err := svc.Propose(context.Background(), Proposal{
+		Action: "always-broken", Entity: "e-retry2", RiskTier: RiskApprovalRequired,
+		Rule: "test", DedupKey: uniqueDedup(t),
+		Params:  map[string]any{},
+		Trigger: triggerEvidenceForTest(t.Name()),
+	})
+	if err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	t.Cleanup(func() { cleanupAction(t, pool, id) })
+
+	if err := svc.Approve(context.Background(), id, "demo", "alice@abi"); err == nil {
+		t.Fatal("Approve must surface the executor failure")
+	}
+	if err := svc.Retry(context.Background(), id, "tester"); err == nil {
+		t.Fatal("Retry on a still-failing executor must return the new error")
+	}
+	if row, _, _ := svc.Trace(context.Background(), id); row.Status != StatusFailed {
+		t.Fatalf("after failed retry: status = %s, want failed", row.Status)
+	}
+}
+
 // TestAutoTierIsAnExplicitAllowListPath: the 'auto' tier gets an explicit
 // auto_approved audit row before executing — the identical governance shape to
 // a human approval, but recorded with the allow-list as the authority.

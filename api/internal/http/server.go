@@ -71,6 +71,7 @@ func (s *Server) routes() *http.ServeMux {
 	mux.Handle("GET /api/v1/actions/{id}/trace", s.middleware(s.handleTraceAction))
 	mux.Handle("POST /api/v1/actions/{id}/approve", s.middleware(s.handleApproveAction))
 	mux.Handle("POST /api/v1/actions/{id}/reject", s.middleware(s.handleRejectAction))
+	mux.Handle("POST /api/v1/actions/{id}/retry", s.middleware(s.handleRetryAction))
 	mux.Handle("GET /api/v1/model-drift", s.middleware(s.handleModelDrift))
 	return mux
 }

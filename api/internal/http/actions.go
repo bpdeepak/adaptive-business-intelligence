@@ -123,6 +123,41 @@ func (s *Server) decideAction(w http.ResponseWriter, r *http.Request, reject boo
 	}, time.Now(), s.now))
 }
 
+// handleRetryAction is POST /api/v1/actions/{id}/retry — re-runs a failed
+// execution under its original approval. No new human decision is needed: the
+// retry is the mechanical surface for a transient executor failure, and every
+// attempt (and the retry itself) is an audit-log transition.
+func (s *Server) handleRetryAction(w http.ResponseWriter, r *http.Request) {
+	if s.actions == nil {
+		writeError(w, http.StatusServiceUnavailable, "actions not attached", s.now)
+		return
+	}
+	id, err := actionID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid action id", s.now)
+		return
+	}
+	actor := DemoActor
+	var req DecidedRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err == nil && req.Actor != "" {
+		actor = req.Actor
+	}
+	if err := s.actions.Retry(r.Context(), id, actor); err != nil {
+		switch {
+		case errors.Is(err, actions.ErrInvalidState):
+			writeError(w, http.StatusConflict, err.Error(), s.now)
+		case errors.Is(err, actions.ErrUnauthorized):
+			writeError(w, http.StatusForbidden, err.Error(), s.now)
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error(), s.now)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope(map[string]any{
+		"id": id, "status": "executing", "actor": actor,
+	}, time.Now(), s.now))
+}
+
 // handleTraceAction is GET /api/v1/actions/{id}/trace — the full evidence
 // trail: the proposal's trigger payload + every audit transition.
 func (s *Server) handleTraceAction(w http.ResponseWriter, r *http.Request) {

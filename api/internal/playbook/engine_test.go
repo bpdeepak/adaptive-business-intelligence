@@ -81,7 +81,7 @@ func orderEvent(score float64) events.Event {
 
 func TestEngineProposesApprovalRequired(t *testing.T) {
 	eng, fake, _ := newTestEngine(t, testRules())
-	eng.handle(context.Background(), orderEvent(0.91))
+	eng.Handle(context.Background(), orderEvent(0.91))
 
 	proposed, auto := fake.snapshot()
 	if len(proposed) != 1 {
@@ -122,7 +122,7 @@ func TestEngineAutoTierExecutesImmediately(t *testing.T) {
 			},
 			"registry": map[string]any{"recommended_threshold": 0.5, "positive_rate": 0.02},
 		}}
-	eng.handle(context.Background(), session)
+	eng.Handle(context.Background(), session)
 
 	proposed, auto := fake.snapshot()
 	if len(proposed) != 1 || len(auto) != 1 {
@@ -135,7 +135,7 @@ func TestEngineAutoTierExecutesImmediately(t *testing.T) {
 
 func TestEngineDoesNotProposeWhenConditionFalse(t *testing.T) {
 	eng, fake, _ := newTestEngine(t, testRules())
-	eng.handle(context.Background(), orderEvent(0.5)) // below threshold
+	eng.Handle(context.Background(), orderEvent(0.5)) // below threshold
 
 	proposed, auto := fake.snapshot()
 	if len(proposed) != 0 || len(auto) != 0 {
@@ -143,18 +143,37 @@ func TestEngineDoesNotProposeWhenConditionFalse(t *testing.T) {
 	}
 }
 
-func TestEngineFailClosedOnUnknownField(t *testing.T) {
-	// score at/above threshold but the condition ALSO references a field the
-	// event does not carry → the rule refuses to fire entirely.
+func TestBootRejectsUnknownConditionField(t *testing.T) {
+	// A parse-valid but typo'd field name is now a boot failure: the playbook
+	// compiler cross-checks every referenced path against the event's payload
+	// schema, so a rule can never silently never-fire forever.
 	rules := []Rule{
-		{Name: "strict", Trigger: "order_scored",
+		{Name: "typo", Trigger: "order_scored",
 			Condition: "prediction.score >= registry.recommended_threshold && prediction.missing > 0",
 			Action:    "hold_order_for_review", RiskTier: "approval_required", Enabled: true},
 	}
+	bus := events.New()
+	fake := &fakeActions{has: map[string]bool{"hold_order_for_review": true}}
+	_, err := NewEngine(bus, fake, rules, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil {
+		t.Fatal("engine should refuse to boot with a condition referencing a field the event never carries")
+	}
+}
+
+func TestRuntimeFailClosedWhenSchemaFieldAbsentFromPayload(t *testing.T) {
+	// The schema check happens at boot, but individual events may still omit
+	// a legitimately-declared optional field; the runtime evaluator must fail
+	// closed on those too (never fire, never silently pass).
+	rules := []Rule{
+		{Name: "confident-fraud", Trigger: "order_scored",
+			Condition: "prediction.model == 'fraud_risk' && prediction.confidence > 0.1",
+			Action:    "hold_order_for_review", RiskTier: "approval_required", Enabled: true},
+	}
 	eng, fake, _ := newTestEngine(t, rules)
-	eng.handle(context.Background(), orderEvent(0.91))
+	relaxed := orderEvent(0.91) // orderEvent payload has no confidence field
+	eng.Handle(context.Background(), relaxed)
 	if proposed, _ := fake.snapshot(); len(proposed) != 0 {
-		t.Fatalf("rule with unknown field fired; fail-closed violated: %+v", proposed)
+		t.Fatalf("rule fired on a payload missing a declared field; fail-closed violated: %+v", proposed)
 	}
 }
 
@@ -176,7 +195,7 @@ func TestEngineSkipsDormantRules(t *testing.T) {
 		Action: "retrain_model", RiskTier: "approval_required", Enabled: false,
 	})
 	eng, fake, _ := newTestEngine(t, rules)
-	eng.handle(context.Background(), orderEvent(0.91))
+	eng.Handle(context.Background(), orderEvent(0.91))
 	proposed, _ := fake.snapshot()
 	if len(proposed) != 1 {
 		t.Fatalf("dormant rule fired; proposals = %d, want 1", len(proposed))
@@ -218,5 +237,21 @@ func TestDedupKeyDistinguishesTriggers(t *testing.T) {
 	if dedupKey("r", events.Event{Type: events.TypeAnomalyDetected,
 		Payload: map[string]any{"anomaly": map[string]any{"metric": "revenue"}}}) != "r|revenue|" {
 		t.Error("anomaly dedup should incorporate bucket_start even when empty")
+	}
+}
+
+func TestDedupKeyScopedToTriggerInstance(t *testing.T) {
+	// The same entity scored twice is TWO trigger instances: the dedup key must
+	// differ by the persisted prediction id, so a re-flagged entity proposes
+	// again instead of being silently vaccinated by its first incident.
+	first := dedupKey("r", events.Event{Type: events.TypeOrderScored,
+		Payload: map[string]any{"prediction": map[string]any{"entity_id": "a", "id": "1001"}}})
+	second := dedupKey("r", events.Event{Type: events.TypeOrderScored,
+		Payload: map[string]any{"prediction": map[string]any{"entity_id": "a", "id": "1002"}}})
+	if first == second {
+		t.Fatalf("re-scored entity must get a distinct dedup key, got %q for both", first)
+	}
+	if first != "r|a|1001" || second != "r|a|1002" {
+		t.Errorf("dedup keys = %q, %q; want r|a|1001, r|a|1002", first, second)
 	}
 }

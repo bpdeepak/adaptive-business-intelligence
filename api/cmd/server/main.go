@@ -22,10 +22,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
-	"abi/internal/agent"
 	"abi/internal/actions"
+	"abi/internal/agent"
 	"abi/internal/config"
 	"abi/internal/events"
+	"abi/internal/govern"
 	grpcapi "abi/internal/grpcapi"
 	metricsv1 "abi/internal/grpcapi/metricsv1"
 	httpapi "abi/internal/http"
@@ -81,6 +82,10 @@ func run(logger *slog.Logger, cfg config.Config) error {
 		return err
 	}
 	logger.Info("monitor schema ensured")
+	if err := govern.EnsureSchema(ctx, pool); err != nil {
+		return err
+	}
+	logger.Info("governance reconcile schema ensured")
 
 	st, err := store.NewPostgresStore(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -154,6 +159,19 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	driftCtx, driftCancel := context.WithCancel(ctx)
 	defer driftCancel()
 	go func() { _ = poller.Run(driftCtx, cfg.DriftPollEvery) }()
+
+	// 4d. Governance reconciliation backstop: re-derives proposals straight
+	// from the persisted gold tables, so a dropped bus event can never
+	// silently void a proposal (at-least-once with idempotent-on-instance
+	// dedup). Same period as the Phase 1 realtime reconcile loop.
+	reconciler := govern.NewReconciler(pool, engine, rules, logger)
+	govRecEvery, err1 := time.ParseDuration(cfg.ReconcileEvery)
+	if err1 != nil || govRecEvery <= 0 {
+		govRecEvery = time.Minute
+	}
+	govReconcileCtx, govReconcileCancel := context.WithCancel(ctx)
+	defer govReconcileCancel()
+	go func() { _ = reconciler.Run(govReconcileCtx, govRecEvery) }()
 
 	// 5. HTTP (REST + SSE + dashboard + /metrics).
 	srv := httpapi.New(st, logger)

@@ -36,17 +36,17 @@ type Service struct {
 	bc      *realtime.Broadcaster
 	events  *events.Bus // Phase 4 governance bus; nil disables event publishing
 
-	refs   *References
-	asm    *FraudAssembler
-	rings  *Rings
-	rates  map[string]*RateTracker
-	gate   *gate
-	jobs   *dropQueue
-	state  *stateStore
-	reg    *telemetry.Registry
+	refs  *References
+	asm   *FraudAssembler
+	rings *Rings
+	rates map[string]*RateTracker
+	gate  *gate
+	jobs  *dropQueue
+	state *stateStore
+	reg   *telemetry.Registry
 
-	seenMu sync.Mutex
-	seen   map[string]struct{}
+	seenMu  sync.Mutex
+	seen    map[string]struct{}
 	curLoop string
 
 	speed      float64
@@ -310,7 +310,7 @@ type scoreJob struct {
 // fired rate anomaly is persisted and broadcast to the in-process SSE banner.
 func (s *Service) scoreOne(ctx context.Context, j scoreJob) {
 	md := json.RawMessage(fmt.Sprintf(`{"source":"stream_score","grain":"%s"}`, j.grain))
-	resp, _, err := s.predict.ScoreAndPersist(ctx, j.model, j.entity, j.features, md)
+	resp, predID, err := s.predict.ScoreAndPersist(ctx, j.model, j.entity, j.features, md)
 	if err != nil {
 		s.counter("abi_score_writer_errors_total", "Scoring or persistence failures.").Inc()
 		s.log.Warn("scorewriter: score failed", "model", j.model, "entity", j.entity, "error", err)
@@ -336,11 +336,17 @@ func (s *Service) scoreOne(ctx context.Context, j scoreJob) {
 			At:   j.evt,
 			Payload: map[string]any{
 				"prediction": map[string]any{
-					"model":      j.model,
-					"entity_id":  j.entity,
-					"score":      resp.Prediction,
-					"confidence": resp.Confidence,
-					"threshold":  rt.Threshold(),
+					"model":         j.model,
+					"model_version": resp.Version,
+					"entity_id":     j.entity,
+					"score":         resp.Prediction,
+					"confidence":    resp.Confidence,
+					"threshold":     rt.Threshold(),
+					// The persisted prediction row id: the per-trigger-instance
+					// discriminator the playbook dedup key is scoped on, so a
+					// re-scored entity can be flagged again, while the same
+					// prediction row can never propose twice.
+					"id": predID,
 				},
 				"registry": map[string]any{
 					"recommended_threshold": rt.Threshold(),

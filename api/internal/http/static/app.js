@@ -625,8 +625,10 @@ async function loadActionHistory() {
     `<td>${statusPill(a.status)}</td>` +
     `<td class="id-cell">${escapeHtml(a.rule)}</td>` +
     `<td class="time-cell">${((a.decided_at || a.executed_at || a.created_at) || "").slice(0, 16).replace("T", " ")}</td>` +
-    `<td class="action-cell"><button class="btn-action trace" data-trace="${a.id}">trace</button></td>` +
-    `</tr>`
+    `<td class="action-cell">` +
+    (a.status === "failed" ? `<button class="btn-action retry" data-retry="${a.id}">retry</button>` : "") +
+    `<button class="btn-action trace" data-trace="${a.id}">trace</button>` +
+    `</td></tr>`
   ).join("");
 }
 
@@ -664,6 +666,19 @@ document.getElementById("approvalQueue").addEventListener("click", (ev) => {
 });
 
 document.getElementById("actionHistory").addEventListener("click", async (ev) => {
+  const retryBtn = ev.target.closest("button[data-retry]");
+  if (retryBtn) {
+    try {
+      await fetch(`/api/v1/actions/${retryBtn.dataset.retry}/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+    } catch { /* server unreachable; keep the row as-is */ }
+    loadApprovalQueue();
+    loadActionHistory();
+    return;
+  }
   const btn = ev.target.closest("button[data-trace]");
   if (!btn) return;
   const box = document.getElementById("actionTrace");

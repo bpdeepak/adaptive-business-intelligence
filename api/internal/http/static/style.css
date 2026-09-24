@@ -286,6 +286,8 @@ main { padding: 24px 28px; }
 .btn-action.reject { color: var(--danger); }
 .btn-action.reject:hover { border-color: var(--danger); }
 .btn-action.trace { color: var(--muted); }
+.btn-action.retry { color: #e6c15c; }
+.btn-action.retry:hover { border-color: #e6c15c; }
 .btn-action.close-trace { margin-top: 6px; }
 .trace-box {
   margin-top: 12px;
