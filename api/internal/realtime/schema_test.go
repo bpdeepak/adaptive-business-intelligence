@@ -39,6 +39,7 @@ func TestAnomaliesDDLPinsPhase3Contract(t *testing.T) {
 	for _, want := range []string{
 		"ALTER TABLE gold.anomalies ADD COLUMN IF NOT EXISTS detector text NOT NULL DEFAULT 'statistical'",
 		"ALTER TABLE gold.anomalies ALTER COLUMN z_score DROP NOT NULL",
+		"ALTER TABLE gold.anomalies ADD COLUMN IF NOT EXISTS surfaced boolean NOT NULL DEFAULT true",
 		"idx_anomalies_detector",
 	} {
 		if !strings.Contains(joined, want) {

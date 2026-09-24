@@ -1,8 +1,12 @@
 package playbook
 
 import (
+	"io"
+	"log/slog"
 	"os"
 	"testing"
+
+	"abi/internal/events"
 )
 
 // TestLoadShippedPlaybooks validates the real policy file the server boots
@@ -54,5 +58,41 @@ func TestLoadShippedPlaybooks(t *testing.T) {
 		if r.Enabled {
 			t.Errorf("dormant rule %q must stay disabled until its producer exists", dormant)
 		}
+	}
+}
+// TestShippedPlaybooksBootTheEngine runs the real policy file through the same
+// NewEngine the server uses, so the boot-time checks (condition fields against
+// the payload schema, unknown actions, the auto-tier allow-list) are exercised
+// on the shipped YAML in CI rather than only at 3am server start.
+func TestShippedPlaybooksBootTheEngine(t *testing.T) {
+	var rules []Rule
+	for _, p := range []string{"../../../config/playbooks.yml", "../../config/playbooks.yml"} {
+		if r, err := LoadRules(p); err == nil {
+			rules = r
+			break
+		}
+	}
+	if len(rules) == 0 {
+		t.Skip("config/playbooks.yml not found relative to the package")
+	}
+	all := &fakeActions{has: map[string]bool{}}
+	for _, r := range rules {
+		all.has[r.Action] = true
+	}
+	if _, err := NewEngine(events.New(), all, rules, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatalf("shipped playbooks do not boot: %v", err)
+	}
+}
+
+func TestLoadRulesRejectsAutoOnNonAllowListedAction(t *testing.T) {
+	path := t.TempDir() + "/p.yml"
+	yml := "version: 1\nrules:\n  - name: sneaky\n    trigger: drift_computed\n" +
+		"    condition: \"drift.status == 'critical'\"\n    action: retrain_model\n" +
+		"    risk_tier: auto\n    enabled: false\n"
+	if err := os.WriteFile(path, []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadRules(path); err == nil {
+		t.Fatal("LoadRules accepted risk_tier: auto on retrain_model")
 	}
 }

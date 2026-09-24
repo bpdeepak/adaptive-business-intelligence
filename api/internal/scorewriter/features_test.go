@@ -235,3 +235,112 @@ func TestBotFeaturesMapping(t *testing.T) {
 		}
 	}
 }
+// TestBotFeaturesMatchSharedSpec pins the hand-written BotFeatures mapping to the
+// spec file the Python trainer is also asserted against
+// (ml/tests/test_bot_feature_spec.py), so the two sides cannot drift apart
+// silently — the sidecar now refuses a vector with a missing feature.
+func TestBotFeaturesMatchSharedSpec(t *testing.T) {
+	var spec FeatureSpec
+	if err := json.Unmarshal(botSpecJSON, &spec); err != nil {
+		t.Fatalf("parse embedded bot spec: %v", err)
+	}
+	got := BotFeatures(stream.SessionEnd{})
+	want := map[string]bool{}
+	for _, f := range spec.Features {
+		want[f.Name] = true
+		if _, ok := got[f.Name]; !ok {
+			t.Errorf("BotFeatures does not emit spec feature %q", f.Name)
+		}
+	}
+	for name := range got {
+		if !want[name] {
+			t.Errorf("BotFeatures emits %q which is not in bot_feature_spec.json", name)
+		}
+	}
+}
+
+// The three assembler skews the train/serve parity test (parity_integration_test.go)
+// found against the batch feature table. Each is pinned here without a database.
+
+// Batch reads order_hour / is_weekend from the UTC timestamp. An event's
+// time.Time keeps whatever zone its producer marshalled (pgx hands back the
+// machine's local zone), so reading .Hour() directly skewed both features on
+// any non-UTC host.
+func TestAssembleReadsCalendarFieldsInUTC(t *testing.T) {
+	a := NewFraudAssembler(testRefs())
+	ist := time.FixedZone("IST", 5*3600+1800)
+	// Monday 01:00 IST == Sunday 19:30 UTC.
+	at := time.Date(2017, 1, 16, 1, 0, 0, 0, ist)
+	f := a.Assemble(stream.OrderPlaced{OrderID: "o", CustomerID: "c", PurchaseTime: at, PaymentValue: 10,
+		Items: []stream.OrderItem{{ProductID: "p1", Price: 10}}}, NewRings())
+	if f["order_hour"] != 19 {
+		t.Errorf("order_hour = %v, want 19 (UTC), not the event's local hour", f["order_hour"])
+	}
+	if f["is_weekend"] != 1 {
+		t.Errorf("is_weekend = %v, want 1 (Sunday in UTC)", f["is_weekend"])
+	}
+}
+
+// Batch: an order with no item rows has category_primary 'unknown' and
+// categories_count 1 (fillna), not "" / 0.
+func TestAssembleOrderWithNoItemsMatchesBatchFillna(t *testing.T) {
+	a := NewFraudAssembler(testRefs())
+	od := stream.OrderPlaced{OrderID: "o", CustomerID: "c", PurchaseTime: time.Now(), PaymentValue: 10}
+	if got := a.primaryCategory(od.Items); got != "unknown" {
+		t.Errorf("primaryCategory(no items) = %q, want unknown", got)
+	}
+	f := a.Assemble(od, NewRings())
+	if f["categories_count"] != 1 {
+		t.Errorf("categories_count = %v, want 1", f["categories_count"])
+	}
+	if f["item_count"] != 0 {
+		t.Errorf("item_count = %v, want 0 (that one really is zero in batch)", f["item_count"])
+	}
+}
+
+// Olist gives every order its own customer_id; batch velocity/age group by the
+// person (customer_unique_id). Keyed by the event's customer_id a repeat buyer
+// is never seen twice.
+func TestVelocityAndAgeAreKeyedByPersonNotOrderCustomerID(t *testing.T) {
+	refs := testRefs()
+	refs.CustomerKey = map[string]string{"cust-order-1": "person", "cust-order-2": "person"}
+	a := NewFraudAssembler(refs)
+	r := NewRings()
+	item := []stream.OrderItem{{ProductID: "p1", Price: 10}}
+	t0 := time.Date(2017, 3, 1, 10, 0, 0, 0, time.UTC)
+
+	first := stream.OrderPlaced{OrderID: "o1", CustomerID: "cust-order-1", PurchaseTime: t0, PaymentValue: 10, Items: item}
+	a.Assemble(first, r)
+	r.RecordOrder(first, refs, a.primaryCategory(first.Items))
+
+	second := stream.OrderPlaced{OrderID: "o2", CustomerID: "cust-order-2", PurchaseTime: t0.Add(3 * time.Hour), PaymentValue: 10, Items: item}
+	f := a.Assemble(second, r)
+	if f["velocity_24h"] != 1 {
+		t.Errorf("velocity_24h = %v, want 1: same person, 3h apart, different per-order customer_id", f["velocity_24h"])
+	}
+
+	third := stream.OrderPlaced{OrderID: "o3", CustomerID: "cust-order-2", PurchaseTime: t0.Add(72 * time.Hour), PaymentValue: 10, Items: item}
+	r.RecordOrder(second, refs, a.primaryCategory(second.Items))
+	if f := a.Assemble(third, r); f["account_age_days"] != 3 {
+		t.Errorf("account_age_days = %v, want 3 (days since the person's first order)", f["account_age_days"])
+	}
+}
+
+// An order with two equally priced items in different categories: the primary
+// category is the FIRST such item (batch: ORDER BY price DESC, order_item_id). The
+// producer loads items in (order_id, order_item_id) order, so first-listed wins.
+func TestPrimaryCategoryTieBreaksToTheFirstListedItem(t *testing.T) {
+	a := NewFraudAssembler(testRefs())
+	catAfirst := []stream.OrderItem{{ProductID: "p1", Price: 10}, {ProductID: "p2", Price: 10}}
+	catBfirst := []stream.OrderItem{{ProductID: "p2", Price: 10}, {ProductID: "p1", Price: 10}}
+	if got := a.primaryCategory(catAfirst); got != "catA" {
+		t.Errorf("primaryCategory = %q, want catA (first of two equal prices)", got)
+	}
+	if got := a.primaryCategory(catBfirst); got != "catB" {
+		t.Errorf("primaryCategory = %q, want catB (first of two equal prices)", got)
+	}
+	// A strictly higher price still wins regardless of position.
+	if got := a.primaryCategory([]stream.OrderItem{{ProductID: "p1", Price: 5}, {ProductID: "p2", Price: 10}}); got != "catB" {
+		t.Errorf("primaryCategory = %q, want catB (highest price)", got)
+	}
+}

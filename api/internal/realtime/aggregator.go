@@ -46,6 +46,69 @@ type Aggregator struct {
 	mu           sync.Mutex
 	buckets      map[time.Time]*bucket
 	lastAnalyzed time.Time
+
+	// watermark is the newest event-time minute seen; lastIngest is the wall
+	// time of the last consumed record. Bucket closure and eviction are decided
+	// against the stream's OWN clock (see closedLocked), not the wall clock,
+	// because replayed events carry simulated timestamps that are years in the
+	// past — and, after enough loops, in the future.
+	watermark  time.Time
+	lastIngest time.Time
+
+	// restoredThrough is the analysis cursor restored at boot. Buckets at or
+	// before it were already finalised (and persisted) by the previous process;
+	// after a crash the broker redelivers some of their events, which rebuild
+	// only PARTIAL copies here — persisting those would overwrite the finished
+	// sums with smaller ones. cursorKey is this aggregator's row in
+	// gold.aggregator_state.
+	restoredThrough time.Time
+	cursorKey       string
+}
+
+// timelineRegression is how far event time may jump backwards before the
+// aggregator concludes the source restarted its timeline (a replay starting
+// over at 2016) rather than delivering a late event.
+const timelineRegression = time.Hour
+
+// closedLocked reports whether a minute bucket is complete and may be analysed.
+// A bucket is closed when the stream has moved on (its start is more than a
+// minute behind the event-time watermark), or when the stream has gone idle for
+// a flush interval and the wall clock says the minute is over. Deciding on wall
+// time alone (the original rule) analysed a still-filling newest bucket on every
+// flush during a historical replay, and never closed a bucket whose simulated
+// time was ahead of the wall clock. Caller holds a.mu.
+func (a *Aggregator) closedLocked(start, now time.Time) bool {
+	if start.Before(a.watermark.Add(-time.Minute)) {
+		return true
+	}
+	idle := !a.lastIngest.IsZero() && now.Sub(a.lastIngest) >= a.flushEvery
+	return idle && start.Before(now.Add(-time.Minute))
+}
+
+// evictableLocked reports whether an in-memory bucket is far enough behind the
+// event-time watermark that no further event can plausibly land in it. Keyed on
+// the watermark (not the wall clock) so a bucket a replay is still filling is
+// never dropped and re-created, which made a later flush overwrite the earlier
+// partial sum with a smaller one. Caller holds a.mu.
+func (a *Aggregator) evictableLocked(start time.Time) bool {
+	return start.Before(a.watermark.Add(-10 * time.Minute))
+}
+
+// advanceLocked folds one record's event time into the watermark / ingest clock.
+func (a *Aggregator) advanceLocked(start time.Time) {
+	// A source that restarts its timeline (the replay producer begins again at
+	// the dataset start) would otherwise be ignored forever: every new bucket is
+	// "older" than the analysis cursor and the watermark. Treat a large backwards
+	// jump as a new timeline.
+	if !a.lastAnalyzed.IsZero() && start.Before(a.lastAnalyzed.Add(-timelineRegression)) {
+		a.lastAnalyzed = time.Time{}
+		a.restoredThrough = time.Time{}
+		a.watermark = start
+	}
+	if start.After(a.watermark) {
+		a.watermark = start
+	}
+	a.lastIngest = time.Now()
 }
 
 type bucket struct {
@@ -72,6 +135,7 @@ func NewAggregator(pool *pgxpool.Pool, cl, anomPub *kgo.Client, bc *Broadcaster,
 		detector:   NewDetector(),
 		flushEvery: 5 * time.Second,
 		buckets:    make(map[time.Time]*bucket),
+		cursorKey:  DefaultCursorKey,
 	}
 }
 
@@ -145,8 +209,13 @@ func (a *Aggregator) restoreBaseline(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	through, err := LoadAnalyzedThrough(ctx, a.pool, a.cursorKey)
+	if err != nil {
+		return err
+	}
 	a.mu.Lock()
 	a.detector.Restore(states)
+	a.lastAnalyzed, a.restoredThrough = through, through
 	a.mu.Unlock()
 	if len(states) > 0 {
 		a.log.Info("aggregator: detector baseline restored", "metrics", len(states))
@@ -160,9 +229,12 @@ func (a *Aggregator) restoreBaseline(ctx context.Context) error {
 func (a *Aggregator) saveBaseline(ctx context.Context) {
 	a.mu.Lock()
 	states := a.detector.Snapshot()
+	through := a.lastAnalyzed
 	a.mu.Unlock()
-	if err := SaveDetectorState(ctx, a.pool, states); err != nil {
-		a.log.Debug("aggregator: save detector state", "error", err)
+	if err := SaveDetectorStateAt(ctx, a.pool, states, a.cursorKey, through); err != nil {
+		// Warn, not debug: an unsaved baseline means the next restart re-warms
+		// or re-folds, and nobody would know.
+		a.log.Warn("aggregator: save detector state", "error", err)
 	}
 }
 
@@ -182,6 +254,9 @@ func (a *Aggregator) ingest(rec *kgo.Record) {
 		return
 	}
 	start := env.OccurredAt.UTC().Truncate(time.Minute)
+	a.mu.Lock()
+	a.advanceLocked(start)
+	a.mu.Unlock()
 
 	switch rec.Topic {
 	case stream.TopicOrders:
@@ -261,7 +336,6 @@ func (a *Aggregator) bucketLocked(start time.Time) *bucket {
 func (a *Aggregator) flushAndDetect(ctx context.Context) error {
 	a.mu.Lock()
 	now := time.Now().UTC()
-	cutoff := now.Add(-time.Minute) // buckets strictly older than 1 min are closed
 	starts := make([]time.Time, 0, len(a.buckets))
 	for s := range a.buckets {
 		starts = append(starts, s)
@@ -271,7 +345,7 @@ func (a *Aggregator) flushAndDetect(ctx context.Context) error {
 	var anomalies []model.Anomaly
 	for _, s := range starts {
 		b := a.buckets[s]
-		if s.Before(cutoff) && s.After(a.lastAnalyzed) {
+		if a.closedLocked(s, now) && s.After(a.lastAnalyzed) {
 			a.detectBucketLocked(b, &anomalies)
 		}
 	}
@@ -295,22 +369,12 @@ func (a *Aggregator) flushAndDetect(ctx context.Context) error {
 		// Phase 4: after the durable row exists, publish the anomaly onto the
 		// governance bus so the playbook engine sees statistical findings too.
 		if a.evBus != nil {
-			a.evBus.Publish(events.Event{
-				Type: events.TypeAnomalyDetected,
-				At:   time.Now().UTC(),
-				Payload: map[string]any{
-					"anomaly": map[string]any{
-						"metric":       anom.Metric,
-						"detector":     anom.Detector,
-						"bucket_start": anom.BucketStart,
-						"observed":     anom.Observed,
-						"expected":     anom.Expected,
-						"severity":     anom.Severity,
-						"status":       anom.Status,
-						"surfaced":     true, // statistical anomalies surface as they fire (no hysteresis)
-					},
-				},
-			})
+			a.evBus.Publish(events.NewAnomalyDetected(events.Anomaly{
+				Metric: anom.Metric, Detector: anom.Detector, BucketStart: anom.BucketStart,
+				Observed: anom.Observed, Expected: anom.Expected, ZScore: anom.ZScore,
+				Severity: anom.Severity, Status: anom.Status,
+				Surfaced: true, // statistical anomalies surface as they fire (no hysteresis)
+			}, time.Now().UTC()))
 		}
 		if err := a.publishAnomaly(ctx, anom); err != nil {
 			a.log.Error("aggregator: publish anomaly", "error", err)
@@ -388,6 +452,16 @@ func (a *Aggregator) persistBuckets(ctx context.Context, starts []time.Time) err
 	persisted := make([]model.RealtimeBucket, 0, len(starts))
 	for _, s := range starts {
 		b := a.buckets[s]
+		if b == nil {
+			continue
+		}
+		if !a.restoredThrough.IsZero() && !s.After(a.restoredThrough) {
+			// Already finalised before the restart; what is in memory is only the
+			// redelivered fraction of that minute. Never overwrite the finished
+			// row with it.
+			delete(a.buckets, s)
+			continue
+		}
 		persisted = append(persisted, model.RealtimeBucket{
 			BucketStart:    s.UTC().Format(time.RFC3339),
 			Revenue:        round2(b.revenue),
@@ -400,15 +474,23 @@ func (a *Aggregator) persistBuckets(ctx context.Context, starts []time.Time) err
 	if len(persisted) == 0 {
 		return nil
 	}
-	// Bulk upsert in one round trip.
-	var sb []string
-	args := make([]any, 0, len(persisted)*5)
-	for _, p := range persisted {
-		args = append(args, p.BucketStart, p.Revenue, p.Orders, p.ActiveSessions, p.AnomalyFlag)
-		sb = append(sb, fmt.Sprintf("($%d,$%d,$%d,$%d,$%d)",
-			len(args)-4, len(args)-3, len(args)-2, len(args)-1, len(args)))
-	}
-	sql := `INSERT INTO gold.realtime_metrics (bucket_start, revenue, orders, active_sessions, anomaly_flag)
+	// Bulk upsert in chunks: each row binds 5 parameters and Postgres caps a
+	// statement at 65,535, so a backlog (consumer lag, a restart catching up)
+	// must not turn into one oversized statement that fails every flush.
+	const chunk = 1000
+	for from := 0; from < len(persisted); from += chunk {
+		to := from + chunk
+		if to > len(persisted) {
+			to = len(persisted)
+		}
+		var sb []string
+		args := make([]any, 0, (to-from)*5)
+		for _, p := range persisted[from:to] {
+			args = append(args, p.BucketStart, p.Revenue, p.Orders, p.ActiveSessions, p.AnomalyFlag)
+			sb = append(sb, fmt.Sprintf("($%d,$%d,$%d,$%d,$%d)",
+				len(args)-4, len(args)-3, len(args)-2, len(args)-1, len(args)))
+		}
+		sql := `INSERT INTO gold.realtime_metrics (bucket_start, revenue, orders, active_sessions, anomaly_flag)
 VALUES ` + joinArgs(sb) + `
 ON CONFLICT (bucket_start) DO UPDATE SET
   revenue = EXCLUDED.revenue,
@@ -416,13 +498,13 @@ ON CONFLICT (bucket_start) DO UPDATE SET
   active_sessions = EXCLUDED.active_sessions,
   anomaly_flag = EXCLUDED.anomaly_flag,
   updated_at = now()`
-	if _, err := a.pool.Exec(ctx, sql, args...); err != nil {
-		return fmt.Errorf("upsert realtime metrics: %w", err)
+		if _, err := a.pool.Exec(ctx, sql, args...); err != nil {
+			return fmt.Errorf("upsert realtime metrics: %w", err)
+		}
 	}
-	// Drop buckets that slid outside the in-memory window.
-	cut := time.Now().UTC().Add(-10 * time.Minute)
+	// Drop buckets that fell behind the event-time watermark.
 	for s := range a.buckets {
-		if s.Before(cut) {
+		if a.evictableLocked(s) {
 			delete(a.buckets, s)
 		}
 	}
@@ -435,8 +517,8 @@ ON CONFLICT (bucket_start) DO UPDATE SET
 func (a *Aggregator) persistAnomaly(ctx context.Context, anom *model.Anomaly) (*model.Anomaly, error) {
 	var out model.Anomaly
 	err := a.pool.QueryRow(ctx, `
-INSERT INTO gold.anomalies (metric, detector, bucket_start, observed, expected, z_score, severity, status, detected_at)
-VALUES ($1, 'statistical', $2, $3, $4, $5, $6, 'open', now())
+INSERT INTO gold.anomalies (metric, detector, bucket_start, observed, expected, z_score, severity, status, detected_at, surfaced)
+VALUES ($1, 'statistical', $2, $3, $4, $5, $6, 'open', now(), true)
 RETURNING id, metric, detector,
   to_char(bucket_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
   observed, expected, z_score, severity, status,

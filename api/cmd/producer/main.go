@@ -25,7 +25,7 @@ import (
 
 	"abi/internal/config"
 	"abi/internal/kafka"
-	"abi/internal/model"
+	"abi/internal/store"
 	"abi/internal/stream"
 	"abi/internal/telemetry"
 )
@@ -54,7 +54,7 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	}
 	defer pool.Close()
 
-	orders, err := loadReplayOrders(ctx, pool)
+	orders, err := store.LoadReplayOrders(ctx, pool)
 	if err != nil {
 		return err
 	}
@@ -261,95 +261,6 @@ func topicFor(eventType string) string {
 // ---------------------------------------------------------------------------
 // Replay data loading (gold → simulator)
 // ---------------------------------------------------------------------------
-
-func loadReplayOrders(ctx context.Context, pool *pgxpool.Pool) ([]model.ReplayOrder, error) {
-	rows, err := pool.Query(ctx, `
-SELECT o.order_id, o.customer_id, o.order_status, o.order_purchase_timestamp,
-       o.payment_value_total::float8,
-       (o.order_status IN ('canceled','unavailable')) AS is_lost
-FROM gold.fct_orders o
-ORDER BY o.order_purchase_timestamp, o.order_id`)
-	if err != nil {
-		return nil, fmt.Errorf("load replay orders: %w", err)
-	}
-	defer rows.Close()
-
-	type base struct {
-		orderID, customerID, status string
-		at                          time.Time
-		value                       float64
-		lost                        bool
-	}
-	var bs []base
-	for rows.Next() {
-		var b base
-		if err := rows.Scan(&b.orderID, &b.customerID, &b.status, &b.at, &b.value, &b.lost); err != nil {
-			return nil, fmt.Errorf("scan replay order: %w", err)
-		}
-		bs = append(bs, b)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	itemRows, err := pool.Query(ctx, `
-SELECT order_id, product_id, seller_id, price::float8, freight_value::float8
-FROM gold.fct_order_items`)
-	if err != nil {
-		return nil, fmt.Errorf("load replay items: %w", err)
-	}
-	defer itemRows.Close()
-	items := make(map[string][]model.ReplayItem)
-	for itemRows.Next() {
-		var orderID, productID, sellerID string
-		var price, freight float64
-		if err := itemRows.Scan(&orderID, &productID, &sellerID, &price, &freight); err != nil {
-			return nil, fmt.Errorf("scan replay item: %w", err)
-		}
-		items[orderID] = append(items[orderID], model.ReplayItem{
-			ProductID: productID, SellerID: sellerID, Price: price, Freight: freight,
-		})
-	}
-	if err := itemRows.Err(); err != nil {
-		return nil, err
-	}
-
-	payRows, err := pool.Query(ctx, `
-SELECT order_id, payment_type,
-       COALESCE(payment_installments, 0)::int,
-       payment_value::float8
-FROM silver.stg_order_payments
-ORDER BY order_id, payment_value DESC, payment_installments DESC, payment_type`)
-	if err != nil {
-		return nil, fmt.Errorf("load replay payments: %w", err)
-	}
-	defer payRows.Close()
-	payments := make(map[string][]model.ReplayPayment)
-	for payRows.Next() {
-		var orderID, pType string
-		var installments int
-		var value float64
-		if err := payRows.Scan(&orderID, &pType, &installments, &value); err != nil {
-			return nil, fmt.Errorf("scan replay payment: %w", err)
-		}
-		payments[orderID] = append(payments[orderID], model.ReplayPayment{
-			Type: pType, Installments: installments, Value: value,
-		})
-	}
-	if err := payRows.Err(); err != nil {
-		return nil, err
-	}
-
-	out := make([]model.ReplayOrder, 0, len(bs))
-	for _, b := range bs {
-		out = append(out, model.ReplayOrder{
-			OrderID: b.orderID, CustomerID: b.customerID, Status: b.status,
-			PurchaseAt: b.at, PaymentValue: b.value, IsLost: b.lost,
-			Items: items[b.orderID], Payments: payments[b.orderID],
-		})
-	}
-	return out, nil
-}
 
 func loadProducts(ctx context.Context, pool *pgxpool.Pool) ([]string, error) {
 	rows, err := pool.Query(ctx, `SELECT DISTINCT product_id FROM gold.fct_order_items ORDER BY product_id`)

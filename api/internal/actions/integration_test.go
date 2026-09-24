@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,12 +61,30 @@ func uniqueDedup(t *testing.T) string {
 	return fmt.Sprintf("test.%s.%d", t.Name(), time.Now().UnixNano())
 }
 
+// auditMaintenance runs one statement with the audit log's append-only trigger
+// explicitly switched off for this transaction only (SET LOCAL). Tests are the
+// only code that ever needs it: the service never updates or deletes audit rows.
+func auditMaintenance(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL abi.audit_maintenance = 'on'`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, sql, args...); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // cleanupAction removes the queue + audit rows for one test action (they are
 // append-only by design; the test just doesn't want to accumulate).
 func cleanupAction(t *testing.T, pool *pgxpool.Pool, id int64) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := pool.Exec(ctx, `DELETE FROM gold.action_audit_log WHERE action_id = $1`, id); err != nil {
+	if err := auditMaintenance(ctx, pool, `DELETE FROM gold.action_audit_log WHERE action_id = $1`, id); err != nil {
 		t.Logf("cleanup audit rows: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM gold.action_queue WHERE id = $1`, id); err != nil {
@@ -412,5 +431,306 @@ func triggerEvidenceForTest(name string) map[string]any {
 		"payload":    payload,
 		"rule":       "hold-high-fraud-order",
 		"condition":  "prediction.score >= registry.recommended_threshold",
+	}
+}
+
+// TestProposeRefusesAutoForNonAllowListedAction: the auto tier is an
+// allow-list, so a hold/retrain proposed as risk_tier "auto" never enters the
+// queue as something the engine could fast-path.
+func TestProposeRefusesAutoForNonAllowListedAction(t *testing.T) {
+	svc, pool := testActionsService(t)
+	key := uniqueDedup(t)
+	for _, action := range []string{"hold_order_for_review", "retrain_model"} {
+		_, err := svc.Propose(context.Background(), Proposal{
+			Action: action, Entity: "e-auto", RiskTier: RiskAuto,
+			Rule: "test", DedupKey: key + action,
+			Trigger: triggerEvidenceForTest(t.Name()),
+		})
+		if !errors.Is(err, ErrAutoNotAllowed) {
+			t.Fatalf("Propose(%s, auto): err = %v, want ErrAutoNotAllowed", action, err)
+		}
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM gold.action_queue WHERE dedup_key LIKE $1`, key+"%").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("refused proposals left %d queue rows (err %v)", n, err)
+	}
+}
+
+// TestAutoPathRefusesNonAllowListedActionEvenWhenTierSaysAuto: a row that
+// claims tier 'auto' for a non-allow-listed action (inserted behind Propose's
+// back) is still refused, and leaves no auto_approved authority row.
+func TestAutoPathRefusesNonAllowListedActionEvenWhenTierSaysAuto(t *testing.T) {
+	svc, pool := testActionsService(t)
+	ctx := context.Background()
+	var id int64
+	if err := pool.QueryRow(ctx, `
+INSERT INTO gold.action_queue (action, entity, risk_tier, rule, dedup_key, trigger)
+VALUES ('hold_order_for_review', 'e-forged', 'auto', 'test', $1, $2::jsonb) RETURNING id`,
+		uniqueDedup(t), `{"event_type":"order_scored","payload":{"prediction":{"entity_id":"o-forged"}}}`).Scan(&id); err != nil {
+		t.Fatalf("insert forged row: %v", err)
+	}
+	t.Cleanup(func() { cleanupAction(t, pool, id) })
+
+	if err := svc.AutoApproveAndExecute(ctx, id); !errors.Is(err, ErrAutoNotAllowed) {
+		t.Fatalf("AutoApproveAndExecute: err = %v, want ErrAutoNotAllowed", err)
+	}
+	if got := auditTransitions(t, pool, id); len(got) != 0 {
+		t.Fatalf("audit after refused auto path = %v, want none", got)
+	}
+	var flags int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM gold.order_flags WHERE order_id = 'o-forged'`).Scan(&flags)
+	if flags != 0 {
+		t.Fatal("the held-order effect ran without a human approval")
+	}
+}
+
+// TestAutoPathDoesNotStampAuthorityOnDecidedRows: calling the auto path on an
+// already-executed (or rejected) row must not append a misleading
+// auto_approved transition.
+func TestAutoPathDoesNotStampAuthorityOnDecidedRows(t *testing.T) {
+	svc, pool := testActionsService(t)
+	ctx := context.Background()
+	id, err := svc.Propose(ctx, Proposal{
+		Action: "log_event_note", Entity: "e-once", RiskTier: RiskAuto,
+		Rule: "test", DedupKey: uniqueDedup(t),
+		Params: map[string]any{"kind": "test"}, Trigger: triggerEvidenceForTest(t.Name()),
+	})
+	if err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	t.Cleanup(func() { cleanupAction(t, pool, id) })
+	if err := svc.AutoApproveAndExecute(ctx, id); err != nil {
+		t.Fatalf("first auto execute: %v", err)
+	}
+	if err := svc.AutoApproveAndExecute(ctx, id); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("second auto execute: err = %v, want ErrInvalidState", err)
+	}
+	if got := auditTransitions(t, pool, id); fmt.Sprint(got) != "[proposed auto_approved executed]" {
+		t.Fatalf("audit = %v, want exactly [proposed auto_approved executed]", got)
+	}
+}
+
+// TestOpenProposalSuppressesRepeatUntilDecided: the audit found one order with
+// two pending holds (a re-scored entity got a fresh prediction id, hence a fresh
+// dedup key). While a proposal for the same rule+entity is open, a new trigger
+// is suppressed; once a human decides it, a later trigger proposes again.
+func TestOpenProposalSuppressesRepeatUntilDecided(t *testing.T) {
+	svc, pool := testActionsService(t)
+	ctx := context.Background()
+	rule := fmt.Sprintf("test-open-%d", time.Now().UnixNano())
+	propose := func(entity, key string) int64 {
+		t.Helper()
+		id, err := svc.Propose(ctx, Proposal{
+			Action: "log_event_note", Entity: entity, RiskTier: RiskApprovalRequired,
+			Rule: rule, DedupKey: rule + "|" + key,
+			Params: map[string]any{"kind": "test"}, Trigger: triggerEvidenceForTest(t.Name()),
+		})
+		if err != nil {
+			t.Fatalf("Propose(%s,%s): %v", entity, key, err)
+		}
+		return id
+	}
+	first := propose("order-A", "pred-1")
+	if first == 0 {
+		t.Fatal("first proposal was not created")
+	}
+	t.Cleanup(func() { cleanupAction(t, pool, first) })
+
+	if dup := propose("order-A", "pred-2"); dup != 0 {
+		t.Fatalf("second trigger on the same entity created action %d while #%d is still pending", dup, first)
+	}
+	other := propose("order-B", "pred-3")
+	if other == 0 {
+		t.Fatal("a different entity must still propose")
+	}
+	t.Cleanup(func() { cleanupAction(t, pool, other) })
+
+	if err := svc.Reject(ctx, first, "reviewed: legitimate", "bob@abi"); err != nil {
+		t.Fatalf("Reject: %v", err)
+	}
+	again := propose("order-A", "pred-4")
+	if again == 0 {
+		t.Fatal("after the earlier proposal was decided, a new trigger on the entity must propose again")
+	}
+	t.Cleanup(func() { cleanupAction(t, pool, again) })
+
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM gold.action_queue WHERE rule = $1 AND entity = 'order-A'`, rule).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("order-A rows = %d (err %v), want 2 (the decided one + the new one)", n, err)
+	}
+}
+
+// TestConcurrentProposalsForOneEntityCreateOne: the live bus and the
+// reconciler can propose for the same entity at the same instant.
+func TestConcurrentProposalsForOneEntityCreateOne(t *testing.T) {
+	svc, pool := testActionsService(t)
+	ctx := context.Background()
+	rule := fmt.Sprintf("test-race-%d", time.Now().UnixNano())
+	ids := make(chan int64, 8)
+	for i := 0; i < 8; i++ {
+		go func(i int) {
+			id, err := svc.Propose(ctx, Proposal{
+				Action: "log_event_note", Entity: "order-R", RiskTier: RiskApprovalRequired,
+				Rule: rule, DedupKey: fmt.Sprintf("%s|%d", rule, i),
+				Trigger: triggerEvidenceForTest(t.Name()),
+			})
+			if err != nil {
+				t.Errorf("Propose: %v", err)
+			}
+			ids <- id
+		}(i)
+	}
+	created := 0
+	for i := 0; i < 8; i++ {
+		if id := <-ids; id != 0 {
+			created++
+			t.Cleanup(func() { cleanupAction(t, pool, id) })
+		}
+	}
+	if created != 1 {
+		t.Fatalf("8 concurrent proposals created %d actions, want exactly 1", created)
+	}
+}
+
+// TestAuditLogIsAppendOnlyAtTheDatabase: "immutable" was a convention (the API
+// never issued UPDATE/DELETE) while the application role could do anything. The
+// trigger makes UPDATE, DELETE and TRUNCATE fail unless the session explicitly
+// opts in; INSERT (the only thing the service does) is unaffected.
+func TestAuditLogIsAppendOnlyAtTheDatabase(t *testing.T) {
+	svc, pool := testActionsService(t)
+	ctx := context.Background()
+	id, err := svc.Propose(ctx, Proposal{
+		Action: "log_event_note", Entity: "e-audit", RiskTier: RiskApprovalRequired,
+		Rule: "test", DedupKey: uniqueDedup(t),
+		Params: map[string]any{"kind": "test"}, Trigger: triggerEvidenceForTest(t.Name()),
+	})
+	if err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	t.Cleanup(func() { cleanupAction(t, pool, id) })
+
+	for name, stmt := range map[string]string{
+		"UPDATE":   `UPDATE gold.action_audit_log SET reason = 'edited' WHERE action_id = $1`,
+		"DELETE":   `DELETE FROM gold.action_audit_log WHERE action_id = $1`,
+		"TRUNCATE": `TRUNCATE gold.action_audit_log`,
+	} {
+		var err error
+		if name == "TRUNCATE" {
+			_, err = pool.Exec(ctx, stmt)
+		} else {
+			_, err = pool.Exec(ctx, stmt, id)
+		}
+		if err == nil {
+			t.Errorf("%s on gold.action_audit_log succeeded; the log must be append-only", name)
+		}
+	}
+	if got := auditTransitions(t, pool, id); fmt.Sprint(got) != "[proposed]" {
+		t.Fatalf("audit rows changed: %v", got)
+	}
+	// Appending is still fine, and the explicit maintenance switch works.
+	if _, err := pool.Exec(ctx, `INSERT INTO gold.action_audit_log (action_id, transition, actor) VALUES ($1, 'outcome', 'test')`, id); err != nil {
+		t.Fatalf("INSERT must remain allowed: %v", err)
+	}
+	if err := auditMaintenance(ctx, pool, `DELETE FROM gold.action_audit_log WHERE action_id = $1 AND transition = 'outcome'`, id); err != nil {
+		t.Fatalf("explicit maintenance mode must permit the delete: %v", err)
+	}
+}
+
+// TestConcurrentRetriesRunTheExecutorOnce: Retry's re-arm is conditional on
+// status = 'failed', so of N concurrent retries exactly one executes.
+func TestConcurrentRetriesRunTheExecutorOnce(t *testing.T) {
+	pool := testActionsPool(t)
+	svc := New(pool, slog.New(slog.DiscardHandler))
+	var mu sync.Mutex
+	calls := 0
+	svc.Register("flaky-once", func(_ context.Context, _ Context) (Result, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls == 1 {
+			return Result{}, fmt.Errorf("first attempt fails")
+		}
+		time.Sleep(100 * time.Millisecond) // widen the window a racing retry would need
+		return Result{OK: true}, nil
+	})
+	id, err := svc.Propose(context.Background(), Proposal{
+		Action: "flaky-once", Entity: "e-race", RiskTier: RiskApprovalRequired,
+		Rule: "test", DedupKey: uniqueDedup(t), Trigger: triggerEvidenceForTest(t.Name()),
+	})
+	if err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	t.Cleanup(func() { cleanupAction(t, pool, id) })
+	if err := svc.Approve(context.Background(), id, "demo", "alice@abi"); err == nil {
+		t.Fatal("first execution must fail")
+	}
+
+	const racers = 6
+	results := make(chan error, racers)
+	for i := 0; i < racers; i++ {
+		go func() { results <- svc.Retry(context.Background(), id, "tester") }()
+	}
+	won := 0
+	for i := 0; i < racers; i++ {
+		err := <-results
+		switch {
+		case err == nil:
+			won++
+		case errors.Is(err, ErrInvalidState):
+		default:
+			t.Errorf("unexpected retry error: %v", err)
+		}
+	}
+	if won != 1 {
+		t.Fatalf("%d concurrent retries executed, want exactly 1", won)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("executor ran %d times, want 2 (the original failure + one retry)", calls)
+	}
+	if got := auditTransitions(t, pool, id); fmt.Sprint(got) != "[proposed approved failed retrying executed]" {
+		t.Fatalf("audit = %v", got)
+	}
+}
+
+// TestStatsCountsFailedAndPendingRows: a failed execution must be visible as a
+// number an operator can alert on, not only as a row in the history panel.
+func TestStatsCountsFailedAndPendingRows(t *testing.T) {
+	pool := testActionsPool(t)
+	svc := New(pool, slog.New(slog.DiscardHandler))
+	svc.Register("always-broken-stats", func(_ context.Context, _ Context) (Result, error) {
+		return Result{}, fmt.Errorf("permanent failure")
+	})
+	before, err := svc.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	mk := func(action string) int64 {
+		id, err := svc.Propose(context.Background(), Proposal{
+			Action: action, Entity: "e-stats-" + action, RiskTier: RiskApprovalRequired,
+			Rule: "test-" + action, DedupKey: uniqueDedup(t) + action, Trigger: triggerEvidenceForTest(t.Name()),
+		})
+		if err != nil {
+			t.Fatalf("Propose: %v", err)
+		}
+		t.Cleanup(func() { cleanupAction(t, pool, id) })
+		return id
+	}
+	failing := mk("always-broken-stats")
+	mk("log_event_note") // stays pending
+	if err := svc.Approve(context.Background(), failing, "demo", "alice@abi"); err == nil {
+		t.Fatal("approve must surface the executor failure")
+	}
+	after, err := svc.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if after.Failed != before.Failed+1 {
+		t.Errorf("failed = %d, want %d", after.Failed, before.Failed+1)
+	}
+	if after.Pending != before.Pending+1 {
+		t.Errorf("pending = %d, want %d", after.Pending, before.Pending+1)
 	}
 }

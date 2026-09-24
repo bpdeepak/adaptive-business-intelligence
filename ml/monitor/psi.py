@@ -10,8 +10,10 @@ distributions come from common.feature_distribution_baseline (stored in
 gold.model_registry.drift_baseline by the trainers).
 
 Conventional banding: ok < 0.10, warning 0.10–0.20, critical > 0.20.
-Decay (forecast/churn): compare the current error / positive rate against the
-train-time baseline recorded in the registry metrics, as a ratio.
+Backtest reproduction (forecasts): recompute the error of the registry's own
+held-out predictions and compare it with the train-time WMAPE recorded in the
+registry. That verifies the stored evidence is self-consistent; it is NOT a decay
+measurement (no live ground truth ever enters it), so it is warning-capped.
 """
 from __future__ import annotations
 
@@ -67,21 +69,19 @@ def status_for(psi: float, *, warn: float = PSI_OK, crit: float = PSI_WARN) -> s
     return "warning"
 
 
-def decay_status(
-    current: float,
-    baseline: float,
-    *,
-    warn_ratio: float = 1.25,
-    crit_ratio: float = 2.0,
-) -> str:
-    """Band a real-decay finding (forecast WAPE / churn rate) against its
-    train-time baseline. Degradation beyond warn_ratio x is a warning; beyond
-    crit_ratio x is critical. Any drop (improvement) stays ok."""
+def reproduction_status(current: float, baseline: float, *, warn_ratio: float = 1.25) -> str:
+    """Band a backtest-reproduction check: the WAPE recomputed from the active
+    version's persisted held-out predictions against the WMAPE the registry
+    recorded when that same version was trained.
+
+    The two should agree (ratio ~ 1.0), so a ratio above ``warn_ratio`` means the
+    persisted evidence no longer reproduces the registry metric (a corrupted or
+    mixed-up predictions table, a changed metric definition) — worth a human
+    look. It can never be ``critical`` and therefore never proposes a retrain:
+    retraining does not repair an inconsistency, and this check has no live
+    ground truth, so it cannot establish that the model decayed. A genuine decay
+    monitor needs realised outcomes for served forecasts and is a separate item.
+    Any improvement stays ok."""
     if baseline <= 0 or current <= baseline:
         return "ok"
-    ratio = current / baseline
-    if ratio <= warn_ratio:
-        return "ok"
-    if ratio <= crit_ratio:
-        return "warning"
-    return "critical"
+    return "warning" if current / baseline > warn_ratio else "ok"

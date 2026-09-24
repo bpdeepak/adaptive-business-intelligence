@@ -65,6 +65,26 @@ var ErrUnknownAction = errors.New("unknown action")
 // prior approved (or allow-list auto_approved) transition on the audit log.
 var ErrUnauthorized = errors.New("execution without prior approval transition")
 
+// ErrAutoNotAllowed is returned when an action outside the auto allow-list is
+// proposed (or fast-pathed) under risk_tier "auto".
+var ErrAutoNotAllowed = errors.New("action is not on the auto-tier allow-list")
+
+// autoAllowList is THE allow-list behind risk_tier "auto": the only actions
+// that may execute on the playbook's own authority (an audited
+// 'auto_approved' transition instead of a human 'approved'). Membership is a
+// code-reviewed decision, not something a rule in config/playbooks.yml can
+// grant itself — the entries are informational/reversible log writes with no
+// revenue exposure. Anything else (hold, release, retrain, purchase order,
+// retention offer) always needs a human. Enforced at playbook load/boot
+// (playbook.validateRiskTier), at Propose, and again in AutoApproveAndExecute.
+var autoAllowList = map[string]bool{
+	"log_event_note":      true,
+	"log_retention_email": true,
+}
+
+// AutoAllowed reports whether action may run under risk_tier "auto".
+func AutoAllowed(action string) bool { return autoAllowList[action] }
+
 // ErrInvalidState is returned for approve/reject/execute on a row that is not
 // in the expected state (already decided, or missing).
 var ErrInvalidState = errors.New("action not in the expected state")
@@ -189,10 +209,10 @@ RETURNING id`, category, week, qty, `{}`).Scan(&id)
 		return Result{OK: true, Detail: map[string]any{"id": id, "category": category, "forecast_week": week, "quantity": qty}}, nil
 	},
 
-	// Informational only — no real email exists. Idempotence guard: same
-	// customer + kind within 24h logs once.
+	// Informational only — no real email exists, so the row says 'logged', never
+	// 'sent'. Idempotence guard: same customer + kind within 24h logs once.
 	"log_retention_email": func(ctx context.Context, ac Context) (Result, error) {
-		return insertRetention(ctx, ac, "email", "sent")
+		return insertRetention(ctx, ac, "email", "logged")
 	},
 	"propose_retention_offer": func(ctx context.Context, ac Context) (Result, error) {
 		return insertRetention(ctx, ac, "offer", "proposed")

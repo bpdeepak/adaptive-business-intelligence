@@ -78,9 +78,31 @@ class ModelStore:
     def score(self, name: str, features: dict[str, float]) -> dict[str, Any]:
         if name not in self.models:
             return {"error": f"unknown model {name!r}"}
+        cols = self.models[name]["features"]
+        # Strict contract: every manifest feature must be present and a finite
+        # number. Silently defaulting a missing feature to 0.0 turns any
+        # Go<->Python feature-name drift into confidently wrong scores (silent
+        # train/serve skew), so an incomplete vector is refused with a 400.
+        missing = [c for c in cols if c not in features]
+        if missing:
+            return {"error": f"missing features for {name}: {', '.join(missing)}",
+                    "missing_features": missing, "http": 400}
+        row: dict[str, float] = {}
+        bad: list[str] = []
+        for c in cols:
+            try:
+                v = float(features[c])
+            except (TypeError, ValueError):
+                bad.append(c)
+                continue
+            if v != v or v in (float("inf"), float("-inf")):
+                bad.append(c)
+                continue
+            row[c] = v
+        if bad:
+            return {"error": f"non-numeric or non-finite features for {name}: {', '.join(bad)}",
+                    "invalid_features": bad, "http": 400}
         m = self._load(name)
-        cols = m["features"]
-        row = {c: float(features.get(c, 0.0)) for c in cols}
         df = pd.DataFrame([row], columns=cols)
         model = m["model"]
         task = m.get("task", "binary_classification")
@@ -184,7 +206,7 @@ def make_handler(store: ModelStore):
                 self._json(500, {"error": f"scoring failed: {exc}"})
                 return
             if "error" in result:
-                self._json(404, result)
+                self._json(result.pop("http", 404), result)
             else:
                 self._json(200, result)
 

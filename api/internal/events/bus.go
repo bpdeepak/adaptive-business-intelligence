@@ -8,6 +8,7 @@ package events
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,7 +34,7 @@ const (
 	// Phase 5 scheduled churn-scoring job emits this event.
 	TypeChurnScored Type = "churn_scored"
 	// TypeDriftComputed fires when the monitoring ticker observes a new
-	// gold.model_drift row (assembly: PSI or real performance decay) for a
+	// gold.model_drift row (PSI drift or the backtest-reproduction check) for a
 	// model — this is what drives the drift-triggers-retrain-proposal rule.
 	TypeDriftComputed Type = "drift_computed"
 )
@@ -58,7 +59,21 @@ type Bus struct {
 	mu     sync.Mutex
 	nextID int64
 	subs   map[int64]chan Event
+
+	// published counts events handed to Publish; dropped counts deliveries lost to
+	// a full subscriber buffer. A drop is harmless for the dashboard but costs a
+	// governance proposal until the reconciler re-derives it, so it must be
+	// countable (exported as abi_domain_events_dropped_total).
+	published atomic.Int64
+	dropped   atomic.Int64
 }
+
+// Published is the number of events passed to Publish.
+func (b *Bus) Published() int64 { return b.published.Load() }
+
+// Dropped is the number of (event, subscriber) deliveries dropped because the
+// subscriber's buffer was full.
+func (b *Bus) Dropped() int64 { return b.dropped.Load() }
 
 // New creates an empty bus.
 func New() *Bus {
@@ -95,12 +110,16 @@ func (b *Bus) Publish(e Event) {
 	if e.At.IsZero() {
 		e.At = time.Now().UTC()
 	}
+	b.published.Add(1)
 	for _, ch := range b.subs {
 		select {
 		case ch <- e:
 		default:
-			// Slow consumer: drop. The governance effect is advisory; the
-			// authoritative record is the DB row the producer already wrote.
+			// Slow consumer: drop (never block the producer). The authoritative
+			// record is the DB row the producer already wrote and the governance
+			// reconciler re-derives the proposal from it — but the drop is counted
+			// so it is visible instead of silent.
+			b.dropped.Add(1)
 		}
 	}
 }

@@ -61,11 +61,11 @@ CREATE INDEX IF NOT EXISTS idx_predictions_created
     ON gold.predictions (predicted_at DESC);
 
 -- Phase 4 model monitoring: per-feature drift (PSI) and honest performance
--- decay findings. Every row is one (model, feature, computed_at) measurement;
--- status follows the conventional PSI bands: ok (<0.1), warning (0.1–0.2),
--- critical (>0.2). `kind` distinguishes distribution drift ('psi') from the
--- two real-decay findings ('forecast_decay', 'churn_decay') so the Go ticker
--- and dashboard can tell "data drifted" from "ground truth arrived".
+-- one consistency check. `kind` is 'psi' (distribution drift) or 'backtest_repro'
+-- (the forecast's registry backtest recomputed from its persisted held-out
+-- predictions: warning-capped, NOT live decay; rows written before 2026-09-24
+-- carry the old label 'forecast_decay'). A genuine decay kind needs realised
+-- outcomes for served forecasts and does not exist yet.
 CREATE TABLE IF NOT EXISTS gold.model_drift (
     id bigserial PRIMARY KEY,
     model_name text NOT NULL,

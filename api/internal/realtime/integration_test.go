@@ -6,10 +6,10 @@
 // Skipped automatically when either service is unreachable so plain
 // `go test ./...` stays green everywhere:
 //
-//   - Local dev: docker compose up -d --wait then run as-is (defaults match the
-//     stack: kafka://localhost:29092, postgres://abi:abi@localhost:5432/abi).
-//   - CI: the workflow starts Redpanda + Postgres and can override the
-//     endpoints with ABI_TEST_KAFKA / ABI_TEST_DATABASE_URL.
+//   - Local dev: point ABI_TEST_DATABASE_URL and ABI_TEST_KAFKA at a SCRATCH
+//     database and broker (the test truncates gold.detector_state and trims the
+//     Kafka topics, so it refuses to guess the dev stack).
+//   - CI: the workflow sets both to the compose services it just started.
 //
 // The test drives the real BronzeWriter + Aggregator end to end: it publishes a
 // controlled series of 1-minute buckets (baseline + a revenue/orders spike) to
@@ -65,14 +65,16 @@ type realtimeStack struct {
 func newRealtimeStack(t *testing.T) *realtimeStack {
 	t.Helper()
 
+	// This test is DESTRUCTIVE by design: it TRUNCATEs gold.detector_state and trims
+	// the shared Kafka topics. Falling back to the dev defaults would wipe a running
+	// stack's anomaly baseline and topics, so it only runs against a stack the caller
+	// named explicitly (CI does; locally point both at a scratch database + broker).
 	dsn := os.Getenv("ABI_TEST_DATABASE_URL")
-	if dsn == "" {
-		dsn = "postgres://abi:abi@localhost:5432/abi?sslmode=disable"
+	kafkaSeeds := os.Getenv("ABI_TEST_KAFKA")
+	if dsn == "" || kafkaSeeds == "" {
+		t.Skip("destructive realtime pipeline test: set ABI_TEST_DATABASE_URL and ABI_TEST_KAFKA to a scratch database and broker (it truncates gold.detector_state and trims the Kafka topics)")
 	}
-	seeds := []string{"localhost:29092"}
-	if v := os.Getenv("ABI_TEST_KAFKA"); v != "" {
-		seeds = strings.Split(v, ",")
-	}
+	seeds := strings.Split(kafkaSeeds, ",")
 
 	probeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -94,6 +96,12 @@ func newRealtimeStack(t *testing.T) *realtimeStack {
 	// restored sigma and pushes this run's controlled spike z-score onto the
 	// wrong side of the "severe" bar (observed: 4.93 vs want >= 5). Same
 	// philosophy as TrimTopics below: the assertions rely on a precise dataset.
+	// The aggregator also persists its analysis cursor; a stale one (from any earlier
+	// run against this database) would make it skip this run's minutes as "already
+	// finalised", so it is reset together with the baseline it belongs to.
+	if _, err := pool.Exec(probeCtx, `DELETE FROM gold.aggregator_state`); err != nil {
+		t.Fatalf("reset aggregator_state: %v", err)
+	}
 	if _, err := pool.Exec(probeCtx, `TRUNCATE gold.detector_state`); err != nil {
 		t.Fatalf("reset detector_state: %v", err)
 	}

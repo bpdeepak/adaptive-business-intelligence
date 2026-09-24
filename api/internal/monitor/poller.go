@@ -79,15 +79,6 @@ func (p *Poller) poll(ctx context.Context) error {
 		return err
 	}
 
-	type driftRun struct {
-		model       string
-		version     string
-		computedAt  string
-		worst       int      // okay=0 < warning=1 < critical=2
-		worstStatus string
-		maxPSI      float64
-		features    []map[string]any
-	}
 	rows, err := p.pool.Query(ctx, `
 SELECT id, model_name, model_version, feature, psi, status, kind,
        to_char(computed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
@@ -97,7 +88,7 @@ FROM gold.model_drift WHERE id > $1 ORDER BY id`, watermark)
 	}
 	defer rows.Close()
 
-	runs := map[string]*driftRun{} // key: model|computedAt
+	runs := map[string]*events.DriftRun{} // key: model|computedAt
 	maxID := watermark
 	for rows.Next() {
 		var id int64
@@ -112,43 +103,21 @@ FROM gold.model_drift WHERE id > $1 ORDER BY id`, watermark)
 		key := model + "|" + computedAt
 		r, ok := runs[key]
 		if !ok {
-			// A run with only healthy findings must still report "ok": the
-			// worst-status merge only overwrites when a worse status arrives.
-			r = &driftRun{model: model, version: version, computedAt: computedAt, worstStatus: "ok"}
+			r = &events.DriftRun{Model: model, Version: version, ComputedAt: computedAt}
 			runs[key] = r
 		}
-		r.features = append(r.features, map[string]any{
-			"feature": feature, "psi": psi, "status": status, "kind": kind,
-		})
-		if s := rank(status); s > r.worst {
-			r.worst, r.worstStatus = s, status
-		}
-		if psi > r.maxPSI {
-			r.maxPSI = psi
-		}
+		r.Add(feature, psi, status, kind)
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 
 	for _, r := range runs {
-		p.bus.Publish(events.Event{
-			Type: events.TypeDriftComputed,
-			At:   time.Now().UTC(),
-			Payload: map[string]any{
-				"drift": map[string]any{
-					"model":         r.model,
-					"model_version": r.version,
-					"status":        r.worstStatus,
-					"psi":           r.maxPSI,
-					"feature_count": len(r.features),
-					"features":      r.features,
-					"computed_at":   r.computedAt,
-				},
-			},
-		})
+		ev := r.Event(false, time.Now().UTC())
+		p.bus.Publish(ev)
 		if p.log != nil {
-			p.log("monitor: drift event", "model", r.model, "status", r.worstStatus, "computed_at", r.computedAt)
+			drift, _ := ev.Payload["drift"].(map[string]any)
+			p.log("monitor: drift event", "model", r.Model, "status", drift["status"], "computed_at", r.ComputedAt)
 		}
 	}
 
@@ -158,18 +127,6 @@ FROM gold.model_drift WHERE id > $1 ORDER BY id`, watermark)
 		}
 	}
 	return nil
-}
-
-// rank orders the drift statuses for worst-takes-all merging.
-func rank(status string) int {
-	switch status {
-	case "critical":
-		return 2
-	case "warning":
-		return 1
-	default:
-		return 0
-	}
 }
 
 func (p *Poller) readWatermark(ctx context.Context) (int64, error) {

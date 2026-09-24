@@ -69,6 +69,12 @@ func NewRateTracker(model string, cfg ModelConfig) *RateTracker {
 	}
 }
 
+// Configured reports whether the registry gave this model a usable decision
+// threshold (> 0). Without one there is nothing to compare a score against:
+// the tracker stays silent and the score-writer publishes no threshold fields,
+// so playbook rules fail closed rather than treating "missing" as 0.
+func (rt *RateTracker) Configured() bool { return rt.threshold > 0 }
+
 // Threshold returns the model's recommended decision threshold (used in the
 // order_scored/session_scored event payloads the playbook sees).
 func (rt *RateTracker) Threshold() float64 { return rt.threshold }
@@ -98,6 +104,9 @@ func (rt *RateTracker) Snapshot() *RateTrace {
 // false on the first fired bucket and true once the breach has persisted for
 // ConsecutiveWindowsRequired consecutive windows (the banner hysteresis).
 func (rt *RateTracker) Observe(t time.Time, prediction float64) *model.Anomaly {
+	if !rt.Configured() {
+		return nil
+	}
 	secs := float64(t.Unix())
 	rt.obs = append(rt.obs, rateObs{T: secs, Pos: prediction >= rt.threshold})
 	cutoff := secs - RateWindowSecs

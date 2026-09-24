@@ -125,6 +125,7 @@
       "id": "q13",
       "question": "What did the most recent live replay bucket show for orders and revenue?",
       "answerable": true,
+      "requires_rows": {"tool": "live_realtime", "params": {"minutes": 1440}},
       "check": {"type": "numbers_head", "tool": "live_realtime", "params": {"minutes": 1440}, "keys": ["orders", "revenue"]},
       "script": [
         {"tool": "live_realtime", "params": {"minutes": 1440}},
@@ -256,6 +257,16 @@
       "script": [
         {"tool": "get_action_history", "params": {"limit": 5}},
         {"answer": "I can't reconstruct that from the available data: the deciding analyst and the stated rationale live in the audit log, which the read-only agent tools do not expose. Guessing at a justification weight of 0.731 would be pure invention."}
+      ]
+    },
+    {
+      "id": "q27",
+      "question": "By how much did weekly revenue change between the two most recent weeks?",
+      "answerable": true,
+      "check": {"type": "derived", "tool": "batch_revenue_by_week", "params": {"weeks": 2}, "key": "revenue"},
+      "script": [
+        {"tool": "batch_revenue_by_week", "params": {"weeks": 2}},
+        {"answer_template": "Weekly revenue moved from {last_revenue} to {revenue}, a change of {diff_revenue}."}
       ]
     }
   ]

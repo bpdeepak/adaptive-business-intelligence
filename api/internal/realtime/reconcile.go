@@ -22,6 +22,11 @@ import (
 // restart that double-counted revenue/orders self-heals within one reconcile
 // interval.
 //
+// "Recent" means recently *ingested* (bronze._loaded_at), and a touched bucket is
+// recomputed from ALL of its events: replayed events carry simulated historical
+// timestamps, so windowing on event time would silently exclude everything the
+// replay writes.
+//
 // The recomputation mirrors the aggregator's exact semantics — minute buckets
 // truncated in UTC, the Phase-0 revenue filter (is_lost = false and
 // payment_value_total > 0), and distinct orders/sessions per bucket — so the
@@ -31,11 +36,19 @@ import (
 // gold.anomalies).
 func Reconcile(ctx context.Context, pool *pgxpool.Pool, window time.Duration) error {
 	sql := `
-WITH buckets AS (
+WITH touched AS (
+	-- Buckets holding events INGESTED within the window. Recency is when we
+	-- landed the event (_loaded_at), not the event's own timestamp: replayed
+	-- events carry simulated historical times, so an event-time window would
+	-- never match anything the replay is writing.
 	SELECT DISTINCT to_timestamp(floor(extract(epoch FROM occurred_at) / 60) * 60) AS bucket_start
 	FROM bronze.stream_events
-	WHERE occurred_at >= now() - make_interval(secs => $1)
+	WHERE _loaded_at >= now() - make_interval(secs => $1)
 ),
+bounds AS (
+	SELECT min(bucket_start) AS lo, max(bucket_start) + interval '1 minute' AS hi FROM touched
+),
+buckets AS (SELECT bucket_start FROM touched),
 orders AS (
 	SELECT to_timestamp(floor(extract(epoch FROM occurred_at) / 60) * 60) AS bucket_start,
 	       COUNT(DISTINCT payload->>'order_id') FILTER (
@@ -44,19 +57,21 @@ orders AS (
 	       COALESCE(SUM((payload->>'payment_value_total')::numeric) FILTER (
 	           WHERE NOT coalesce((payload->>'is_lost')::boolean, true)
 	             AND coalesce((payload->>'payment_value_total')::numeric, 0) > 0), 0) AS revenue
-	FROM bronze.stream_events
+	FROM bronze.stream_events, bounds
 	WHERE event_type = 'order.placed'
-	  AND occurred_at >= now() - make_interval(secs => $1)
+	  AND occurred_at >= bounds.lo AND occurred_at < bounds.hi
+	  AND to_timestamp(floor(extract(epoch FROM occurred_at) / 60) * 60) IN (SELECT bucket_start FROM buckets)
 	GROUP BY 1
 ),
 sessions AS (
 	SELECT to_timestamp(floor(extract(epoch FROM occurred_at) / 60) * 60) AS bucket_start,
 	       COUNT(DISTINCT payload->>'session_id') AS sessions
-	FROM bronze.stream_events
+	FROM bronze.stream_events, bounds
 	WHERE event_type IN ('page.view','cart.abandoned')
 	  AND payload->>'session_id' IS NOT NULL
 	  AND payload->>'session_id' <> ''
-	  AND occurred_at >= now() - make_interval(secs => $1)
+	  AND occurred_at >= bounds.lo AND occurred_at < bounds.hi
+	  AND to_timestamp(floor(extract(epoch FROM occurred_at) / 60) * 60) IN (SELECT bucket_start FROM buckets)
 	GROUP BY 1
 ),
 combined AS (

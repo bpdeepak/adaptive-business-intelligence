@@ -173,6 +173,13 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	defer govReconcileCancel()
 	go func() { _ = reconciler.Run(govReconcileCtx, govRecEvery) }()
 
+	// 4e. Governance observability: domain-bus drops and the approval backlog.
+	// A dropped event costs a proposal until the reconciler recovers it, and a
+	// failed execution is otherwise only a row in the history panel.
+	govMetricsCtx, govMetricsCancel := context.WithCancel(ctx)
+	defer govMetricsCancel()
+	go governanceMetricsLoop(govMetricsCtx, logger, reg, bus, actionsSvc)
+
 	// 5. HTTP (REST + SSE + dashboard + /metrics).
 	srv := httpapi.New(st, logger)
 	srv.AttachLive(feed)
@@ -210,7 +217,7 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	if err := scorewriter.EnsureSchema(ctx, pool); err != nil {
 		return err
 	}
-	swCl, err := kafka.Consumer(cfg.KafkaSeedBrokers, cfg.ConsumerGroupScoreWriter,
+	swCl, err := kafka.ConsumerManualCommit(cfg.KafkaSeedBrokers, cfg.ConsumerGroupScoreWriter,
 		[]string{stream.TopicOrders, stream.TopicClicks})
 	if err != nil {
 		return fmt.Errorf("score-writer consumer: %w", err)
@@ -330,6 +337,35 @@ func loadPlaybooks(path string) ([]playbook.Rule, error) {
 		return playbook.LoadRules(alt)
 	}
 	return nil, fmt.Errorf("playbook file not found (tried %q and %q)", path, alt)
+}
+
+// governanceMetricsLoop publishes the domain bus's publish/drop counters and the
+// approval-queue backlog (pending / failed / stuck-approved / reconciled).
+func governanceMetricsLoop(ctx context.Context, logger *slog.Logger, reg *telemetry.Registry,
+	bus *events.Bus, svc *actions.Service) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reg.Counter("abi_domain_events_published_total", "Domain events published on the in-process bus.").
+				Set(float64(bus.Published()))
+			reg.Counter("abi_domain_events_dropped_total",
+				"Domain-event deliveries dropped for a slow subscriber (the reconciler recovers the proposals).").
+				Set(float64(bus.Dropped()))
+			st, err := svc.Stats(ctx)
+			if err != nil {
+				logger.Warn("governance stats", "error", err)
+				continue
+			}
+			reg.Gauge("abi_governance_pending_actions", "Proposals awaiting a human decision.").Set(float64(st.Pending))
+			reg.Gauge("abi_governance_failed_actions", "Executions that failed and are awaiting a retry.").Set(float64(st.Failed))
+			reg.Gauge("abi_governance_stuck_approved_actions", "Approved actions that never reached executed/failed.").Set(float64(st.Approved))
+			reg.Gauge("abi_governance_reconciled_proposals", "Proposals created by the reconciliation backstop rather than the live bus.").Set(float64(st.Reconciled))
+		}
+	}
 }
 
 // seedBroadcaster publishes the stored recent buckets as the broadcaster's

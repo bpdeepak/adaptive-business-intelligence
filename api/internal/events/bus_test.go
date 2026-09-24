@@ -76,3 +76,17 @@ func TestSubscribeCount(t *testing.T) {
 		t.Fatal("unsubscribe should decrement the count")
 	}
 }
+func TestDroppedDeliveriesAreCounted(t *testing.T) {
+	b := New()
+	_, unsub := b.Subscribe() // never read: the buffer fills
+	defer unsub()
+	for i := 0; i < subBuffer+10; i++ {
+		b.Publish(Event{Type: TypeOrderScored})
+	}
+	if b.Published() != int64(subBuffer+10) {
+		t.Errorf("published = %d, want %d", b.Published(), subBuffer+10)
+	}
+	if b.Dropped() != 10 {
+		t.Errorf("dropped = %d, want 10 (silent drops were the audit's H1 finding)", b.Dropped())
+	}
+}

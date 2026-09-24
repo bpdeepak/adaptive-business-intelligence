@@ -84,7 +84,10 @@ fi
 echo "  realtime buckets ok (${buckets} buckets)"
 
 echo "==> Waiting for an SSE frame on /api/v1/stream/metrics"
-SSE_OUT="$(curl -sN --max-time 12 "$BASE_URL/api/v1/stream/metrics" | head -c 400)"
+# `head` closes the pipe after 400 bytes, which SIGPIPEs curl (exit 23); under
+# `set -o pipefail` that aborted the script whenever frames arrived quickly. The
+# assertion below is on the captured bytes, so the pipeline status is irrelevant.
+SSE_OUT="$(curl -sN --max-time 12 "$BASE_URL/api/v1/stream/metrics" | head -c 400 || true)"
 if ! printf '%s' "$SSE_OUT" | grep -q "event: metrics"; then
   echo "FAIL: no SSE metrics frame" >&2
   exit 1
@@ -182,6 +185,44 @@ except urllib.error.HTTPError as e:  # graceful degrade is the expected path
     code = e.code
 check(code in (502, 503), f"score without sidecar should return 502/503, got {code}")
 print(f"  score degrades ok  {code} without sidecar")
+
+# --- Phase 3/4 surfaces (the smoke test previously covered none of them) ---
+# The governance endpoints are wired unconditionally in cmd/server, so they must
+# answer with well-formed payloads even on an empty queue.
+actions_list = get("/api/v1/actions?limit=5")["data"]
+check(isinstance(actions_list, list), "actions data not a list")
+print(f"  actions ok  {len(actions_list)} rows")
+
+drift = get("/api/v1/model-drift?limit=5")["data"]
+check(isinstance(drift, list), "model-drift data not a list")
+print(f"  model-drift ok  {len(drift)} rows")
+
+# Validation, not state: approving without a reason must be refused (400), and an
+# unknown id must not 500.
+def post(path, payload):
+    req = urllib.request.Request(f"{base}{path}", data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+code = post("/api/v1/actions/1/approve", {"actor": "smoke"})
+check(code == 400, f"approve without a reason should be 400, got {code}")
+code = post("/api/v1/actions/999999999/reject", {"reason": "smoke", "actor": "smoke"})
+check(code == 409, f"deciding a missing action should be 409, got {code}")
+print("  actions validation ok  reason required (400), missing action (409)")
+
+# The agent sidecar is not started in CI: its health/query endpoints must degrade
+# to a clean 503/502 rather than hang or 500.
+try:
+    with urllib.request.urlopen(f"{base}/api/v1/agent/health", timeout=10) as resp:
+        agent_code = resp.status
+except urllib.error.HTTPError as e:
+    agent_code = e.code
+check(agent_code in (200, 502, 503), f"agent/health should be 200/502/503, got {agent_code}")
+print(f"  agent/health ok  {agent_code}")
 
 print("\nSMOKE TEST PASSED")
 PY

@@ -31,6 +31,14 @@ func NewScoreClient(baseURL string) *ScoreClient {
 	}
 }
 
+// RejectedError is the sidecar refusing a request as malformed (HTTP 400) — for
+// example a feature vector missing a feature the model was trained on. It is the
+// caller's fault, not a gateway failure, so the REST layer answers 400 (never a
+// 502) and the score-writer counts it as a contract error.
+type RejectedError struct{ Message string }
+
+func (e *RejectedError) Error() string { return "sidecar rejected request: " + e.Message }
+
 // ScoreResponse is the sidecar's reply for one scoring request.
 type ScoreResponse struct {
 	Status      string          `json:"status"`
@@ -66,6 +74,9 @@ func (c *ScoreClient) Score(ctx context.Context, name string, features map[strin
 	var out ScoreResponse
 	if err := json.Unmarshal(payload, &out); err != nil {
 		return nil, fmt.Errorf("score response %d: %w", resp.StatusCode, err)
+	}
+	if resp.StatusCode == http.StatusBadRequest {
+		return nil, &RejectedError{Message: out.Error}
 	}
 	if resp.StatusCode != http.StatusOK {
 		if out.Error != "" {

@@ -275,3 +275,17 @@ func TestHysteresisStreakRestoresFromSnapshot(t *testing.T) {
 		t.Error("restored streak should surface the next adjacent breach")
 	}
 }
+// A model whose registry row has no threshold must not be tracked: with the
+// zero value every prediction would count as at-risk.
+func TestUnconfiguredThresholdNeverFiresAndIsReported(t *testing.T) {
+	rt := NewRateTracker("fraud_risk", ModelConfig{BaselineRate: 0.01}) // threshold missing
+	if rt.Configured() {
+		t.Fatal("a tracker with no recommended threshold must report Configured() == false")
+	}
+	t0 := time.Date(2018, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 200; i++ {
+		if anom := rt.Observe(t0.Add(time.Duration(i)*time.Second), 0.99); anom != nil {
+			t.Fatalf("unconfigured tracker fired an anomaly at i=%d", i)
+		}
+	}
+}

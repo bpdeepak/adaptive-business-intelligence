@@ -88,12 +88,17 @@ WHERE status = 'active'
 ORDER BY model_name, created_at DESC
 """
 
+# "Valid" = the metrics catalog's population (revenue / orders / aov, defined in
+# Phase 0 and served at /api/v1/metrics): order_status NOT IN ('canceled',
+# 'unavailable') AND payment_value_total > 0. An earlier version used `NOT is_lost`
+# alone, which admitted one zero-payment order and made the agent's AOV (160.26 over
+# 98,207) disagree with the API/dashboard (160.27 over 98,206) — audit item 4.
 _BATCH_OVERVIEW_SQL = """
 SELECT COUNT(*)::int                                   AS total_orders,
-       SUM(CASE WHEN NOT is_lost THEN 1 ELSE 0 END)::int AS valid_orders,
-       ROUND(SUM(CASE WHEN NOT is_lost THEN payment_value_total ELSE 0 END)::numeric, 2) AS valid_revenue,
-       ROUND(SUM(CASE WHEN NOT is_lost THEN payment_value_total ELSE 0 END)::numeric /
-             NULLIF(SUM(CASE WHEN NOT is_lost THEN 1 ELSE 0 END), 0), 2)            AS avg_valid_order_value,
+       SUM(CASE WHEN NOT is_lost AND payment_value_total > 0 THEN 1 ELSE 0 END)::int AS valid_orders,
+       ROUND(SUM(CASE WHEN NOT is_lost AND payment_value_total > 0 THEN payment_value_total ELSE 0 END)::numeric, 2) AS valid_revenue,
+       ROUND(SUM(CASE WHEN NOT is_lost AND payment_value_total > 0 THEN payment_value_total ELSE 0 END)::numeric /
+             NULLIF(SUM(CASE WHEN NOT is_lost AND payment_value_total > 0 THEN 1 ELSE 0 END), 0), 2) AS avg_valid_order_value,
        ROUND(SUM(freight_total)::numeric /
              NULLIF(SUM(items_gross_total + freight_total), 0) * 100, 2)             AS freight_share_pct,
        (SELECT COUNT(DISTINCT customer_unique_id) FROM gold.fct_orders)::int       AS distinct_customers
@@ -107,7 +112,7 @@ SELECT p.product_category                                   AS category,
 FROM gold.fct_orders o
 JOIN gold.fct_order_items i ON i.order_id = o.order_id
 JOIN gold.dim_products p   ON p.product_id = i.product_id
-WHERE NOT o.is_lost
+WHERE NOT o.is_lost AND o.payment_value_total > 0
 GROUP BY p.product_category
 ORDER BY revenue DESC
 LIMIT %s
@@ -154,13 +159,18 @@ ORDER BY entity_id DESC
 LIMIT 16
 """
 
+# NOTE the qualified ORDER BY. The select list aliases to_char(predicted_at) AS
+# predicted_at, and Postgres resolves a bare `ORDER BY predicted_at` to that OUTPUT
+# column (second-resolution text) rather than the table column — rows within one
+# second then come back in arbitrary order, so "the latest score" was not the latest
+# (the source of the eval's long-standing q12 flakiness).
 _MODEL_SCORES_SQL = """
-SELECT entity_id, to_char(predicted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS predicted_at,
-       prediction::float8 AS prediction, confidence::float8 AS confidence,
-       metadata->>'grain' AS grain, metadata->>'source' AS source
-FROM gold.predictions
-WHERE model_name = %s
-ORDER BY predicted_at DESC
+SELECT p.entity_id, to_char(p.predicted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS predicted_at,
+       p.prediction::float8 AS prediction, p.confidence::float8 AS confidence,
+       p.metadata->>'grain' AS grain, p.metadata->>'source' AS source
+FROM gold.predictions p
+WHERE p.model_name = %s
+ORDER BY p.predicted_at DESC, p.id DESC
 LIMIT %s
 """
 
@@ -342,11 +352,11 @@ LIMIT %s
 """
 
 _MODEL_DRIFT_SQL = """
-SELECT model_name, feature, ROUND(psi::numeric, 4)::float8 AS psi,
-       status, kind,
-       to_char(computed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS computed_at
-FROM gold.model_drift
-ORDER BY computed_at DESC, id DESC
+SELECT d.model_name, d.feature, ROUND(d.psi::numeric, 4)::float8 AS psi,
+       d.status, d.kind,
+       to_char(d.computed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS computed_at
+FROM gold.model_drift d
+ORDER BY d.computed_at DESC, d.id DESC
 LIMIT %s
 """
 
@@ -389,7 +399,7 @@ TOOL_SPECS: list[ToolSpec] = [
     ),
     ToolSpec(
         name="batch_overview",
-        description="Headline batch figures over the whole history: total orders, valid revenue, avg order value, freight share.",
+        description="Headline batch figures over the whole history: total orders, valid orders/revenue, avg order value, freight share. 'Valid' is the metrics catalog's population (not canceled/unavailable AND payment > 0), so these match /api/v1/summary and the dashboard.",
         parameters={},
         label=BATCH,
         run=_batch_overview,
@@ -462,7 +472,7 @@ TOOL_SPECS: list[ToolSpec] = [
     ),
     ToolSpec(
         name="get_model_drift",
-        description="Latest model-health findings from the Phase 4 monitor (gold.model_drift): per-feature PSI (ok/warning/critical), forecast/churn decay, model + feature + computed_at.",
+        description="Latest model-health findings from the Phase 4 monitor (gold.model_drift): per-feature PSI (ok/warning/critical) and the forecast backtest-reproduction check (kind=backtest_repro; not live decay), model + feature + computed_at.",
         parameters={"limit": {"type": "integer", "description": "max rows (default 20)"}},
         label=MODEL_HEALTH,
         run=_model_drift,

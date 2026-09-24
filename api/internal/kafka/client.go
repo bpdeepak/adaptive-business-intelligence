@@ -38,6 +38,22 @@ func Consumer(seeds []string, group string, topics []string) (*kgo.Client, error
 	)
 }
 
+// ConsumerManualCommit is Consumer with auto-commit disabled: the caller commits
+// offsets itself, once the state derived from those records is durable. The
+// score-writer uses it so its consumer position and its persisted state
+// (rings, rate windows, dedupe offsets) can never disagree after a restart.
+func ConsumerManualCommit(seeds []string, group string, topics []string) (*kgo.Client, error) {
+	return kgo.NewClient(
+		kgo.SeedBrokers(seeds...),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeTopics(topics...),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.DisableAutoCommit(),
+		kgo.SessionTimeout(15*time.Second),
+		kgo.RetryTimeout(10*time.Second),
+	)
+}
+
 // EnsureTopics creates any missing topics. Idempotent: existing topics are
 // left untouched.
 func EnsureTopics(ctx context.Context, seeds []string, topics []string, partitions int32) error {

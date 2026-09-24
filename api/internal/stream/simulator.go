@@ -340,16 +340,7 @@ func (o *orderSource) buildQueue(rng *rand.Rand, od model.ReplayOrder) {
 
 	queue = append(queue, subevent{
 		env: newEnv(EventOrderPlaced, od.CustomerID, orderTime, o.ls.loopID,
-			OrderPlaced{
-				OrderID:      od.OrderID,
-				CustomerID:   od.CustomerID,
-				Status:       od.Status,
-				PurchaseTime: orderTime,
-				PaymentValue: od.PaymentValue,
-				IsLost:       od.IsLost,
-				Items:        toOrderItems(od.Items),
-				Payments:     toOrderPayments(od.Payments),
-			})})
+			NewOrderPlaced(od, orderTime))})
 
 	// Terminal marker for the completed converting session, placed just after
 	// the last emitted click (scored regardless of bot/human).
@@ -386,6 +377,23 @@ func toOrderItems(items []model.ReplayItem) []OrderItem {
 		})
 	}
 	return out
+}
+
+// NewOrderPlaced builds the order.placed payload the producer emits for one
+// historical order at the given (loop-shifted) purchase time. Exported so the
+// score-writer's train/serve parity test constructs events exactly as the live
+// stream does.
+func NewOrderPlaced(od model.ReplayOrder, at time.Time) OrderPlaced {
+	return OrderPlaced{
+		OrderID:      od.OrderID,
+		CustomerID:   od.CustomerID,
+		Status:       od.Status,
+		PurchaseTime: at,
+		PaymentValue: od.PaymentValue,
+		IsLost:       od.IsLost,
+		Items:        toOrderItems(od.Items),
+		Payments:     toOrderPayments(od.Payments),
+	}
 }
 
 func toOrderPayments(payments []model.ReplayPayment) []OrderPayment {

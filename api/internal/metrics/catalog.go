@@ -45,14 +45,14 @@ const (
 	// not business figures — never additive with any other source.
 	SourceGovernance = "governance"
 	// SourceMonitoring marks model-health findings in gold.model_drift: per-
-	// feature PSI and forecast/churn decay measurements. They describe model
+	// feature PSI and the forecast backtest-reproduction check. They describe model
 	// inputs and error trends, not business value.
 	SourceMonitoring = "monitoring"
 )
 
 // Version is bumped whenever a definition changes. Keep it in sync with the
 // `Metric definitions` table in docs/phase0.md (section 4) and docs/phase1.md.
-const Version = "1.4.0"
+const Version = "1.5.0"
 
 // Default returns the Phase 0 catalog.
 func Default() Catalog {
@@ -90,7 +90,8 @@ func Default() Catalog {
 				SourceTable: "gold.daily_orders; gold.daily_revenue (summary count)",
 				Tags:        []string{"kpi", "count"},
 				Notes: []string{
-					"summary.orders counts the paying, non-lost population (98,206); the raw order count is 99,441. The difference is lost orders (canceled/unavailable). Both are intentional.",
+					"summary.orders counts the paying, non-lost population (98,206); the raw order count is 99,441. The difference is lost orders (canceled/unavailable) plus one non-lost order with no payment. Both are intentional.",
+						"The NL-BI agent's valid_orders / valid_revenue / avg_valid_order_value use exactly this population (98,206 orders, AOV 160.27); there is no separate 'valid' definition.",
 					"daily_orders also exposes delivered_orders and lost_orders as separate splits over ALL orders.",
 				},
 			},
@@ -359,18 +360,20 @@ func Default() Catalog {
 				},
 			},
 			{
-				Name:        "model_forecast_decay",
-				Label:       "Forecast accuracy decay",
+				Name:        "model_backtest_reproduction",
+				Label:       "Forecast backtest reproduction (not live decay)",
 				Source:      SourceMonitoring,
-				Description: "Current WAPE of the newest rolling-origin backtest window for a forecast model versus the baseline WMAPE it registered at training time. Crosses the 1.5x deterioration bound when the model's recent error meaningfully exceeds its own trained behavior.",
+				Description: "WAPE recomputed from the ACTIVE forecast version's persisted held-out predictions, versus the baseline WMAPE the registry recorded when that same version was trained. It verifies the stored backtest evidence is self-consistent (ratio ~ 1.0). It does NOT measure decay: no live ground truth for served forecasts enters it.",
 				Population:  "one (active forecast model, run) row in gold.model_drift",
 				Grain:       "model (computed_at)",
-				Aggregation: "WAPE over the most recent backtest window vs registry metrics.wmape; status from the 1.5x deterioration boundary",
-				Unit:        "ratio (current/baseline WAPE)",
-				SourceTable: "gold.model_drift (kind='forecast_decay')",
-				Tags:        []string{"monitoring", "phase4", "drift"},
+				Aggregation: "WAPE over the active version's held-out rows vs registry metrics.wmape; warning above 1.25x, never critical",
+				Unit:        "WAPE (current); baseline in the row detail",
+				SourceTable: "gold.model_drift (kind='backtest_repro')",
+				Tags:        []string{"monitoring", "phase4", "consistency"},
 				Notes: []string{
-					"Same advisory posture as model_drift_psi: a decay finding can raise the retrain-on-critical-drift proposal, but never silently acts.",
+					"Warning-capped by design: it cannot reach 'critical', so it never raises the retrain-on-critical-drift proposal. Renamed from 'model_forecast_decay' (catalog 1.4.0) because it was never a decay measurement.",
+					"Rows written before 2026-09-24 carry kind='forecast_decay' and mixed model versions; treat them as history of the same check.",
+					"A genuine decay monitor (realised outcomes for served forecasts) is a separate, not-yet-built item.",
 				},
 			},
 		},

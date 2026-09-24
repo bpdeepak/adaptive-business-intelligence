@@ -93,13 +93,17 @@ func TestReconcileBackfillsProposalsFromPersistedRows(t *testing.T) {
 	// into model_registry.metrics, and both the reconciler and the agent SQL
 	// read metrics->>'recommended_threshold'; params holds hyperparameters
 	// only).
+	// The reconciler resolves thresholds from ANY registry version, so these rows are
+	// 'superseded': a temporary *active* fraud_risk row (with no category_rank) would
+	// be picked up by anything else loading the active model while this test runs
+	// (the score-writer parity test did exactly that when packages ran in parallel).
 	saveWatermark(t, pool)
 	if _, err := pool.Exec(ctx, `
 INSERT INTO gold.model_registry
   (model_name, model_version, status, framework, task, grain, artifact_path, params, metrics)
 VALUES
-  ('fraud_risk', $1, 'active', 'fake', 'classification', 'order', '/tmp/fake', '{}'::jsonb, $2::jsonb),
-  ('bot_score',  $1, 'active', 'fake', 'classification', 'session', '/tmp/fake', '{}'::jsonb, $2::jsonb)`,
+  ('fraud_risk', $1, 'superseded', 'fake', 'classification', 'order', '/tmp/fake', '{}'::jsonb, $2::jsonb),
+  ('bot_score',  $1, 'superseded', 'fake', 'classification', 'session', '/tmp/fake', '{}'::jsonb, $2::jsonb)`,
 		ver, `{"recommended_threshold": 0.80}`); err != nil {
 		t.Fatalf("insert registry rows: %v", err)
 	}
@@ -134,7 +138,7 @@ RETURNING id`,
 		if _, err := pool.Exec(ctx, `DELETE FROM gold.model_drift WHERE model_name = $1`, driftModel); err != nil {
 			t.Logf("cleanup drift rows: %v", err)
 		}
-		if _, err := pool.Exec(ctx, `
+		if err := auditMaintenance(ctx, pool, `
 DELETE FROM gold.action_audit_log WHERE action_id IN (
     SELECT id FROM gold.action_queue
     WHERE dedup_key LIKE $1 OR dedup_key LIKE $2 OR dedup_key LIKE $3)`,
@@ -224,6 +228,22 @@ WHERE a.dedup_key LIKE $1`, "hold-high-fraud-order|"+tg+"-ord-1|%").
 		t.Error("hold trigger evidence must carry payload.reconciled=true (recovered, not delivered live)")
 	}
 
+	// The reconciled event has the SAME shape a live score-writer event has (both
+	// come from events.NewScored): every rule-visible scored field is present.
+	var haveFields int
+	if err := pool.QueryRow(ctx, `
+SELECT (trigger->'payload'->'prediction' ? 'id')::int
+     + (trigger->'payload'->'prediction' ? 'threshold')::int
+     + (trigger->'payload'->'registry' ? 'recommended_threshold')::int
+     + (trigger->'payload'->'registry' ? 'positive_rate')::int
+FROM gold.action_queue WHERE dedup_key LIKE $1`, "hold-high-fraud-order|"+tg+"-ord-1|%").Scan(&haveFields); err != nil {
+		t.Fatalf("read reconciled evidence shape: %v", err)
+	}
+	if haveFields != 4 {
+		t.Errorf("reconciled event carries %d/4 of prediction.id, prediction.threshold, "+
+			"registry.recommended_threshold, registry.positive_rate", haveFields)
+	}
+
 	var noteStatus string
 	if err := pool.QueryRow(ctx, `
 SELECT status FROM gold.action_queue
@@ -286,6 +306,24 @@ WHERE dedup_key LIKE $1 OR dedup_key LIKE $2 OR dedup_key LIKE $3`,
 	}
 }
 
+// auditMaintenance runs one statement with the audit log's append-only trigger
+// switched off for this transaction only (SET LOCAL) - test cleanup is the only
+// caller; the service never updates or deletes audit rows.
+func auditMaintenance(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL abi.audit_maintenance = 'on'`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, sql, args...); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // saveWatermark captures the shared 'reconcile' watermark so the test can put
 // it back afterwards (tests and the live server share gold.governance_state).
 func saveWatermark(t *testing.T, pool *pgxpool.Pool) {
@@ -323,5 +361,123 @@ VALUES ('reconcile', $1::jsonb, now())
 ON CONFLICT (key) DO UPDATE SET value = $1::jsonb, updated_at = now()`,
 		fmt.Sprintf(`{"predictions": %d, "drift": %d}`, p, d)); err != nil {
 		t.Fatalf("set start cursor: %v", err)
+	}
+}
+
+// TestReconcileFailsClosedWhenRegistryHasNoThreshold: a model version whose
+// registry metrics carry no recommended_threshold must produce NO threshold
+// fields, so `score >= registry.recommended_threshold` cannot fire. (It used to
+// COALESCE the missing value to 0, which proposes a hold for every order.)
+func TestReconcileFailsClosedWhenRegistryHasNoThreshold(t *testing.T) {
+	pool := governTestPool(t)
+	ctx := context.Background()
+	uniq := fmt.Sprintf("%d", time.Now().UnixNano())
+	tg := "tgnothr" + uniq
+	ver := "it_gov_nothr_" + uniq
+
+	saveWatermark(t, pool)
+	if _, err := pool.Exec(ctx, `
+INSERT INTO gold.model_registry
+  (model_name, model_version, status, framework, task, grain, artifact_path, params, metrics)
+VALUES ('fraud_risk', $1, 'superseded', 'fake', 'classification', 'order', '/tmp/fake', '{}'::jsonb, '{}'::jsonb)`,
+		ver); err != nil {
+		t.Fatalf("insert threshold-less registry row: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM gold.model_registry WHERE model_name = 'fraud_risk' AND model_version = $1`, ver)
+		_, _ = pool.Exec(ctx, `DELETE FROM gold.predictions WHERE entity_id LIKE $1`, tg+"-%")
+		_ = auditMaintenance(ctx, pool, `DELETE FROM gold.action_audit_log WHERE action_id IN (
+			SELECT id FROM gold.action_queue WHERE dedup_key LIKE $1)`, "hold-high-fraud-order|"+tg+"-%")
+		_, _ = pool.Exec(ctx, `DELETE FROM gold.action_queue WHERE dedup_key LIKE $1`, "hold-high-fraud-order|"+tg+"-%")
+	})
+	startCursor(t, pool)
+	if _, err := pool.Exec(ctx, `
+INSERT INTO gold.predictions (model_name, model_version, grain, entity_id, prediction, confidence, metadata)
+VALUES ('fraud_risk', $1, 'order', $2, 0.99, 0.9, '{"source":"stream_score","grain":"order"}'::jsonb)`,
+		ver, tg+"-ord-1"); err != nil {
+		t.Fatalf("insert prediction: %v", err)
+	}
+
+	logger := slog.New(slog.DiscardHandler)
+	engine, err := playbook.NewEngine(events.New(), actions.New(pool, logger), governRules(), logger)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	if err := NewReconciler(pool, engine, governRules(), logger).Once(ctx); err != nil {
+		t.Fatalf("reconcile pass: %v", err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM gold.action_queue WHERE dedup_key LIKE $1`,
+		"hold-high-fraud-order|"+tg+"-%").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("a model version with no recommended_threshold produced %d hold proposals; must fail closed", n)
+	}
+}
+
+// TestReconcileDrainsABacklogInBoundedBatches: each pass reads at most
+// predictionBatch rows and advances the cursor to the last row it handled, so a
+// large backlog (the first pass after deploy) drains over several passes instead
+// of being loaded into memory at once.
+func TestReconcileDrainsABacklogInBoundedBatches(t *testing.T) {
+	pool := governTestPool(t)
+	ctx := context.Background()
+	uniq := fmt.Sprintf("%d", time.Now().UnixNano())
+	tg := "tgbatch" + uniq
+	ver := "it_gov_batch_" + uniq
+
+	old := predictionBatch
+	predictionBatch = 2
+	t.Cleanup(func() { predictionBatch = old })
+
+	saveWatermark(t, pool)
+	if _, err := pool.Exec(ctx, `
+INSERT INTO gold.model_registry
+  (model_name, model_version, status, framework, task, grain, artifact_path, params, metrics)
+VALUES ('fraud_risk', $1, 'superseded', 'fake', 'classification', 'order', '/tmp/fake', '{}'::jsonb, $2::jsonb)`,
+		ver, `{"recommended_threshold": 0.80}`); err != nil {
+		t.Fatalf("insert registry row: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM gold.model_registry WHERE model_name = 'fraud_risk' AND model_version = $1`, ver)
+		_, _ = pool.Exec(ctx, `DELETE FROM gold.predictions WHERE entity_id LIKE $1`, tg+"-%")
+		_ = auditMaintenance(ctx, pool, `DELETE FROM gold.action_audit_log WHERE action_id IN (
+			SELECT id FROM gold.action_queue WHERE dedup_key LIKE $1)`, "hold-high-fraud-order|"+tg+"-%")
+		_, _ = pool.Exec(ctx, `DELETE FROM gold.action_queue WHERE dedup_key LIKE $1`, "hold-high-fraud-order|"+tg+"-%")
+	})
+	startCursor(t, pool)
+	for i := 0; i < 5; i++ {
+		if _, err := pool.Exec(ctx, `
+INSERT INTO gold.predictions (model_name, model_version, grain, entity_id, prediction, confidence, metadata)
+VALUES ('fraud_risk', $1, 'order', $2, 0.95, 0.9, '{"source":"stream_score","grain":"order"}'::jsonb)`,
+			ver, fmt.Sprintf("%s-ord-%d", tg, i)); err != nil {
+			t.Fatalf("insert prediction %d: %v", i, err)
+		}
+	}
+	logger := slog.New(slog.DiscardHandler)
+	engine, err := playbook.NewEngine(events.New(), actions.New(pool, logger), governRules(), logger)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	rec := NewReconciler(pool, engine, governRules(), logger)
+	count := func() int {
+		var n int
+		_ = pool.QueryRow(ctx, `SELECT count(*) FROM gold.action_queue WHERE dedup_key LIKE $1`, "hold-high-fraud-order|"+tg+"-%").Scan(&n)
+		return n
+	}
+	if err := rec.Once(ctx); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if got := count(); got != 2 {
+		t.Fatalf("after one capped pass: %d proposals, want 2 (batch size)", got)
+	}
+	for pass := 2; pass <= 3; pass++ {
+		if err := rec.Once(ctx); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+	if got := count(); got != 5 {
+		t.Fatalf("after draining: %d proposals, want all 5", got)
 	}
 }

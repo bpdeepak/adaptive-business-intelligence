@@ -3,11 +3,20 @@
 Rules (all enforced here, deliberately simple + testable):
 
 * R1  Literal — the number appears (within tolerance) among the values the
-     tools actually returned, OR in the prose-constants table.
+     tools actually returned, a numeric parameter the agent passed to a tool
+     ("last 4 weeks" -> weeks=4), or the small prose-constants table (simulation
+     config only; never model thresholds, which come from the registry).
 * R2  Derived — the number is a documented construction over observed values:
      the exact sum, arithmetic mean or absolute difference of two observed
-     values. (A proportion-of-anything rule is deliberately absent: it accepts
-     *any* number, which would make grounding vacuous.)
+     values OF THE SAME COLUMN (same tool, same provenance label, same field —
+     e.g. two rows of `revenue`), never values from different columns: pairing
+     any two numbers in a result set "derives" a surprising share of arbitrary
+     integers (measured ~7% on the small fixtures) and makes grounding close to
+     vacuous. A difference that the sentence characterises with a direction word
+     (rose / fell / up / down …) must also cite both operands and the direction
+     must agree with them ("fell by 30" about a rising series is refused).
+     (A proportion-of-anything rule is deliberately absent: it accepts *any*
+     number.)
 * R3  Provenance — the answer must never claim a figure that sums batch and
      live_replay series. The pattern check rejects "combined/replay+batch"
      phrasings before any numeric check runs. Since every tool row is labeled,
@@ -29,14 +38,13 @@ from typing import Any, Iterable
 
 from . import tools
 
-# Fixed business constants the answer may repeat in prose without a tool call.
-# Values mirrored from the trained registry rows (fraud/bot thresholds are read
-# from metrics at deploy time; the agent tools surface them too).
+# Fixed constants the answer may repeat in prose without a tool call: only
+# simulation/config values stated in the system prompt. Model thresholds and
+# baseline rates are deliberately NOT here — they live in the model registry and
+# change on every retrain (the fraud threshold moved 0.795 -> 0.81), so a number
+# quoted from memory must come from a registry tool observation, not from a
+# stale constant that "grounds" itself.
 PROSE_CONSTANTS: list[float] = [
-    0.795,  # recommended fraud_risk threshold
-    0.5,    # recommended bot_score threshold
-    0.02,   # bot_score positive rate baseline
-    0.01,   # fraud_risk positive rate baseline (approx, ≥1% floor)
     3.0,    # 3x-baseline rate-anomaly multiplier (Phase 3A)
     0.03,   # session conversion rate (simulator default)
     2880.0,  # replay speed multiplier
@@ -101,29 +109,60 @@ def _strip_month_day(text: str) -> str:
     return _MONTH_DAY_RX.sub(repl, text)
 
 
-def extract_numbers(text: str) -> list[float]:
-    """All numeric claims in the answer.
+# A 1900..2100 integer is a year (a text artifact, not a claim) ONLY in a year-like
+# context: "in 2017", "since 2016", "from 2016 to 2018", "September 17, 2018". A bare
+# "2000" ("a change of 2000", "2,000 orders") is an ordinary number and must be
+# verified — exempting the whole range silently left ~200 integers unchecked.
+_MONTHS = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+           r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+_YEAR_CONTEXT_RX = re.compile(
+    r"(?:\b(?:in|since|during|year|years|fy|until|through|between|from|by|circa)\s+"
+    r"|\b(?:19|20)\d\d\s+(?:to|and|-|–)\s+"
+    r"|\b" + _MONTHS + r"\.?,?\s+(?:\d{1,2}(?:st|nd|rd|th)?,?\s+)?)$",
+    re.IGNORECASE)
 
-    Dates/times are filtered (ISO dates, times, prose month-day dates, and
-    standalone years), as are digit runs inside hex identifiers (order/session
-    ids like ``a1b2c3d4...`` — a digit flanked by hex letters is part of an id,
-    not a claim).
+
+def _is_year_artifact(text: str, start: int, tok: str, value: float) -> bool:
+    if "," in tok or "." in tok or value != int(value) or not (1900 <= value <= 2100):
+        return False
+    return bool(_YEAR_CONTEXT_RX.search(text[max(0, start - 40):start]))
+
+
+def extract_number_spans(text: str) -> list[tuple[float, int]]:
+    """All numeric claims with the character offset they start at (offsets are
+    into the month-day-stripped text, which is what sentence splitting also uses).
+
+    Dates/times are filtered (ISO dates, times, prose month-day dates, and years
+    in a year-like context), as are digit runs inside hex identifiers
+    (order/session ids like ``a1b2c3d4...`` — a digit flanked by hex letters is
+    part of an id, not a claim).
     """
-    out: list[float] = []
-    for m in _CLAIM_RX.finditer(_strip_month_day(text)):
+    out: list[tuple[float, int]] = []
+    stripped = _strip_month_day(text)
+    for m in _CLAIM_RX.finditer(stripped):
         tok = m.group(0)
         # ``98,207`` / ``1,711,258.08`` — drop the grouping commas, then parse.
         v = float(tok.replace(",", ""))
-        # Standalone years (2016..2018 dataset, 2026 deploy) are text artifacts.
-        if v == int(v) and 1900 <= v <= 2100:
+        if _is_year_artifact(stripped, m.start(), tok, v):
             continue
-        out.append(v)
+        out.append((v, m.start()))
     return out
+
+
+def extract_numbers(text: str) -> list[float]:
+    """All numeric claims in the answer (see extract_number_spans)."""
+    return [v for v, _ in extract_number_spans(text)]
 
 
 def observed_values(observations: Iterable[tools.ToolObservation], constants: Iterable[float] | None = None) -> list[float]:
     vals: list[float] = list(constants or PROSE_CONSTANTS)
     for obs in observations:
+        # Numbers the agent itself passed to a tool ("the last 4 weeks" -> weeks=4)
+        # are echoes of the request, not claims about the data. They count for R1
+        # only (never for derivation).
+        for value in (obs.params or {}).values():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                vals.append(float(value))
         for row in obs.rows:
             for key, value in row.items():
                 if isinstance(value, bool):
@@ -137,12 +176,8 @@ def observed_by_label(
     observations: Iterable[tools.ToolObservation],
     constants: Iterable[float] | None = None,
 ) -> dict[str, list[float]]:
-    """Observed values grouped by provenance label.
-
-    Derivation (R2) is only ever computed WITHIN one label: a number made from
-    combining batch and live_replay values is refused even when it is a clean
-    sum of two observed values — provenance may not be mixed.
-    """
+    """Observed values grouped by provenance label (kept for callers/tests that
+    want the per-label view; derivation now uses observed_by_column)."""
     by_label: dict[str, list[float]] = {"constants": list(constants or PROSE_CONSTANTS)}
     for obs in observations:
         bucket = by_label.setdefault(obs.label, [])
@@ -155,35 +190,101 @@ def observed_by_label(
     return by_label
 
 
+def observed_by_column(
+    observations: Iterable[tools.ToolObservation],
+) -> dict[tuple[str, str, str], list[float]]:
+    """Observed numeric values grouped by (provenance label, tool, column).
+
+    R2 derives only WITHIN one group: two rows of the same field from the same
+    tool. That keeps a derivation semantically meaningful (a gap between two
+    revenues, a change between two weekly orders counts) and can never mix
+    batch with live_replay, nor an orders count with a revenue.
+    """
+    groups: dict[tuple[str, str, str], list[float]] = {}
+    for obs in observations:
+        for row in obs.rows:
+            for key, value in row.items():
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, (int, float, Decimal)):
+                    groups.setdefault((obs.label, obs.tool, key), []).append(float(value))
+    return groups
+
+
 def _close(a: float, b: float) -> bool:
     return abs(a - b) <= 1e-6 * max(1.0, abs(b)) + 1e-3
 
 
-def _match_derived(candidate: float, by_label: dict[str, list[float]]) -> bool:
-    """R2: a documented construction over observed values — WITHIN one label.
+_UP_RX = re.compile(
+    r"\b(rose|rise|rises|risen|rising|increase[ds]?|increasing|grew|grow|grows|grown|growth|"
+    r"(?<![-\w])up|higher|gain(?:ed|s)?|climbed|jumped|surged?|improved?)\b", re.IGNORECASE)
+# (the lookbehind keeps hyphenated words such as "runner-up" from reading as a direction)
+_DOWN_RX = re.compile(
+    r"\b(fell|fall|falls|fallen|falling|decrease[ds]?|decreasing|dropped|drop|drops|(?<![-\w])down|lower|"
+    r"declin\w+|shrank|shrink\w*|dipped|reduc\w+|worsen\w*)\b", re.IGNORECASE)
 
-    Supported (deliberately narrow — falsifiability beats recall): the exact
-    sum, arithmetic mean or absolute difference of two observed values (the
-    difference branch answers comparison questions like "how much changed /
-    how much more than": eval q21 is the regression pin). Values are grouped by
-    provenance; batch and live_replay numbers may never be combined into a
-    derivation. A proportion-of-anything rule is NOT supported: it accepts any
-    number (every value is *some* percentage of some other value), which would
-    make grounding vacuous.
-    """
-    for label, vals in by_label.items():
+_SENTENCE_RX = re.compile(r"[^.!?\n]+(?:[.!?](?!\s|$)[^.!?\n]*)*")
+
+
+def _derived_pairs(candidate: float, groups: dict[tuple[str, str, str], list[float]]):
+    """Yield (op, a, b) for every same-column pair whose sum, mean or absolute
+    difference equals `candidate` (R2)."""
+    for vals in groups.values():
         n = len(vals)
-        if n < 2:
-            continue
         for i in range(n):
             for j in range(i + 1, n):
-                if (
-                    _close(candidate, vals[i] + vals[j])
-                    or _close(candidate, (vals[i] + vals[j]) / 2.0)
-                    or _close(candidate, abs(vals[i] - vals[j]))
-                ):
-                    return True
-    return False
+                x, y = vals[i], vals[j]
+                if _close(candidate, x + y):
+                    yield "sum", x, y
+                if _close(candidate, (x + y) / 2.0):
+                    yield "mean", x, y
+                if _close(candidate, abs(x - y)):
+                    yield "diff", x, y
+
+
+def _match_derived(candidate: float, groups: dict[tuple[str, str, str], list[float]]) -> bool:
+    """R2 without the direction check (kept for callers/tests): is `candidate`
+    a sum, mean or absolute difference of two same-column observed values?"""
+    return next(_derived_pairs(candidate, groups), None) is not None
+
+
+def _sentence_around(text: str, pos: int) -> tuple[str, int]:
+    """The sentence containing character `pos` and the offset it starts at."""
+    for m in _SENTENCE_RX.finditer(text):
+        if m.start() <= pos < m.end():
+            return m.group(0), m.start()
+    return text, 0
+
+
+def _direction_verdict(text: str, pos: int, x: float, y: float) -> str | None:
+    """Check a directional claim about a derived difference.
+
+    Returns None when the sentence makes no directional claim (a neutral "gap of
+    30" is fine) or the direction agrees with the operands; otherwise a refusal
+    reason. The operands are read in the order the sentence mentions them
+    ("from 90 to 120": before = 90, after = 120).
+    """
+    sentence, _ = _sentence_around(_strip_month_day(text), pos)
+    up, down = bool(_UP_RX.search(sentence)), bool(_DOWN_RX.search(sentence))
+    if not (up or down):
+        return None
+    if up and down:
+        return "ambiguous direction in a derived difference"
+    mentioned = extract_number_spans(sentence)  # (value, offset within the sentence)
+    xs = [p for v, p in mentioned if _close(v, x)]
+    ys = [p for v, p in mentioned if _close(v, y)]
+    if not xs or not ys:
+        return "a directional claim about a derived difference must cite both values it compares"
+    # Operand order of appearance: the earlier-mentioned one is "before".
+    if min(xs) <= min(ys):
+        before, after = x, y
+    else:
+        before, after = y, x
+    if up and after > before:
+        return None
+    if down and after < before:
+        return None
+    return f"direction contradicts the observed values ({before:g} -> {after:g})"
 
 
 def ground_answer(answer: str, observations: list[tools.ToolObservation]) -> GroundingReport:
@@ -193,24 +294,41 @@ def ground_answer(answer: str, observations: list[tools.ToolObservation]) -> Gro
     if _FORBIDDEN_MIX_RX.search(answer):
         return GroundingReport(False, "answer combines batch and live_replay figures")
 
-    numbers = extract_numbers(answer)
-    if not numbers:
+    spans = extract_number_spans(answer)
+    if not spans:
         # No numeric claims — nothing to verify, but also nothing much said.
         return GroundingReport(True, "no numeric claims")
 
     obs_vals = observed_values(observations)
-    by_label = observed_by_label(observations)
+    groups = observed_by_column(observations)
     unmatched: list[float] = []
-    for n in numbers:
+    reasons: list[str] = []
+    for n, pos in spans:
         if any(_close(n, v) for v in obs_vals):
             continue
-        if _match_derived(n, by_label):
+        matched = False
+        direction_reason = ""
+        for op, x, y in _derived_pairs(n, groups):
+            if op != "diff":
+                matched = True
+                break
+            verdict = _direction_verdict(answer, pos, x, y)
+            if verdict is None:
+                matched = True
+                break
+            direction_reason = verdict
+        if matched:
             continue
         unmatched.append(n)
+        if direction_reason:
+            reasons.append(f"{n:g}: {direction_reason}")
 
     if unmatched:
         pretty = ", ".join(f"{u:g}" for u in unmatched[:8])
-        return GroundingReport(False, f"ungrounded numbers: {pretty}", unmatched=unmatched)
+        detail = f"ungrounded numbers: {pretty}"
+        if reasons:
+            detail += " (" + "; ".join(reasons[:3]) + ")"
+        return GroundingReport(False, detail, unmatched=unmatched)
 
     return GroundingReport(True, "all claims traced")
 

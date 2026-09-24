@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"abi/internal/events"
+	"abi/internal/predict"
 )
 
 func testPool(t *testing.T) *pgxpool.Pool {
@@ -42,33 +43,46 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	if err := EnsureSchema(probeCtx, pool); err != nil {
 		t.Fatalf("ensure monitor schema: %v", err)
 	}
-	// model_drift lives in the predict schema; ensure it here for isolation.
-	if _, err := pool.Exec(probeCtx, `
-CREATE TABLE IF NOT EXISTS gold.model_drift (
-	id bigserial PRIMARY KEY,
-	model_name text NOT NULL,
-	model_version text NOT NULL,
-	computed_at timestamptz NOT NULL DEFAULT now(),
-	feature text NOT NULL,
-	psi double precision NOT NULL,
-	status text NOT NULL,
-	kind text NOT NULL DEFAULT 'psi',
-	detail jsonb NOT NULL DEFAULT '{}'::jsonb
-)`); err != nil {
-		t.Fatalf("ensure model_drift: %v", err)
+	// model_drift lives in the predict schema (single-sourced schema.sql).
+	if err := predict.EnsureSchema(probeCtx, pool); err != nil {
+		t.Fatalf("ensure predict schema: %v", err)
 	}
 	return pool
 }
 
 // uniqueModel derives a model name for this test run so live traffic can never
 // collide with the test rows.
-func uniqueModel(t *testing.T) string {
-	return "it_monitor_" + t.Name()
+func uniqueModel(t *testing.T, pool *pgxpool.Pool) string {
+	model := "it_monitor_" + t.Name()
+	// Leave nothing behind: these rows would otherwise be consumed by the live
+	// Model-health board and the governance reconciler.
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(),
+			`DELETE FROM gold.model_drift WHERE model_name = $1`, model); err != nil {
+			t.Logf("cleanup drift rows: %v", err)
+		}
+	})
+	return model
 }
 
+// resetWatermark clears the poller cursor for the test and restores whatever
+// was there afterwards, so running against a live database never rewinds the
+// real poller.
 func resetWatermark(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
+	var saved []byte
+	err := pool.QueryRow(ctx,
+		`SELECT value::text FROM gold.monitor_state WHERE key = 'drift'`).Scan(&saved)
+	t.Cleanup(func() {
+		if err != nil {
+			_, _ = pool.Exec(ctx, `DELETE FROM gold.monitor_state WHERE key = 'drift'`)
+			return
+		}
+		_, _ = pool.Exec(ctx, `
+INSERT INTO gold.monitor_state (key, value, updated_at) VALUES ('drift', $1::jsonb, now())
+ON CONFLICT (key) DO UPDATE SET value = $1::jsonb, updated_at = now()`, string(saved))
+	})
 	if _, err := pool.Exec(ctx, `DELETE FROM gold.monitor_state WHERE key = 'drift'`); err != nil {
 		t.Fatalf("reset watermark: %v", err)
 	}
@@ -112,7 +126,7 @@ func pollEvents(t *testing.T, pool *pgxpool.Pool) []events.Event {
 func TestPollerBootstrapsAndMergesRuns(t *testing.T) {
 	pool := testPool(t)
 	resetWatermark(t, pool)
-	model := uniqueModel(t)
+	model := uniqueModel(t, pool)
 
 	// Bootstrap: drain whatever un-polled rows exist (on a fresh DB this is
 	// nothing; against live data the poller must happily consume them too),
@@ -161,7 +175,7 @@ func TestPollerBootstrapsAndMergesRuns(t *testing.T) {
 func TestPollerResumesAfterRestart(t *testing.T) {
 	pool := testPool(t)
 	resetWatermark(t, pool)
-	model := uniqueModel(t)
+	model := uniqueModel(t, pool)
 
 	insertDrift(t, pool, model, "feat_a", "ok", time.Now().UTC().Add(-time.Minute))
 	bus := events.New()

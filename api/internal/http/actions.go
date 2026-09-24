@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,8 +16,19 @@ import (
 // the model-health surface). While either is nil their endpoints 503 with a
 // clear message, mirroring how the realtime endpoints gate on AttachLive.
 
+// ActionsService is the slice of *actions.Service the approval-queue handlers use.
+// An interface so the handlers' validation and status mapping are testable without a
+// database (actions.Service satisfies it).
+type ActionsService interface {
+	List(ctx context.Context, status string, limit int) ([]actions.ActionRow, error)
+	Approve(ctx context.Context, id int64, reason, actor string) error
+	Reject(ctx context.Context, id int64, reason, actor string) error
+	Retry(ctx context.Context, id int64, actor string) error
+	Trace(ctx context.Context, id int64) (actions.ActionRow, []actions.AuditRow, error)
+}
+
 // AttachActions activates the approval-queue endpoints (/api/v1/actions/*).
-func (s *Server) AttachActions(svc *actions.Service) { s.actions = svc }
+func (s *Server) AttachActions(svc ActionsService) { s.actions = svc }
 
 // AttachPredict activates the model-health surface (/api/v1/model-drift).
 func (s *Server) AttachPredict(p *predict.Service) { s.predict = p }
@@ -183,7 +195,7 @@ func (s *Server) handleTraceAction(w http.ResponseWriter, r *http.Request) {
 
 // handleModelDrift is GET /api/v1/model-drift?model=&limit= — the model
 // health panel's read surface over gold.model_drift (PSI bands + the honest
-// distinction between distribution drift and real decay, on the kind field).
+// distinction between distribution drift (kind=psi) and the forecast backtest-reproduction check (kind=backtest_repro; not decay), on the kind field).
 func (s *Server) handleModelDrift(w http.ResponseWriter, r *http.Request) {
 	if s.predict == nil {
 		writeError(w, http.StatusServiceUnavailable, "model surface not attached", s.now)

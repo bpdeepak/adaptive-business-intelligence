@@ -10,6 +10,8 @@ import (
 	"os"
 
 	"gopkg.in/yaml.v3"
+
+	"abi/internal/actions"
 )
 
 // Rule is one declarative policy: when an event of Trigger arrives and
@@ -30,6 +32,19 @@ type Rule struct {
 type Config struct {
 	Version int    `yaml:"version"`
 	Rules   []Rule `yaml:"rules"`
+}
+
+// validateRiskTier enforces the auto-tier allow-list at policy load and engine
+// boot: a rule may only claim risk_tier "auto" for an action that
+// actions.AutoAllowed lists. Dormant rules are checked too — the policy file
+// must never contain a rule that could auto-execute a non-allow-listed action
+// the moment someone flips `enabled`.
+func validateRiskTier(r Rule) error {
+	if r.RiskTier == actions.RiskAuto && !actions.AutoAllowed(r.Action) {
+		return fmt.Errorf("playbook %q: action %q is not on the auto-tier allow-list "+
+			"(only human-approved risk_tier: approval_required may run it)", r.Name, r.Action)
+	}
+	return nil
 }
 
 // LoadRules reads + parses config/playbooks.yml. Every rule's condition is
@@ -59,6 +74,9 @@ func LoadRules(path string) ([]Rule, error) {
 		}
 		if _, err := Parse(r.Condition); err != nil {
 			return nil, fmt.Errorf("playbooks %s: rule %q condition invalid: %w", path, r.Name, err)
+		}
+		if err := validateRiskTier(*r); err != nil {
+			return nil, fmt.Errorf("playbooks %s: %w", path, err)
 		}
 	}
 	return cfg.Rules, nil

@@ -32,9 +32,13 @@ app: server producer
 test:
 	cd api && go test ./...
 
-# Real-DB/real-broker integration tests (skip when the stack is down).
+# Real-DB/real-broker integration tests (skip when the stack is down). Same
+# package set as CI. NOTE: the realtime test TRUNCATEs gold.detector_state and
+# trims the shared Kafka topics - point ABI_TEST_DATABASE_URL / ABI_TEST_KAFKA at
+# a scratch database and broker (the realtime test skips unless both are set).
+# -p 1: the suites share one database, so packages run one at a time.
 integration-test:
-	cd api && go test -tags integration -v ./internal/store/ ./internal/realtime/
+	cd api && go test -p 1 -tags integration -v ./internal/store/ ./internal/realtime/ ./internal/predict/ ./internal/actions/ ./internal/govern/ ./internal/monitor/ ./internal/scorewriter/
 
 # Full Phase 1 pipeline in one shot (Linux/macOS/CI).
 bootstrap:

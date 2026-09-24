@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"time"
 
-	"abi/internal/actions"
 	"abi/internal/predict"
 	"abi/internal/realtime"
 	"abi/internal/store"
@@ -27,7 +26,7 @@ type Server struct {
 	live *realtime.LiveFeed
 	// actions + predict are Phase 4 surfaces (approval queue + model health);
 	// while nil their endpoints 503 (see AttachActions / AttachPredict).
-	actions *actions.Service
+	actions ActionsService
 	predict *predict.Service
 }
 

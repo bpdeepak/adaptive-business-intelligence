@@ -36,6 +36,9 @@ func TestModelDetectorDeclaredInServiceInsert(t *testing.T) {
 	if !strings.Contains(string(src), "'model'") {
 		t.Error("service.go no longer writes detector='model' in persistModelAnomaly")
 	}
+	if !strings.Contains(string(src), "detected_at, surfaced)") {
+		t.Error("service.go no longer persists the surfaced flag (banner hysteresis would be SSE-only)")
+	}
 	if !strings.Contains(string(src), "NULL") {
 		t.Error("service.go no longer inserts NULL z_score for model anomalies")
 	}

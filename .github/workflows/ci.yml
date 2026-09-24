@@ -77,14 +77,23 @@ jobs:
       - name: Go vet + unit + integration tests
         env:
           # The integration tests verify real SQL and the live Redpanda ->
-          # Postgres realtime pipeline; they skip when the stack is down.
+          # Postgres realtime pipeline; they skip when the stack is down. The
+          # Phase 4 governance suites (execution guard, retry, dedup, the
+          # reconciler backstop, the drift poller) run here too: they are the
+          # only tests that enforce "propose, don't silently act".
           ABI_TEST_DATABASE_URL: postgres://abi:abi@localhost:5432/abi?sslmode=disable
           ABI_TEST_KAFKA: localhost:29092
+          # The train/serve parity test must RUN here, never silently skip.
+          ABI_REQUIRE_PARITY: "1"
         run: |
+          # Parity compares the Go assembler against the FULL batch feature
+          # table; the ML smoke step above built a --limit subset, so rebuild it
+          # in full (seconds; no training involved).
+          uv run --group ml python ml/build_fraud_features.py
           cd api
           go vet ./...
           go test ./...
-          go test -tags integration ./internal/store/ ./internal/realtime/ ./internal/predict/
+          go test -p 1 -tags integration ./internal/store/ ./internal/realtime/ ./internal/predict/ ./internal/actions/ ./internal/govern/ ./internal/monitor/ ./internal/scorewriter/
 
       - name: Build binaries + end-to-end smoke test
         run: |

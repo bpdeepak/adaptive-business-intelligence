@@ -8,7 +8,8 @@ Usage:
 
 Checks mirror the eval JSON `check` specs and re-run the SAME tool the agent
 used, so expectations can never drift from the SQL. Exits 1 when any question
-fails its check.
+fails its check. A question with `requires_rows` is skipped (visibly) when its tool
+returns nothing, so the real-DB run does not depend on a producer having run recently.
 """
 
 from __future__ import annotations
@@ -210,6 +211,15 @@ def main() -> int:
     for entry in questions:
         if entry.get("skip_when") == args.db:
             print(f"[SKIP] {entry['id']} (intended for db={entry.get('skip_when')})")
+            skip_total += 1
+            continue
+        # Preconditions: some questions are about LIVE replay data, which only exists
+        # while a producer has run recently (realtime buckets are retained for hours,
+        # not forever). Without the data the question is unanswerable, not wrong — skip
+        # it visibly instead of failing an otherwise-correct eval.
+        need = entry.get("requires_rows")
+        if need and not tool_rows(ctx, need["tool"], need.get("params")):
+            print(f"[SKIP] {entry['id']} (needs rows from {need['tool']}: no live replay data in this database)")
             skip_total += 1
             continue
         resp = agent.answer(entry["question"])

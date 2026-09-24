@@ -185,6 +185,11 @@ func (s *Service) handleScore(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.reg.Counter("abi_score_errors_total", "Live scoring failures.").Inc()
 		s.log.Warn("score", "model", req.Model, "error", err)
+		var rejected *RejectedError
+		if errors.As(err, &rejected) {
+			s.writeError(w, http.StatusBadRequest, rejected.Error())
+			return
+		}
 		if resp == nil {
 			s.writeError(w, http.StatusBadGateway, err.Error())
 			return

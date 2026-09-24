@@ -110,8 +110,10 @@ pipeline wrote this row" is answerable for streaming rows too:
 | `_loaded_at` | stamp time |
 | `_kafka_topic`, `_kafka_partition`, `_kafka_offset` | broker coordinates |
 
-Writes are batched multi-row `INSERT … ON CONFLICT (event_id) DO NOTHING`, so
-at-least-once redelivery is idempotent. Retention is **enforced, not just
+Writes are batched multi-row `INSERT … ON CONFLICT (event_id) DO NOTHING`
+(**at most 1,000 rows per statement** — 13 bound parameters per row against
+Postgres' 65,535 limit — with any unwritten rows **re-queued** on failure), so
+at-least-once redelivery is idempotent and a failed flush loses nothing. Retention is **enforced, not just
 documented**: a server-side janitor (`retentionLoop`, every 5 min) deletes rows
 older than the window (`ABI_RETENTION_STREAM_EVENTS`, default **12 h** ≈ 2
 loops at default pace), backed by an index on `_loaded_at`.
@@ -128,7 +130,8 @@ loops at default pace), backed by an index on `_loaded_at`.
 `revenue numeric(12,2)`, `orders int`, `active_sessions int`,
 `anomaly_flag bool`, `updated_at`. Upserted every 5 s (`ON CONFLICT (bucket_start)
 DO UPDATE`). Retained 3 h for the dashboard look-back
-(`ABI_RETENTION_METRICS_BUCKETS`, same janitor).
+(`ABI_RETENTION_METRICS_BUCKETS`, same janitor) — measured from when the bucket
+was last **persisted** (`updated_at`), not from its event time (see below).
 
 **Self-healing against redelivery.** The aggregator dedupes by order id in
 memory, but under at-least-once delivery a consumer restart before an offset
@@ -136,6 +139,37 @@ commit still re-folds a batch into the running sums. A `reconcileLoop` (every
 `ABI_RECONCILE_EVERY`, default 60 s) recomputes the visible window directly
 from the idempotent `bronze.stream_events` landing and overwrites the bucket
 sums — so any double-counted revenue/orders self-corrects within one interval.
+
+**Restart safety (corrected 2026-09-24, audit C10a).** The accumulators alone were
+not enough: the analysis cursor (`lastAnalyzed`) was memory-only, so after a crash
+the broker's redelivered records (auto-commit lags by up to ~5 s = hours of
+simulated minutes at 2880×) were analysed and folded into the restored baseline a
+second time. `gold.aggregator_state` now holds the cursor, saved in one transaction
+with `gold.detector_state`; on restart buckets at or before it are neither
+re-analysed nor re-persisted from their redelivered fraction (which would have
+overwritten the finished row with a smaller sum), and a backwards jump in event
+time of more than an hour (the replay producer starting over at 2016) is treated
+as a new timeline instead of being ignored. A failed baseline save now logs at warn.
+Tests: `aggregator_restart_integration_test.go`, `TestTimelineRestartIsNotIgnored`.
+
+**Time semantics (corrected 2026-09-24, audit C7/C8).** The replay stamps events
+with *simulated* time: 2016-09-04 onward, shifted ~729 days per loop, so it is
+years in the past for the first ~5 loops and in the future after that. Anything
+that asks "how old is this?" therefore uses **ingestion** time —
+`bronze.stream_events._loaded_at`, `gold.realtime_metrics.updated_at`,
+`gold.anomalies.detected_at` — never `occurred_at`/`bucket_start` against `now()`.
+The original bucket retention and reconcile window were event-time based, which
+purged every replayed bucket on the first 5-minute janitor tick and made reconcile
+a no-op for replay data (the integration test hid it by fabricating `now()`-relative
+timestamps). Reconcile now recomputes every bucket touched by a *recently ingested*
+event from all of that bucket's events. Bucket **closure** for anomaly detection
+and in-memory **eviction** follow an event-time watermark (newest event minute seen),
+with an idle-stream fallback to the wall clock, so a still-filling bucket is never
+analysed early or evicted and re-created (which overwrote its sum with a smaller
+partial), and a timeline ahead of the wall clock still closes buckets instead of
+stalling detection and growing memory. The bucket upsert is chunked (1,000 rows per
+statement) so a backlog cannot exceed Postgres' 65,535-parameter limit. Tests:
+`realtime/aggregator_closure_test.go`, `retention_integration_test.go`.
 Detection results survive the pass: `anomaly_flag` is preserved on conflict,
 because the anomaly lifecycle lives in `gold.anomalies`.
 

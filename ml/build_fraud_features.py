@@ -46,7 +46,11 @@ item_cats as (
         cat.order_id,
         coalesce(dp.product_category, 'unknown') as product_category,
         cat.price,
-        row_number() over (partition by cat.order_id order by cat.price desc) as rn
+        -- Deterministic: ties on price (an order with two equally priced items in
+        -- different categories) resolve to the lowest order_item_id. Without it the
+        -- primary category was whichever row the planner returned first, and the
+        -- stream assembler (which walks items in the same id order) could disagree.
+        row_number() over (partition by cat.order_id order by cat.price desc, cat.order_item_id) as rn
     from gold.fct_order_items cat
     left join gold.dim_products dp on dp.product_id = cat.product_id
 ),
@@ -96,6 +100,37 @@ left join pay_primary pp on pp.order_id = o.order_id
 """
 
 
+EPOCH = pd.Timestamp("1970-01-01", tz="UTC")
+
+
+def epoch_seconds(ts: pd.Series) -> pd.Series:
+    """Whole epoch seconds of a tz-aware datetime series, independent of the
+    series' internal resolution.
+
+    The trailing windows below are expressed in seconds (24 h = 86_400, 90 d =
+    7_776_000). pandas 2.x stored datetimes as nanoseconds, so
+    ``astype("int64") // 10**9`` happened to give seconds; pandas 3 stores
+    microseconds, which made every ``_ts`` about 1000x too small — a "24 hour"
+    velocity window silently spanned ~1000 days, the "90 day" benchmark became
+    the lifetime mean, and account_age_days was always 0. Dividing by a
+    Timedelta is correct for any resolution.
+    """
+    return ((ts - EPOCH) // pd.Timedelta(seconds=1)).astype("int64")
+
+
+def _in_event_order(g: pd.DataFrame) -> pd.DataFrame:
+    """Order a group by (timestamp, order_id), stably.
+
+    Orders sharing a timestamp are common (second resolution). "Strictly before
+    this order" is positional within such a tie, and numpy's default sort is not
+    stable, so the tie-break used to be arbitrary and unreproducible. The
+    replay/stream processes ties in (timestamp, order_id) order, so the batch now
+    does too — batch and stream agree exactly, and a rebuild is deterministic.
+    """
+    keys = ["_ts", "order_id"] if "order_id" in g.columns else ["_ts"]
+    return g.sort_values(keys, kind="stable")
+
+
 def trailing_benchmark(orders: pd.DataFrame, window_days: int = 90) -> np.ndarray:
     """Per-order category benchmark: mean order value of the same category's
     orders in the trailing `window_days` (strictly before this order). When
@@ -104,7 +139,7 @@ def trailing_benchmark(orders: pd.DataFrame, window_days: int = 90) -> np.ndarra
     n = len(orders)
     out = np.zeros(n, dtype=float)
     for _, g in orders.groupby("category_primary", sort=False):
-        g = g.sort_values("_ts")
+        g = _in_event_order(g)
         idx = g.index.to_numpy()
         gts = g["_ts"].to_numpy()
         gvals = g["order_value"].to_numpy()
@@ -123,7 +158,7 @@ def trailing_velocity(orders: pd.DataFrame, window_hours: int = 24) -> np.ndarra
     n = len(orders)
     out = np.zeros(n, dtype=float)
     for _, g in orders.groupby("customer_unique_id", sort=False):
-        g = g.sort_values("_ts")
+        g = _in_event_order(g)
         idx = g.index.to_numpy()
         gts = g["_ts"].to_numpy()
         start = np.searchsorted(gts, gts - window_hours * 3600, side="left")
@@ -158,7 +193,7 @@ def main() -> int:
     if args.limit:
         df = df.head(args.limit)
     df["order_purchase_timestamp"] = pd.to_datetime(df["order_purchase_timestamp"], utc=True)
-    df["_ts"] = df["order_purchase_timestamp"].astype("int64") // 10**9
+    df["_ts"] = epoch_seconds(df["order_purchase_timestamp"])
     df["order_value"] = df["order_value"].astype(float)
     df["installments_max"] = df["installments_max"].fillna(1).astype(int)
     df["payment_count"] = df["payment_count"].fillna(0).astype(int)

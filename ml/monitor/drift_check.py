@@ -1,15 +1,18 @@
-"""Phase 4 drift + decay monitor.
+"""Phase 4 drift monitor (+ backtest reproduction check).
 
 Writes per-feature findings into gold.model_drift (the Go API's model-health
-surface). Two drift pipelines plus real-decay checks:
+surface). Two drift pipelines plus one consistency check:
 
 * stream PSI — fraud_risk (order) and bot_score (session): compare the live
   feature vectors the Go score-writer persisted into gold.predictions.features
   against the train-time baseline in gold.model_registry.drift_baseline;
 * batch PSI — churn_risk and the two forecast models: compare the current
   feature-mart rows against the same baseline;
-* forecast decay — current WAPE over served forecast predictions vs the
-  train-time WMAPE recorded in the registry metrics.
+* backtest reproduction (forecasts) — WAPE recomputed from the ACTIVE version's
+  persisted held-out predictions vs the train-time WMAPE in the registry. This
+  verifies the stored evidence is self-consistent; it is not live decay (no
+  realised outcomes for served forecasts exist yet), so it is warning-capped and
+  never proposes a retrain. Real decay detection is a separate, future item.
 
 Each row is one (model, feature, computed_at) measurement. The Go drift poller
 flattens a run by (model, computed_at) into a single event, worst status wins,
@@ -42,7 +45,10 @@ BATCH_MARTS = {
     "forecast_category_weekly_orders": ("gold.feature_forecast_weekly", "week_start"),
 }
 
-FORECAST_DECAY_MODELS = ("forecast_category_weekly_revenue", "forecast_category_weekly_orders")
+BACKTEST_REPRO_MODELS = ("forecast_category_weekly_revenue", "forecast_category_weekly_orders")
+
+# gold.model_drift.kind for the reproduction check (was mislabelled "forecast_decay").
+REPRO_KIND = "backtest_repro"
 
 
 def load_active_models(cur) -> list[dict[str, Any]]:
@@ -65,19 +71,21 @@ def load_active_models(cur) -> list[dict[str, Any]]:
     return out
 
 
-def stream_feature_samples(cur, model: str, grain: str, limit: int) -> dict[str, list[float]]:
-    """Collect recent stream feature vectors per feature for one model."""
+def stream_feature_samples(cur, model: str, version: str, grain: str, limit: int) -> dict[str, list[float]]:
+    """Collect recent stream feature vectors per feature for one model VERSION
+    (vectors scored by a superseded version are not comparable evidence for the
+    active version's baseline)."""
     cur.execute(
         """
         select features
         from gold.predictions
-        where model_name = %s and grain = %s
+        where model_name = %s and model_version = %s and grain = %s
           and metadata->>'source' = 'stream_score'
           and features <> '[]'::jsonb and jsonb_typeof(features) = 'object'
         order by id desc
         limit %s
         """,
-        (model, grain, limit),
+        (model, version, grain, limit),
     )
     by_feature: dict[str, list[float]] = {}
     # dict_row: rows are dicts keyed by column name, so read row["features"].
@@ -121,19 +129,24 @@ def feature_rows(model: str, version: str, computed_at, baseline: dict,
     return rows
 
 
-def forecast_decay(cur, plain_rows, model: str, version: str, computed_at,
-                   metrics: dict) -> list[tuple]:
-    """Current WAPE over served forecast predictions vs train-time WMAPE."""
+def backtest_reproduction(cur, plain_rows, model: str, version: str, computed_at,
+                          metrics: dict) -> list[tuple]:
+    """WAPE recomputed from the active version's persisted held-out predictions
+    (those carrying an ``actual``) vs the WMAPE the registry recorded at training.
+
+    Filtered to ``version``: mixing rows from superseded versions (the previous
+    implementation did) compares one model's predictions with another's metric.
+    """
     cur.execute(
         """
         select prediction, (metadata->>'actual')::float8 as actual
         from gold.predictions
-        where model_name = %s and grain = 'category_week'
-          and metadata ? 'actual'
+        where model_name = %s and model_version = %s
+          and grain = 'category_week' and metadata ? 'actual'
         order by id desc
         limit 2000
         """,
-        (model,),
+        (model, version),
     )
     err_sum = 0.0
     abs_actual = 0.0
@@ -147,18 +160,19 @@ def forecast_decay(cur, plain_rows, model: str, version: str, computed_at,
         abs_actual += abs(float(actual))
         n += 1
     if n < 20 or abs_actual <= 0:
-        return []
+        return plain_rows
     current = err_sum / abs_actual
     baseline_wmape = float(metrics.get("wmape") or current)
-    status = psi.decay_status(current, baseline_wmape)
+    status = psi.reproduction_status(current, baseline_wmape)
     plain_rows.append((model, version, computed_at, "wmape", round(current, 6),
-                       status, "forecast_decay",
-                       json.dumps({"n": int(n), "baseline_wmape": round(baseline_wmape, 6)})))
+                       status, REPRO_KIND,
+                       json.dumps({"n": int(n), "baseline_wmape": round(baseline_wmape, 6),
+                                   "note": "reproduces the registry backtest; not a live-decay measurement"})))
     return plain_rows
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Phase 4 drift + decay monitor (writes gold.model_drift)")
+    ap = argparse.ArgumentParser(description="Phase 4 drift monitor + backtest reproduction check (writes gold.model_drift)")
     ap.add_argument("--limit", type=int, default=5000, help="max sample rows per model")
     ap.add_argument("--min-samples", type=int, default=50, help="min values for a feature to be measured")
     ap.add_argument("--dry-run", action="store_true", help="print what would be written, write nothing")
@@ -177,7 +191,7 @@ def main() -> int:
         for m in models:
             name = m["name"]
             if name in STREAM_MODELS:
-                samples = stream_feature_samples(cur, name, STREAM_MODELS[name], args.limit)
+                samples = stream_feature_samples(cur, name, m["version"], STREAM_MODELS[name], args.limit)
                 rows += feature_rows(name, m["version"], computed_at, m["baseline"],
                                      samples, args.min_samples)
             elif name in BATCH_MARTS:
@@ -185,8 +199,8 @@ def main() -> int:
                 samples = batch_feature_samples(cur, table, order_col, m["baseline"], args.limit)
                 rows += feature_rows(name, m["version"], computed_at, m["baseline"],
                                      samples, args.min_samples)
-            if name in FORECAST_DECAY_MODELS:
-                rows = forecast_decay(cur, rows, name, m["version"], computed_at, m["metrics"])
+            if name in BACKTEST_REPRO_MODELS:
+                rows = backtest_reproduction(cur, rows, name, m["version"], computed_at, m["metrics"])
 
         if args.dry_run:
             print(f"[dry-run] would write {len(rows)} gold.model_drift rows @ {computed_at.isoformat()}")

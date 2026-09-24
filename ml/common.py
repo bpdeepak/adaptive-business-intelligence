@@ -60,6 +60,14 @@ def _load_schema_sql() -> str:
 SCHEMA_SQL = _load_schema_sql()
 
 
+# The Phase 4 governance tables (action queue, audit log, retrain requests, the
+# simulated-effect tables) are likewise defined ONCE, in
+# api/internal/actions/schema.sql, which the Go service embeds. The Python retrain
+# worker (and its tests) load the same file rather than restating the columns.
+_GOVERNANCE_SQL_PATH = pathlib.Path(__file__).resolve().parent.parent / "api" / "internal" / "actions" / "schema.sql"
+GOVERNANCE_SQL = _GOVERNANCE_SQL_PATH.read_text(encoding="utf-8")
+
+
 def conn() -> psycopg.Connection:
     return psycopg.connect(DATABASE_URL)
 
@@ -82,6 +90,12 @@ def ensure_serving_tables() -> None:
         # psycopg3 runs parameter-less statements on the simple-query protocol,
         # so the multi-statement schema.sql executes in a single round-trip.
         c.execute(SCHEMA_SQL)
+
+
+def ensure_governance_tables() -> None:
+    """Idempotent: create the Phase 4 governance tables from the shared DDL."""
+    with conn() as c:
+        c.execute(GOVERNANCE_SQL)
 
 
 # ---------------------------------------------------------------------------

@@ -90,6 +90,13 @@ var schemaDDL = []string{
 	`ALTER TABLE gold.anomalies ADD COLUMN IF NOT EXISTS detector text NOT NULL DEFAULT 'statistical'`,
 	`ALTER TABLE gold.anomalies ALTER COLUMN z_score DROP NOT NULL`,
 
+	// Phase 4 banner hysteresis, persisted (audit C6): a rate anomaly is recorded on
+	// its first breached window but only *surfaced* once the breach persists across
+	// ConsecutiveWindowsRequired windows. Persisting the flag lets the REST path
+	// (which the dashboard calls on every page load) honour it, not just the SSE
+	// frame. Rows that existed before the column keep the visibility they had.
+	`ALTER TABLE gold.anomalies ADD COLUMN IF NOT EXISTS surfaced boolean NOT NULL DEFAULT true`,
+
 	// Online detector accumulators, snapshotted so a server restart resumes the
 	// Welford/anomaly baseline instead of re-warming (a fresh 20-bucket warm-up
 	// would otherwise ride a false-positive burst right after a deploy).
@@ -99,6 +106,15 @@ var schemaDDL = []string{
 		mean        double precision NOT NULL,
 		m2          double precision NOT NULL,
 		updated_at  timestamptz NOT NULL DEFAULT now()
+	)`,
+
+	// The aggregator's analysis cursor (newest closed bucket already folded into
+	// the baseline above). Saved in the SAME transaction as the accumulators so a
+	// restart never re-folds a minute the persisted baseline already contains.
+	`CREATE TABLE IF NOT EXISTS gold.aggregator_state (
+		key        text PRIMARY KEY,
+		value      jsonb NOT NULL DEFAULT '{}'::jsonb,
+		updated_at timestamptz NOT NULL DEFAULT now()
 	)`,
 
 	// Supporting indexes for queries and retention purges.
@@ -121,6 +137,12 @@ func EnsureSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
+// Retention keeps the streaming tables bounded. Every age is measured against
+// when the row was PERSISTED (`_loaded_at`, `updated_at`, `detected_at`), never
+// against the event's own timestamp: the replay stamps events with simulated
+// historical time (2016… shifted ~2 years per loop), so an event-time predicate
+// would purge every replayed bucket on the first tick.
+//
 // Retention keeps the streaming tables bounded: raw events for `keep` duration,
 // one-minute buckets for `bucketKeep`, and the anomaly log for `anomalyKeep`.
 // The replay loop is ~6h at default speed, so 12h of raw events preserves ~2
@@ -134,7 +156,7 @@ func Retention(ctx context.Context, pool *pgxpool.Pool, keep, bucketKeep, anomal
 		return fmt.Errorf("purge stream_events: %w", err)
 	}
 	if _, err := pool.Exec(ctx,
-		`DELETE FROM gold.realtime_metrics WHERE bucket_start < now() - $1::interval`, bucketKeep.String()); err != nil {
+		`DELETE FROM gold.realtime_metrics WHERE updated_at < now() - $1::interval`, bucketKeep.String()); err != nil {
 		return fmt.Errorf("purge realtime_metrics: %w", err)
 	}
 	if _, err := pool.Exec(ctx,

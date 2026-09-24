@@ -102,6 +102,16 @@ func (r *Reconciler) Run(ctx context.Context, every time.Duration) error {
 	}
 }
 
+// Per-pass row caps. Without them the first pass after deploying the backstop
+// (cursor 0) loaded every stream-scored prediction ever persisted into memory at
+// once. A capped pass advances the cursor to the last row it processed and the
+// next tick continues, so a large backlog drains over several passes instead of
+// one unbounded one. Variables so a test can force tiny batches.
+var (
+	predictionBatch = 20000
+	driftBatch      = 20000
+)
+
 // watermark is one cursor per scanned source: the max row id already fully
 // processed for that source.
 type watermark struct {
@@ -161,22 +171,40 @@ func (r *Reconciler) scanPredictions(ctx context.Context, cursor int64) ([]event
 	// The threshold lives in model_registry.metrics (written by the training
 	// pipeline as backtest.recommended_threshold), NOT params — the same
 	// column the live score-writer's rate trackers and the agent SQL read.
+	//
+	// A version with no (or a non-positive) threshold gets NO threshold fields:
+	// the rule then fails closed and never fires. It must never default to 0,
+	// which would make `score >= registry.recommended_threshold` true for every
+	// prediction and flood the queue with holds.
 	type threshKey struct{ model, version string }
-	thresh := map[threshKey]float64{}
+	type registryCfg struct{ threshold, positiveRate *float64 }
+	cfgs := map[threshKey]registryCfg{}
 	tr, err := r.pool.Query(ctx, `
-SELECT model_name, model_version, COALESCE((metrics->>'recommended_threshold')::float8, 0)
+SELECT model_name, model_version,
+       (metrics->>'recommended_threshold')::float8,
+       (metrics->>'positive_rate')::float8
 FROM gold.model_registry`)
 	if err != nil {
 		return nil, cursor, fmt.Errorf("query model_registry: %w", err)
 	}
 	for tr.Next() {
 		var m, v string
-		var t float64
-		if err := tr.Scan(&m, &v, &t); err != nil {
+		var thr, pos *float64
+		if err := tr.Scan(&m, &v, &thr, &pos); err != nil {
 			tr.Close()
 			return nil, cursor, fmt.Errorf("scan model_registry: %w", err)
 		}
-		thresh[threshKey{m, v}] = t
+		cfg := registryCfg{}
+		if thr != nil && *thr > 0 {
+			cfg.threshold = thr
+			// Same floored baseline the live score-writer publishes.
+			base := events.BaselineRate(0)
+			if pos != nil {
+				base = events.BaselineRate(*pos)
+			}
+			cfg.positiveRate = &base
+		}
+		cfgs[threshKey{m, v}] = cfg
 	}
 	tr.Close()
 	if err := tr.Err(); err != nil {
@@ -187,7 +215,8 @@ FROM gold.model_registry`)
 SELECT id, model_name, model_version, grain, entity_id, prediction, confidence, predicted_at
 FROM gold.predictions
 WHERE id > $1 AND metadata->>'source' = 'stream_score'
-ORDER BY id`, cursor)
+ORDER BY id
+LIMIT $2`, cursor, predictionBatch)
 	if err != nil {
 		return nil, cursor, fmt.Errorf("query predictions: %w", err)
 	}
@@ -210,28 +239,17 @@ ORDER BY id`, cursor)
 		if grain == "order" {
 			evType = events.TypeOrderScored
 		}
-		payload := map[string]any{
-			"prediction": map[string]any{
-				"model":         model,
-				"model_version": version,
-				"entity_id":     entity,
-				"score":         score,
-				"confidence":    conf,
-				"id":            id,
-			},
-			// Recovery marker: this proposal was backfilled from the persisted
-			// row, not delivered on the live bus. It rides inside the trigger
-			// evidence the queue row persists, so the trace shows it.
-			"reconciled": true,
-		}
-		if t, ok := thresh[threshKey{model, version}]; ok {
-			// The registry carries the threshold; otherwise the field is
-			// omitted and the rule fails closed on it (never fires without a
-			// threshold to compare against).
-			payload["prediction"].(map[string]any)["threshold"] = t
-			payload["registry"] = map[string]any{"recommended_threshold": t}
-		}
-		out = append(out, events.Event{Type: evType, At: at.UTC(), Payload: payload})
+		cfg := cfgs[threshKey{model, version}]
+		// Built by the same constructor the live score-writer uses, so the two
+		// paths cannot differ in shape. Reconciled=true is the recovery marker: it
+		// rides inside the trigger evidence the queue row persists, so the trace
+		// shows the proposal was backfilled, not delivered live.
+		out = append(out, events.NewScored(evType, events.Scored{
+			Model: model, Version: version, Entity: entity,
+			Score: score, Confidence: conf, PredictionID: id,
+			Threshold: cfg.threshold, PositiveRate: cfg.positiveRate,
+			Reconciled: true,
+		}, at.UTC()))
 	}
 	if err := pr.Err(); err != nil {
 		return nil, cursor, err
@@ -239,31 +257,20 @@ ORDER BY id`, cursor)
 	return out, maxID, nil
 }
 
-// driftRun is one (model, computed_at) measurement run, worst status wins —
-// the same merge the drift poller performs, so the reconstructed event and the
-// dedup keys match exactly what the live path produced.
-type driftRun struct {
-	model       string
-	version     string
-	computedAt  string
-	worst       int
-	worstStatus string
-	maxPSI      float64
-	features    []map[string]any
-}
-
 // scanDrift reconstructs drift_computed events from gold.model_drift rows
-// above the cursor, merged per (model, computed_at) exactly like the poller.
+// above the cursor, merged per (model, computed_at) by the same events.DriftRun
+// the drift poller uses, so the reconstructed event and its dedup key match
+// exactly what the live path produced.
 func (r *Reconciler) scanDrift(ctx context.Context, cursor int64) ([]events.Event, int64, error) {
 	rows, err := r.pool.Query(ctx, `
 SELECT id, model_name, model_version, feature, psi, status, kind, computed_at
-FROM gold.model_drift WHERE id > $1 ORDER BY id`, cursor)
+FROM gold.model_drift WHERE id > $1 ORDER BY id LIMIT $2`, cursor, driftBatch)
 	if err != nil {
 		return nil, cursor, fmt.Errorf("query model_drift: %w", err)
 	}
 	defer rows.Close()
 
-	runs := map[string]*driftRun{}
+	runs := map[string]*events.DriftRun{}
 	maxID := cursor
 	for rows.Next() {
 		var id int64
@@ -280,18 +287,10 @@ FROM gold.model_drift WHERE id > $1 ORDER BY id`, cursor)
 		key := model + "|" + computedAt
 		run, ok := runs[key]
 		if !ok {
-			run = &driftRun{model: model, version: version, computedAt: computedAt, worstStatus: "ok"}
+			run = &events.DriftRun{Model: model, Version: version, ComputedAt: computedAt}
 			runs[key] = run
 		}
-		run.features = append(run.features, map[string]any{
-			"feature": feature, "psi": psi, "status": status, "kind": kind,
-		})
-		if s := driftRank(status); s > run.worst {
-			run.worst, run.worstStatus = s, status
-		}
-		if psi > run.maxPSI {
-			run.maxPSI = psi
-		}
+		run.Add(feature, psi, status, kind)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, cursor, err
@@ -299,40 +298,12 @@ FROM gold.model_drift WHERE id > $1 ORDER BY id`, cursor)
 
 	var out []events.Event
 	for _, run := range runs {
-		out = append(out, events.Event{
-			Type: events.TypeDriftComputed,
-			At:   time.Now().UTC(),
-			Payload: map[string]any{
-				"drift": map[string]any{
-					"model":         run.model,
-					"model_version": run.version,
-					"status":        run.worstStatus,
-					"psi":           run.maxPSI,
-					"feature_count": len(run.features),
-					"features":      run.features,
-					"computed_at":   run.computedAt,
-				},
-				"reconciled": true,
-			},
-		})
+		out = append(out, run.Event(true, time.Now().UTC()))
 		if r.log != nil {
-			r.log.Info("govern: drift run reconstructed",
-				"model", run.model, "status", run.worstStatus, "computed_at", run.computedAt)
+			r.log.Info("govern: drift run reconstructed", "model", run.Model, "computed_at", run.ComputedAt)
 		}
 	}
 	return out, maxID, nil
-}
-
-// driftRank mirrors the poller's worst-takes-all status ordering.
-func driftRank(status string) int {
-	switch status {
-	case "critical":
-		return 2
-	case "warning":
-		return 1
-	default:
-		return 0
-	}
 }
 
 func (r *Reconciler) readWatermark(ctx context.Context) (watermark, error) {

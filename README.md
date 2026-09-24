@@ -23,7 +23,7 @@ revision, and a 20-question regression eval. **Phase 4 governs the machine**:
 a domain event bus + declarative playbook engine (`config/playbooks.yml`) that
 *proposes* actions onto an approval queue; humans approve or reject with a
 mandatory reason and every transition lands in an immutable audit log; a
-drift/decay monitor (PSI over training baselines + forecast decay) turns
+drift monitor (PSI over training baselines + a forecast backtest-reproduction check) turns
 critical findings into governed retrain proposals whose worker trains
 **candidates** — promotions stay a deliberate human flip.
 
@@ -40,7 +40,7 @@ critical findings into governed retrain proposals whose worker trains
 | Agentic BI (Phase 3) | `ml/agent` NL-BI sidecar (stdlib HTTP :8094): 9 provenance-labeled tools (`batch` / `live_replay` / `registry` / `predictions`), grounding v2 (R1 literal · R2 within-label sum/mean/diff · R3 batch/live-mix ban · R4 score-entity trace), one bounded revision then honest refusal, and a 20-question deterministic eval (fake DB + mock LLM) mirrored against the real DB; Go API `POST /api/v1/agent/query` + metrics |
 | Dashboard | Vanilla JS + Chart.js: KPI cards, daily charts, top categories, 7D/30D/90D/All windows, **live revenue/orders/sessions tiles, anomaly banner (statistical + model rate), replay-speed badge — plus Phase 3 forecast confidence band, churn-risk leaderboard, stream-scored fraud feed — plus the Phase 4 approval queue (approve/reject with reason), action history + trace, and model-health board** |
 | Governance (Phase 4) | `api/internal/events` (typed bus, publish-after-write) + `api/internal/playbook` (YAML rules, validated at boot, `dedup_key` UNIQUE) → `gold.action_queue` (approval_required default, auto allow-list for informational rows) + `gold.action_audit_log` (append-only, FK to the queue, every transition has actor/reason/payload) + `gold.retrain_requests` consumed by `ml/monitor/retrain_worker.py` (trains candidates, never auto-promotes); `ml/monitor` PSI/decay pipeline writes `gold.model_drift`, bridged to Go by a watermark-based poller (F5: the table is the contract) |
-| Monitoring (Phase 4) | `ml/monitor/{psi,drift_check,retrain_worker}.py`: 10-bin PSI vs training-matrix `drift_baseline` (ok <0.10 / warning 0.10–0.20 / critical >0.20; NaN→ok, inf→critical), stream PSI from the persisted `features` jsonb (fraud/bot) and batch PSI from the feature marts (churn/forecast), forecast decay vs trained WMAPE (1.5× bound); `make monitor` / `make monitor-worker`; `GET /api/v1/model-drift` |
+| Monitoring (Phase 4) | `ml/monitor/{psi,drift_check,retrain_worker}.py`: 10-bin PSI vs training-matrix `drift_baseline` (ok <0.10 / warning 0.10–0.20 / critical >0.20; NaN→ok, inf→critical), stream PSI from the persisted `features` jsonb (fraud/bot) and batch PSI from the feature marts (churn/forecast), forecast backtest reproduction vs trained WMAPE (warning-capped, not decay); `make monitor` / `make monitor-worker`; `GET /api/v1/model-drift` |
 
 ## Architecture
 
@@ -152,7 +152,7 @@ executor registry  ───► gold.retrain_requests ──► ml/monitor/retra
 ml/monitor/drift_check.py (make monitor) ──► gold.model_drift
    stream PSI  ← gold.predictions.features (fraud/bot)      Go poller (watermark)
    batch PSI   ← feature marts (churn/forecast)             merges one event per
-   forecast decay ← newest backtest WAPE vs trained WMAPE    (model, computed_at)
+   backtest repro ← held-out WAPE vs trained WMAPE            (model, computed_at)
 ```
 
 The Phase 4 posture is **"propose, don't silently act"**: every rule can only
@@ -236,7 +236,7 @@ uv run --group ml python ml/train_all.py  # backtest + register 4 models + write
 uv run --group ml python ml/serve.py      # sidecar http://127.0.0.1:8093 (phase 2 scoring)
 
 # 6. Phase 3: NL-BI agent (run the eval gate, then serve it; mock needs no LLM)
-uv run --group ml python -m ml.agent.eval_agent --db fake --llm mock   # expect 25 passed
+uv run --group ml python -m ml.agent.eval_agent --db fake --llm mock   # expect 26 passed
 uv run --group ml python ml/agent/server.py --mode mock                # agent on :8094
 # after installing Ollama (winget install Ollama.Ollama; ollama pull qwen2.5:7b-instruct),
 # restart the agent with --mode live. The Go API exposes POST /api/v1/agent/query.
@@ -396,8 +396,8 @@ semantic layer that agents should fetch before answering metric questions.
   grounded questions against the local model at ~2–5 s each (§8.1).
 - **Phase 4 (this phase)** — governance: the event bus + playbook engine
   (`config/playbooks.yml` propose-only), the human-in-the-loop approval queue
-  with an append-only audit log, the simulated action registry, drift/decay
-  monitoring (PSI vs training baselines + forecast decay) with
+  with an append-only audit log, the simulated action registry, drift
+  monitoring (PSI vs training baselines + a forecast backtest-reproduction check) with
   retrain-as-governed-action, and the API/dashboard/agent surfaces.
   **Complete and verified** (`docs/phase4.md`): the full loop ran live —
   critical drift → proposal → approve → worker-trained candidate

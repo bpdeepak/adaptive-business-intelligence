@@ -76,7 +76,7 @@ score-writer (consumer group ABI_CONSUMER_GROUP_SCORE_WRITER="score-writer")
 
 Design notes:
 
-- **Feature parity, not approximation**: the fraud vector is rebuilt from the
+- **Feature parity, not approximation** (now *enforced*: `TestFraudFeatureParityWithBatchFeatureTable` replays the dataset's first 25,000 orders through the real assembler and requires all 19 features to equal `gold.feature_fraud_orders`; it found and fixed four skews, see phase4 §11.6): the fraud vector is rebuilt from the
   19-feature spec JSON (`api/internal/scorewriter/fraud_feature_spec.json`) — a
   cross-language contract pinned by a Go text test and Python
   `test_fraud_feature_spec.py`; the bot session vector is assembled from the
@@ -88,16 +88,23 @@ Design notes:
   scramble features.
 - **Ring capacity** (`ABI_SCOREWRITER_BUFFER`) bounds the scoring job queue;
   overflow drops the oldest job (counted, advisory).
-- **Restartable**: features/rings/rate windows snapshot to
-  `gold.scorewriter_state` every `ABI_SCOREWRITER_STATE_EVERY` (default 30 s)
-  so a restarted server resumes detection rather than resetting the baseline.
+- **Restartable, offset-consistent**: features/rings/rate windows **and the
+  consumer position** snapshot to `gold.scorewriter_state` every
+  `ABI_SCOREWRITER_STATE_EVERY` (default 30 s). The consumer runs with
+  auto-commit disabled and commits offsets only *after* a snapshot write succeeds
+  (`kafka.ConsumerManualCommit`), and a restored snapshot skips any record it
+  already covers — so state and stream position cannot disagree after a crash
+  (they used to, by up to the gap between a 30 s snapshot and a ~5 s auto-commit:
+  lost events in the rings one way, double-folded events the other). Events still
+  queued for scoring at a crash are lost (the scoring queue is advisory,
+  drop-oldest); see phase4 §10.2's boundary note.
 
 ### 3.2 Just-in-time decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
 | Session features | `session.end` carries the **full bot feature vector** (producer side, single source) | the producer is the simulation's ground truth; Go must not re-derive bot math |
-| Fraud features | 19-feature spec JSON is the single source; single copy (Go embeds it, Python imports it) | two copies would drift; the cross-language spec test pins equality |
+| Fraud + bot features | one spec JSON per model is the single source (`fraud_feature_spec.json`, `bot_feature_spec.json`); Go embeds it, and the Python trainer's feature list is **pinned to it by a test** (the Python side keeps its own list — it does not import the file) | two copies would drift; the cross-language spec tests pin equality, and the sidecar now refuses a vector missing any feature (phase2 §6.1) |
 | Score persistence | `metadata.source="stream_score"` (Go writes the metadata on insert) | the REST live-score path already tags `"live_score"`; the source filter keeps the surfaces honest |
 | z-score on model anomalies | always `NULL` | rate anomalies have no z-score by construction; the Go insert hardcodes the `detector='model'` + `NULL z_score` shape (pinned by `schema_test.go`) |
 | DDL ownership | `gold.anomalies.detector` column lives in the realtime schema migrations; the score-writer only *writes* `'model'` | single schema file (`schema.go`), pinned by the Go text test |
@@ -115,6 +122,19 @@ bucket wasn't already flagged, the score-writer persists a model anomaly:
 - `severity = "elevated" | "severe"` — severe when `> SevereRateMultiplier × baseline`;
 - `z_score` stays `NULL`; one anomaly per bucket (`RateWindowSecs`) — no
   duplicate storms.
+
+**Banner hysteresis (added in Phase 4, documented here after the audit).** A rate
+anomaly is *persisted* on the first breached 5-minute window — the finding is
+durable and traceable — but it is only *surfaced* on the banner once the breach has
+persisted across `ConsecutiveWindowsRequired` (= 2) **adjacent** windows
+(`ratetrack.go`; a populated window that does not breach resets the streak; the
+streak survives restarts via the snapshot). The flag is stored in
+`gold.anomalies.surfaced`, so the SSE frame *and* `GET /api/v1/anomalies` (which the
+dashboard calls on every page load) both honour it. Statistical anomalies surface as
+they fire. This is a different mechanism from `MinRateSamples` (§7.2: silences
+small-sample lull noise *inside* a window) and from the Phase 4 drift-run merge
+(one retrain proposal per measurement run) — three separate things that earlier
+docs listed under one word.
 
 It can **never** fire from a single prediction: `Observe` needs ≥
 `MinRateSamples` scored events in the window and a window rate above the
@@ -161,7 +181,7 @@ tools, and every decision is verifiable through the response contract.
 
 ### 6.2 Tool layer (`tools.py`)
 
-9 tools, all SELECT-only, row-capped, parameterized (`psycopg3` positional
+9 tools (12 with Phase 4's three governance tools), all SELECT-only, row-capped, parameterized (`psycopg3` positional
 params), each carrying a provenance label:
 
 | Tool | Label | Backing query |
@@ -169,7 +189,7 @@ params), each carrying a provenance label:
 | `batch_overview` | batch | gold semantic layer totals (orders, valid revenue, AOV, distinct customers) |
 | `batch_top_categories` | batch | top categories by revenue |
 | `batch_revenue_by_week` | batch | weekly revenue (anchored to `MAX(order_purchase_timestamp)`) |
-| `batch_distinct_customers` | batch | distinct customer count |
+| `list_models` | registry | active model families (name, version, task, grain, key metrics) |
 | `forecast` | batch | persisted forecast rows for a category (`entity_id LIKE '{cat}@%'`) |
 | `model_scores` | predictions | recent persisted scores for `fraud_risk` / `bot_score` / `churn_risk` |
 | `model_rate` | predictions | at-risk rate vs the registry's own `recommended_threshold` |
@@ -191,24 +211,37 @@ Design details worth keeping:
 Applied to the final answer text against the tool observations of that
 conversation:
 
-- **R1 — literal**: every extracted number must be *observed* in a tool row
-  (including prose constants: 0.795 threshold, 0.5, 0.02, 0.01, 3.0, 0.03,
-  2880× speed).
-- **R2 — derived (within one label only)**: the exact sum, arithmetic mean or
-  absolute difference of **two observed values from the same label** — a
-  comparison answer ("how much more / how much did it change") cites a gap the
-  tools never return directly, and the difference branch grounds it (eval q21
-  is the regression pin). Percentages-of-anything are **not** derived (they
-  accept every number). Crucially, derivation can never mix `batch` +
-  `live_replay`.
+- **R1 — literal**: every extracted number must be *observed* in a tool row, be a
+  numeric **parameter the agent itself passed to a tool** ("the last 4 weeks" →
+  `weeks=4`), or be one of a deliberately tiny set of simulation-config constants
+  (`3.0` anomaly multiplier, `0.03` conversion rate, `2880×` replay speed). Model
+  thresholds and baseline rates are **not** constants: they live in the registry and
+  change on every retrain (the fraud threshold moved 0.795 → 0.81), so they must come
+  from a registry observation.
+- **R2 — derived (same column only)**: the exact sum, arithmetic mean or absolute
+  difference of **two observed values of the same column** (same provenance label,
+  same tool, same field — e.g. two rows of `revenue`, two weeks of `orders`). A
+  comparison answer ("how much more / how much did it change") cites a gap the tools
+  never return directly, and the difference branch grounds it (q21 = gap between two
+  categories, **q27 = change between two weeks**). Pairing values from *different*
+  columns is not derivation: measured on the small fixtures it "grounded" ~7 % of
+  arbitrary integers (audit C12). A difference the sentence characterises with a
+  direction word (rose/fell/increase/drop…) must also **cite both operands** and the
+  direction must agree with them in the order mentioned ("rose from 90 to 120" ✓,
+  "fell from 90 to 120" ✗, "fell by 30" without operands ✗); a neutral "a gap of 30"
+  needs no direction. Percentages-of-anything are **not** derived. Derivation can never
+  mix `batch` + `live_replay`.
 - **R3 — provenance**: bidirectional regex rejects batch+live additive
   phrasings *before* the numeric check; the eval's q17 is the regression trap.
 - **R4 — entity scores**: any 32-hex entity token quoted in the answer must
   exist among the observed `predictions` rows, and a decimal cited next to an
   observed entity must equal the persisted prediction (within tolerance).
 - **Number extraction** skips hex-flanked digits (ids like `a1b2c3…`), ISO
-  date/time separators, trailing `Z`, and standalone years 1900–2100; a
-  sentence-final period is punctuation, not part of a number.
+  date/time separators, trailing `Z`, and years **in a year-like context** (`in 2017`,
+  `since 2016`, `from 2016 to 2018`, `September 17, 2018`) — a bare number in
+  1900–2100 ("a change of 2000") is an ordinary claim; the earlier blanket year
+  exemption left ~200 integers unchecked. A sentence-final period is punctuation,
+  not part of a number.
 
 ### 6.4 Response contract
 
@@ -227,7 +260,7 @@ dashboard/agent can see at a glance which surfaces a claim rests on.
 
 ### 6.5 Eval set (`eval_questions.json`) — the regression gate
 
-20 questions: 16 answerable (grounded facts + derivations + tool labels) and
+26 questions today (ids skip q18): the original 20 were 16 answerable (grounded facts + derivations + tool labels) and
 **4 unanswerable** (q14 gross-margin-invention, q15 defect-return-rate
 invention, q16 product-percentage invention, **q17 batch+live sum trap**) —
 plus q19 (anomaly citation) which runs in the deterministic fake suite only,
@@ -265,11 +298,11 @@ Gates:
   | Figure | Value | Definition |
   |---|---|---|
   | total orders | **99,441** | `COUNT(*)` over `gold.fct_orders` |
-  | valid orders | **98,207** | the `NOT is_lost` subset |
+  | valid orders | **98,206** | the catalog's paying, non-lost population: `NOT is_lost AND payment_value_total > 0` (99,441 total − 1,234 lost − 1 zero-payment order; the earlier `NOT is_lost`-only definition gave 98,207) |
   | valid revenue | **15,739,137.01** | `SUM(payment_value_total)` restricted to `NOT is_lost` — the tool's `valid_revenue` (a previous doc said "sum over non-lost" while the SQL summed *all* orders: 16,008,872.12) |
-  | AOV | **160.26** | valid revenue ÷ valid orders, same `NOT is_lost` predicate on numerator and denominator (previously the numerator summed all orders → 163.01) |
+  | AOV | **160.27** | valid revenue ÷ valid orders over that same population — identical to `/api/v1/summary`, `daily_aov` and the metrics catalog (history: 163.01 with the numerator over all orders, then 160.26 over 98,207 before the 2026-09-24 alignment, audit item 4) |
   | distinct customers | **96,096** | `COUNT(DISTINCT customer_unique_id)` |
-  | fraud at-risk | **221 / 19,889 (1.11%)** | at the registry's 0.795 threshold |
+  | fraud at-risk | **221 / 19,889 (1.11%)** | at the then-active 0.795 threshold, over the test-split rows only (2026-09-23). The `model_rate` tool now counts **all** persisted fraud predictions at the registry's *current* threshold, so today's figure is different by construction |
   | top category | `bed_bath_table`, **1,711,258.08** | `batch_top_categories` revenue |
 
   Live buckets are the latest replay epoch; `gold.anomalies` pre-migration rows
@@ -278,8 +311,11 @@ Gates:
   which the observed-values walker must cast like floats — the fake (floats)
   had masked it.
 - A wall-clock subtlety: the live window is anchored to the **latest replay
-  bucket**, not `now()` (a replay that stopped yesterday must still be the
-  live view; `now()`-based windows went empty).
+  bucket**, not `now()` (a replay that stopped a while ago must still be the
+  live view; `now()`-based windows went empty). The look-back is bounded by the
+  3 h bucket retention, now measured from when a bucket was last *persisted* —
+  before the 2026-09-24 audit fix it was event-time based and purged replayed
+  buckets within minutes (phase1 §4.3).
 - **Live LLM smoke (Ollama Qwen2.5-7B-Instruct, Q4_K_M)**: the sidecar in
   `--mode live` grounded `q01` (99,441 orders), `q04` (`bed_bath_table`,
   1,711,258.08), the weekly series and the batch/live-sum trap — 2.0–5.0 s per
@@ -357,13 +393,15 @@ OpenAI-compatible endpoint), then run the agent sidecar with
 - **R4 is recall-limited**: it detects fabricated scores for observed entities
   and refuses unknown-entity citations, but does not positive-verify prose
   claims that carry no number.
-- **Stream-stat restart safety is verified, not changed**: the realtime
-  aggregator's Welford baseline survives restarts — `SaveDetectorState` runs
-  after every flush and `LoadDetectorState`/`restoreBaseline` replay the last
-  snapshot at boot ("aggregator: detector baseline restored, metrics:2", with
-  a round-trip test at `integration_test.go`) — so a consumer restart never
-  zeroes the mean/variance history or re-deduces drift. No code change was
-  needed on review.
+- **Stream-stat restart safety (corrected by the 2026-09-24 audit, C10).** The
+  realtime aggregator's Welford baseline was persisted after every flush
+  (`SaveDetectorState`) and restored at boot, but the *analysis cursor* — which
+  minutes are already folded into it — lived only in memory, so a crash's
+  redelivered records were folded in a second time. The cursor now lives in
+  `gold.aggregator_state`, written in the **same transaction** as the accumulators
+  (`SaveDetectorStateAt`), and buckets at or before the restored cursor are never
+  re-analysed or re-persisted from a redelivered fraction (phase1 §4.5, phase4 §11.8).
+  The score-writer snapshot now also carries its consumer offsets (§3.1).
 - **The local-LLM choice is deliberate, and safe because of the verification
   layer**: a less capable base model is a conscious trade-off (self-hosted,
   free, no per-token cost, no vendor API) whose risk is absorbed by the

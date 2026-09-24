@@ -69,12 +69,16 @@ def test_status_bands() -> None:
     assert psi.status_for(float("inf")) == "critical"
 
 
-def test_decay_status_ratio_bands() -> None:
-    assert psi.decay_status(0.10, 0.10) == "ok"
-    assert psi.decay_status(0.10, 0.20) == "ok"          # improvement stays ok
-    assert psi.decay_status(0.12, 0.10) == "ok"          # within 1.25x
-    assert psi.decay_status(0.15, 0.10) == "warning"     # >1.25x
-    assert psi.decay_status(0.21, 0.10) == "critical"    # >2x
+def test_reproduction_status_bands_and_is_warning_capped() -> None:
+    # Deliberate redesign (audit C11): this check re-reads the registry's own
+    # held-out predictions, so it cannot establish decay and must never reach
+    # "critical" (which would propose a retrain).
+    assert psi.reproduction_status(0.10, 0.10) == "ok"
+    assert psi.reproduction_status(0.10, 0.20) == "ok"          # improvement stays ok
+    assert psi.reproduction_status(0.12, 0.10) == "ok"          # within 1.25x
+    assert psi.reproduction_status(0.15, 0.10) == "warning"     # >1.25x
+    assert psi.reproduction_status(9.0, 0.10) == "warning"      # 90x off: still only a warning
+    assert psi.reproduction_status(0.5, 0.0) == "ok"            # no baseline -> nothing to compare
 
 
 # ---------------------------------------------------------------------------

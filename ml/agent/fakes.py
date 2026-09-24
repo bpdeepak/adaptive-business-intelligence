@@ -77,11 +77,11 @@ def _route(sql: str, params: Any) -> tuple[list[str], list[tuple[Any, ...]]]:
     if "COUNT(DISTINCT customer_unique_id)" in sql and "model_registry" not in sql:
         return (["total_orders", "valid_orders", "valid_revenue", "avg_valid_order_value",
                  "freight_share_pct", "distinct_customers"],
-                [(99441, 98207, 15739137.01, 160.26, 16.24, 96096)])
+                [(99441, 98206, 15739137.01, 160.27, 16.24, 96096)])
     if "DATE_TRUNC('week'" in sql:
         return (["week_start", "orders", "revenue"],
-                [("2018-09-17", 1, 0.0), ("2018-09-24", 3, 0.0),
-                 ("2018-10-01", 2, 0.0), ("2018-10-15", 2, 0.0)])
+                [("2018-08-27", 512, 87126.0), ("2018-08-20", 498, 80211.55),
+                 ("2018-08-13", 475, 75002.4), ("2018-08-06", 460, 71234.1)])
     if "ORDER BY revenue DESC" in sql:
         return (["category", "orders", "revenue"],
                 [("bed_bath_table", 16815, 1711258.08),
@@ -98,7 +98,7 @@ def _route(sql: str, params: Any) -> tuple[list[str], list[tuple[Any, ...]]]:
         return (["model_name", "entity_id", "prediction"],
                 [("forecast_category_weekly_orders", "health_beauty@2018-10-15", 11.7),
                  ("forecast_category_weekly_revenue", "health_beauty@2018-10-15", 1892.4)])
-    if "prediction::float8 AS prediction, confidence" in sql:
+    if "AS prediction, p.confidence::float8 AS confidence" in sql:
         return (["entity_id", "predicted_at", "prediction", "confidence", "grain", "source"],
                 [("a1b2c3d4e5f60718293a4b5c6d7e8f90", "2026-09-19T18:21:00Z", 0.93, 0.81, "order", "batch"),
                  ("11c2f39aa257cc2f6e9d9d302e2e2a11", "2026-09-19T18:21:01Z", 0.41, 0.79, "session", "stream_score")])

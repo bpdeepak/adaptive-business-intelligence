@@ -22,11 +22,19 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"abi/internal/events"
 	"abi/internal/stream"
 )
 
 //go:embed fraud_feature_spec.json
 var fraudSpecJSON []byte
+
+// botSpecJSON is the bot model's feature contract, shared with the Python
+// trainer the same way (see bot_feature_spec.json; both sides are tested
+// against it). BotFeatures itself stays a plain field mapping.
+//
+//go:embed bot_feature_spec.json
+var botSpecJSON []byte
 
 // FeatureSpec is the embedded fraud feature contract (names in manifest order).
 type FeatureSpec struct {
@@ -78,6 +86,20 @@ type References struct {
 	ProductCategory map[string]string
 	CategoryRank    map[string]int
 	Models          map[string]ModelConfig
+	// CustomerKey maps the per-order customer_id carried on order events to the
+	// person (customer_unique_id) the batch features group by. Olist mints a new
+	// customer_id for every order, so keying velocity / account age by the event's
+	// customer_id would never see a repeat customer.
+	CustomerKey map[string]string
+}
+
+// customerKey resolves an event's customer_id to the batch grouping key
+// (customer_unique_id); an id the reference table has never seen is its own key.
+func (r *References) customerKey(customerID string) string {
+	if k, ok := r.CustomerKey[customerID]; ok {
+		return k
+	}
+	return customerID
 }
 
 // LoadReferences snapshots the reference tables at boot, mirroring how the
@@ -88,21 +110,10 @@ func LoadReferences(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (
 		ProductCategory: map[string]string{},
 		CategoryRank:    map[string]int{},
 		Models:          map[string]ModelConfig{},
+		CustomerKey:     map[string]string{},
 	}
 
-	prodRows, err := pool.Query(ctx, `SELECT product_id, product_category FROM gold.dim_products`)
-	if err != nil {
-		return nil, fmt.Errorf("load product categories: %w", err)
-	}
-	defer prodRows.Close()
-	for prodRows.Next() {
-		var pid, cat string
-		if err := prodRows.Scan(&pid, &cat); err != nil {
-			return nil, fmt.Errorf("scan product category: %w", err)
-		}
-		ref.ProductCategory[pid] = cat
-	}
-	if err := prodRows.Err(); err != nil {
+	if err := loadStaticReferences(ctx, pool, ref); err != nil {
 		return nil, err
 	}
 
@@ -144,13 +155,17 @@ WHERE model_name IN ('fraud_risk', 'bot_score') AND status = 'active'`)
 		if err := json.Unmarshal(raw, &mm); err != nil {
 			return nil, fmt.Errorf("parse registry metrics for %s: %w", name, err)
 		}
-		base := mm.PositiveRate
-		if base < 0.01 {
-			base = 0.01
+		if mm.RecommendedThreshold <= 0 {
+			// Leave the threshold unset (zero): the tracker stays silent and the
+			// governance events omit threshold fields (fail closed), instead of
+			// treating a missing registry value as "everything is at risk".
+			log.Warn("scorewriter: active model has no recommended_threshold; "+
+				"rate anomalies and threshold-based playbook rules are disabled for it",
+				"model", name)
 		}
 		ref.Models[name] = ModelConfig{
 			RecommendedThreshold: mm.RecommendedThreshold,
-			BaselineRate:         base,
+			BaselineRate:         events.BaselineRate(mm.PositiveRate),
 		}
 	}
 	if err := modelRows.Err(); err != nil {
@@ -165,6 +180,44 @@ WHERE model_name IN ('fraud_risk', 'bot_score') AND status = 'active'`)
 		"bot_threshold", ref.Models["bot_score"].RecommendedThreshold,
 		"bot_baseline", ref.Models["bot_score"].BaselineRate)
 	return ref, nil
+}
+
+// loadStaticReferences fills the registry-independent reference tables: the
+// customer_id -> customer_unique_id identity map and product -> category.
+func loadStaticReferences(ctx context.Context, pool *pgxpool.Pool, ref *References) error {
+	custRows, err := pool.Query(ctx, `SELECT customer_id, customer_unique_id FROM gold.fct_orders`)
+	if err != nil {
+		return fmt.Errorf("load customer identities: %w", err)
+	}
+	defer custRows.Close()
+	for custRows.Next() {
+		var cid, uid string
+		if err := custRows.Scan(&cid, &uid); err != nil {
+			return fmt.Errorf("scan customer identity: %w", err)
+		}
+		ref.CustomerKey[cid] = uid
+	}
+	if err := custRows.Err(); err != nil {
+		return err
+	}
+
+	prodRows, err := pool.Query(ctx, `SELECT product_id, product_category FROM gold.dim_products`)
+	if err != nil {
+		return fmt.Errorf("load product categories: %w", err)
+	}
+	defer prodRows.Close()
+	for prodRows.Next() {
+		var pid, cat string
+		if err := prodRows.Scan(&pid, &cat); err != nil {
+			return fmt.Errorf("scan product category: %w", err)
+		}
+		ref.ProductCategory[pid] = cat
+	}
+	if err := prodRows.Err(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // FraudAssembler builds the fraud feature vector from an order event plus the
@@ -209,7 +262,7 @@ func primaryPayment(payments []stream.OrderPayment) *stream.OrderPayment {
 // over `order by price desc`).
 func (a *FraudAssembler) primaryCategory(items []stream.OrderItem) string {
 	if len(items) == 0 {
-		return ""
+		return "unknown" // batch: category_primary fillna('unknown')
 	}
 	best := items[0]
 	for _, it := range items[1:] {
@@ -227,7 +280,7 @@ func (a *FraudAssembler) primaryCategory(items []stream.OrderItem) string {
 // (batch: count(distinct coalesce(dim_products.product_category,'unknown'))).
 func (a *FraudAssembler) categoryCount(items []stream.OrderItem) int {
 	if len(items) == 0 {
-		return 0
+		return 1 // batch: categories_count fillna(1) for an order with no item rows
 	}
 	seen := make(map[string]struct{}, 1)
 	for _, it := range items {
@@ -253,7 +306,7 @@ func (a *FraudAssembler) categoryCode(cat string) float64 {
 // BEFORE the order is recorded; the caller then records it (Rings.RecordOrder).
 func (a *FraudAssembler) Assemble(od stream.OrderPlaced, r *Rings) map[string]float64 {
 	t := float64(od.PurchaseTime.Unix())
-	velocity, ageDays := r.Velocity(od.CustomerID, t)
+	velocity, ageDays := r.Velocity(a.ref.customerKey(od.CustomerID), t)
 	cat := a.primaryCategory(od.Items)
 	benchCount, benchSum := r.Benchmark(cat, t)
 
@@ -296,8 +349,12 @@ func (a *FraudAssembler) Assemble(od stream.OrderPlaced, r *Rings) map[string]fl
 
 	f["velocity_24h"] = float64(velocity)
 	f["account_age_days"] = float64(ageDays)
-	f["order_hour"] = float64(od.PurchaseTime.Hour())
-	f["is_weekend"] = boolToFloat(od.PurchaseTime.Weekday() == time.Saturday || od.PurchaseTime.Weekday() == time.Sunday)
+	// Batch derives hour/weekday from the UTC timestamp. The event's time.Time
+	// carries whatever zone its producer marshalled (pgx returns the machine's
+	// local zone), so normalise to UTC before reading the calendar fields.
+	pt := od.PurchaseTime.UTC()
+	f["order_hour"] = float64(pt.Hour())
+	f["is_weekend"] = boolToFloat(pt.Weekday() == time.Saturday || pt.Weekday() == time.Sunday)
 	f["is_lost"] = boolToFloat(od.IsLost)
 
 	// pay_* one-hots from the primary payment type; no rows → 'unknown'. The

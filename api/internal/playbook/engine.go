@@ -49,6 +49,9 @@ func NewEngine(bus *events.Bus, svc Proposer, rules []Rule, log *slog.Logger) (*
 		if err := validateRuleFields(r, n); err != nil {
 			return nil, err
 		}
+		if err := validateRiskTier(r); err != nil {
+			return nil, err
+		}
 		if !r.Enabled {
 			e.log.Info("playbook: rule dormant", "rule", r.Name, "reason", "enabled: false")
 			continue

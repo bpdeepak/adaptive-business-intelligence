@@ -255,3 +255,47 @@ func TestDedupKeyScopedToTriggerInstance(t *testing.T) {
 		t.Errorf("dedup keys = %q, %q; want r|a|1001, r|a|1002", first, second)
 	}
 }
+
+func TestBootRejectsAutoTierOnNonAllowListedAction(t *testing.T) {
+	// risk_tier "auto" is an allow-list, not a self-service label: a rule cannot
+	// grant itself auto-execution for an action outside actions.AutoAllowed —
+	// enabled or dormant (flipping `enabled` must never be the moment it arms).
+	for _, enabled := range []bool{true, false} {
+		rules := []Rule{
+			{Name: "sneaky", Trigger: "drift_computed", Condition: "drift.status == 'critical'",
+				Action: "retrain_model", RiskTier: "auto", Enabled: enabled},
+		}
+		fake := &fakeActions{has: map[string]bool{"retrain_model": true}}
+		_, err := NewEngine(events.New(), fake, rules, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err == nil {
+			t.Fatalf("enabled=%v: engine booted a rule that auto-executes retrain_model", enabled)
+		}
+	}
+}
+
+func TestAutoAllowListIsOnlyInformationalActions(t *testing.T) {
+	for _, a := range []string{"hold_order_for_review", "release_order", "retrain_model",
+		"draft_purchase_order", "propose_retention_offer"} {
+		if actions.AutoAllowed(a) {
+			t.Errorf("%s must never be auto-executable", a)
+		}
+	}
+	for _, a := range []string{"log_event_note", "log_retention_email"} {
+		if !actions.AutoAllowed(a) {
+			t.Errorf("%s is the informational allow-list and must stay auto-executable", a)
+		}
+	}
+}
+
+// TestProducerEventsCarryThePredictionIdThatScopesDedup: the H2 dedup key is
+// only instance-scoped if every producer's scored event carries prediction.id.
+// The events package constructor is what the score-writer AND the reconciler
+// both use, so pinning it here pins both paths.
+func TestProducerEventsCarryThePredictionIdThatScopesDedup(t *testing.T) {
+	ev := events.NewScored(events.TypeOrderScored, events.Scored{
+		Model: "fraud_risk", Entity: "o-1", PredictionID: 4242,
+	}, time.Now())
+	if got, want := dedupKey("r", ev), "r|o-1|4242"; got != want {
+		t.Fatalf("dedupKey = %q, want %q", got, want)
+	}
+}

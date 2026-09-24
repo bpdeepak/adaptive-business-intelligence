@@ -289,3 +289,22 @@ func TestPredictModelsHealth(t *testing.T) {
 		t.Fatalf("active_models = %v, want >= 1", health["active_models"])
 	}
 }
+// A sidecar 400 (feature vector incomplete) reaches the caller as 400, not 502.
+func TestPredictScoreIncompleteFeaturesIs400(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"missing features for fraud_risk: velocity_24h"}`)
+	}))
+	defer srv.Close()
+	_, mux := newServiceMux(t, NewScoreClient(srv.URL))
+	rec, env := doReq(t, mux, http.MethodPost, "/api/v1/score", model.ScoreRequest{
+		Model: "fraud_risk", EntityID: "x", Features: map[string]float64{"order_value": 1},
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if env.Error == "" {
+		t.Fatal("expected the sidecar's missing-feature message")
+	}
+}

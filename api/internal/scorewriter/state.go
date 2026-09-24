@@ -6,9 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 // ScoreWriterKeys identify the state rows in gold.scorewriter_state.
@@ -77,26 +81,116 @@ SELECT payload::text FROM gold.scorewriter_state WHERE key = $1`, key).Scan(&raw
 	return raw, nil
 }
 
-// State is the composite snapshot: rings + per-model rate traces.
+// State is the composite snapshot: rings + per-model rate traces + the consumer
+// position the rings/rates correspond to. Offsets make the snapshot
+// self-consistent with the stream: on restart the consumer resumes exactly where
+// the state left off, and anything at or below these offsets that is delivered
+// again (a commit that lagged the snapshot) is skipped rather than folded twice.
 type State struct {
-	Rings *RingsSnapshot           `json:"rings"`
-	Rates map[string]*RateTrace    `json:"rates"`
+	Rings *RingsSnapshot        `json:"rings"`
+	Rates map[string]*RateTrace `json:"rates"`
+	// Offsets is the next offset to process per "topic|partition".
+	Offsets map[string]int64 `json:"offsets,omitempty"`
 }
 
-// SnapshotState collects everything the score-writer wants to resume from.
-func (s *Service) SnapshotState(ctx context.Context) {
-	rings := s.rings.Snapshot()
+// tp identifies one topic partition.
+type tp struct {
+	topic     string
+	partition int32
+}
+
+func (p tp) key() string { return fmt.Sprintf("%s|%d", p.topic, p.partition) }
+
+func parseTP(k string) (tp, bool) {
+	i := strings.LastIndex(k, "|")
+	if i < 0 {
+		return tp{}, false
+	}
+	n, err := strconv.ParseInt(k[i+1:], 10, 32)
+	if err != nil {
+		return tp{}, false
+	}
+	return tp{topic: k[:i], partition: int32(n)}, true
+}
+
+// snapshot assembles the state under the position lock.
+func (s *Service) snapshot() *State {
 	rates := map[string]*RateTrace{}
 	for name, rt := range s.rates {
 		rates[name] = rt.Snapshot()
 	}
-	state := &State{Rings: rings, Rates: rates}
-	if err := s.state.Save(ctx, StateKeyRings, state); err != nil {
-		s.log.Debug("scorewriter: state snapshot failed", "error", err)
+	s.posMu.Lock()
+	offs := make(map[string]int64, len(s.processed))
+	for p, o := range s.processed {
+		offs[p.key()] = o
 	}
+	s.posMu.Unlock()
+	return &State{Rings: s.rings.Snapshot(), Rates: rates, Offsets: offs}
 }
 
-// RestoreState loads a previous snapshot into the rings and rate trackers.
+// restoreFrom applies a snapshot. Nil-safe on every part: a snapshot written by
+// an older version (no offsets) or with no rings must still restore what it has.
+func (s *Service) restoreFrom(st *State) {
+	if st == nil {
+		return
+	}
+	if st.Rings != nil {
+		s.rings.Restore(st.Rings)
+	}
+	for name, trace := range st.Rates {
+		if rt, ok := s.rates[name]; ok {
+			rt.Restore(trace)
+		}
+	}
+	s.posMu.Lock()
+	for k, o := range st.Offsets {
+		if p, ok := parseTP(k); ok {
+			s.resume[p] = o
+			s.processed[p] = o
+		}
+	}
+	s.posMu.Unlock()
+}
+
+// SnapshotState persists everything the score-writer resumes from and, only once
+// that write succeeded, commits the matching consumer offsets - so the committed
+// position never runs ahead of the durable state (auto-commit did, by up to a
+// commit interval, silently dropping those events from the rings).
+func (s *Service) SnapshotState(ctx context.Context) {
+	st := s.snapshot()
+	if err := s.state.Save(ctx, StateKeyRings, st); err != nil {
+		s.log.Warn("scorewriter: state snapshot failed; offsets not committed", "error", err)
+		return
+	}
+	s.commitOffsets(ctx, st.Offsets)
+}
+
+// commitOffsets commits the snapshot positions to the consumer group.
+func (s *Service) commitOffsets(ctx context.Context, offs map[string]int64) {
+	if s.cl == nil || len(offs) == 0 {
+		return
+	}
+	commit := map[string]map[int32]kgo.EpochOffset{}
+	for k, o := range offs {
+		p, ok := parseTP(k)
+		if !ok {
+			continue
+		}
+		if commit[p.topic] == nil {
+			commit[p.topic] = map[int32]kgo.EpochOffset{}
+		}
+		commit[p.topic][p.partition] = kgo.EpochOffset{Epoch: -1, Offset: o}
+	}
+	s.cl.CommitOffsetsSync(ctx, commit, func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest,
+		_ *kmsg.OffsetCommitResponse, err error) {
+		if err != nil {
+			s.log.Warn("scorewriter: offset commit failed", "error", err)
+		}
+	})
+}
+
+// RestoreState loads a previous snapshot into the rings, rate trackers and
+// resume positions.
 func (s *Service) RestoreState(ctx context.Context) {
 	raw, err := s.state.Load(ctx, StateKeyRings)
 	if err != nil {
@@ -111,15 +205,11 @@ func (s *Service) RestoreState(ctx context.Context) {
 		s.log.Warn("scorewriter: state restore parse failed", "error", err)
 		return
 	}
+	s.restoreFrom(&st)
+	customers, categories := 0, 0
 	if st.Rings != nil {
-		s.rings.Restore(st.Rings)
-	}
-	for name, trace := range st.Rates {
-		if rt, ok := s.rates[name]; ok {
-			rt.Restore(trace)
-		}
+		customers, categories = len(st.Rings.Customers), len(st.Rings.Categories)
 	}
 	s.log.Info("scorewriter state restored",
-		"customers", len(st.Rings.Customers),
-		"categories", len(st.Rings.Categories))
+		"customers", customers, "categories", categories, "partitions_resumed", len(st.Offsets))
 }

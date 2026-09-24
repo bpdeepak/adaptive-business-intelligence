@@ -49,6 +49,15 @@ type Service struct {
 	seen    map[string]struct{}
 	curLoop string
 
+	// Consumer position. processed is the next offset to process per partition
+	// (advanced as events leave the reorder gate and are folded into the rings);
+	// resume is what a restored snapshot said was already processed: records
+	// below it are redeliveries and are skipped. Both are persisted with the
+	// state (see State.Offsets) and committed only after that write succeeds.
+	posMu     sync.Mutex
+	processed map[tp]int64
+	resume    map[tp]int64
+
 	speed      float64
 	stateEvery time.Duration
 }
@@ -101,6 +110,8 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 		jobs:       newDropQueue(opts.Buffer),
 		state:      &stateStore{pool: opts.Pool, log: opts.Log},
 		seen:       map[string]struct{}{},
+		processed:  map[tp]int64{},
+		resume:     map[tp]int64{},
 		reg:        telemetry.NewRegistry(), // overridden by Instrument() in main
 		speed:      opts.Speed,
 		stateEvery: opts.StateEvery,
@@ -155,8 +166,11 @@ func (s *Service) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			s.SnapshotState(context.Background())
+			// Wait for the consume loop to drain the reorder gate BEFORE the final
+			// snapshot, so the snapshot (and the offsets it commits) include the
+			// events the drain just processed.
 			<-consumeDone
+			s.SnapshotState(context.Background())
 			return nil
 		case <-ticker.C:
 			s.SnapshotState(ctx)
@@ -182,6 +196,10 @@ func (s *Service) ScoreWorker(ctx context.Context) {
 func (s *Service) ingestAll(records []*kgo.Record) {
 	var ready []any
 	for _, rec := range records {
+		pos := recPos{tp: tp{rec.Topic, rec.Partition}, offset: rec.Offset}
+		if s.alreadyProcessed(pos) {
+			continue // covered by the restored snapshot: a redelivery, not new data
+		}
 		var env stream.Envelope
 		if err := json.Unmarshal(rec.Value, &env); err != nil {
 			s.log.Warn("scorewriter: undecodable record", "topic", rec.Topic, "error", err)
@@ -194,14 +212,14 @@ func (s *Service) ingestAll(records []*kgo.Record) {
 				s.log.Warn("scorewriter: bad order payload", "event_id", env.EventID, "error", err)
 				continue
 			}
-			ready = append(ready, s.gate.Push(pendingOrder{op: op, loopID: env.LoopID}, float64(op.PurchaseTime.Unix()))...)
+			ready = append(ready, s.gate.Push(pendingOrder{op: op, loopID: env.LoopID, pos: pos}, float64(op.PurchaseTime.Unix()))...)
 		case rec.Topic == stream.TopicClicks && env.EventType == stream.EventSessionEnd:
 			var se stream.SessionEnd
 			if err := env.DecodePayload(&se); err != nil {
 				s.log.Warn("scorewriter: bad session.end payload", "event_id", env.EventID, "error", err)
 				continue
 			}
-			ready = append(ready, s.gate.Push(pendingSession{se: se, loopID: env.LoopID, at: env.OccurredAt},
+			ready = append(ready, s.gate.Push(pendingSession{se: se, loopID: env.LoopID, at: env.OccurredAt, pos: pos},
 				float64(env.OccurredAt.Unix()))...)
 		default:
 			// Aggregator/bronze materialize page views, carts, labels; the
@@ -211,15 +229,43 @@ func (s *Service) ingestAll(records []*kgo.Record) {
 	s.processAll(ready)
 }
 
+// recPos is one record's coordinates, carried through the reorder gate so the
+// consumer position can advance exactly as events are processed.
+type recPos struct {
+	tp
+	offset int64
+}
+
 type pendingOrder struct {
 	op     stream.OrderPlaced
 	loopID string
+	pos    recPos
 }
 
 type pendingSession struct {
 	se     stream.SessionEnd
 	loopID string
 	at     time.Time
+	pos    recPos
+}
+
+// alreadyProcessed reports whether a restored snapshot already covers a record.
+func (s *Service) alreadyProcessed(p recPos) bool {
+	s.posMu.Lock()
+	defer s.posMu.Unlock()
+	next, ok := s.resume[p.tp]
+	return ok && p.offset < next
+}
+
+// markProcessed advances the position of p's partition past this record. The
+// gate releases in event-time order and each partition's records are produced in
+// event-time order, so the processed records of a partition form a prefix.
+func (s *Service) markProcessed(p recPos) {
+	s.posMu.Lock()
+	if p.offset+1 > s.processed[p.tp] {
+		s.processed[p.tp] = p.offset + 1
+	}
+	s.posMu.Unlock()
 }
 
 // processAll handles a batch of gate-released events in order.
@@ -233,8 +279,10 @@ func (s *Service) processEvent(data any) {
 	switch e := data.(type) {
 	case pendingOrder:
 		s.processOrder(&e.op, e.loopID)
+		s.markProcessed(e.pos)
 	case pendingSession:
 		s.processSession(&e.se, e.loopID, e.at)
+		s.markProcessed(e.pos)
 	}
 }
 
@@ -331,47 +379,30 @@ func (s *Service) scoreOne(ctx context.Context, j scoreJob) {
 		if j.grain == "order" {
 			evType = events.TypeOrderScored
 		}
-		s.events.Publish(events.Event{
-			Type: evType,
-			At:   j.evt,
-			Payload: map[string]any{
-				"prediction": map[string]any{
-					"model":         j.model,
-					"model_version": resp.Version,
-					"entity_id":     j.entity,
-					"score":         resp.Prediction,
-					"confidence":    resp.Confidence,
-					"threshold":     rt.Threshold(),
-					// The persisted prediction row id: the per-trigger-instance
-					// discriminator the playbook dedup key is scoped on, so a
-					// re-scored entity can be flagged again, while the same
-					// prediction row can never propose twice.
-					"id": predID,
-				},
-				"registry": map[string]any{
-					"recommended_threshold": rt.Threshold(),
-					"positive_rate":         rt.Baseline(),
-				},
-			},
-		})
+		sc := events.Scored{
+			Model: j.model, Version: resp.Version, Entity: j.entity,
+			Score: resp.Prediction, Confidence: resp.Confidence, PredictionID: predID,
+		}
+		// A model with no registry threshold publishes NO threshold fields, so
+		// the playbook fails closed instead of comparing against a fabricated 0.
+		if rt.Configured() {
+			thr, base := rt.Threshold(), rt.Baseline()
+			sc.Threshold, sc.PositiveRate = &thr, &base
+		}
+		s.events.Publish(events.NewScored(evType, sc, j.evt))
 	}
 }
 
-// persistModelAnomaly writes a model-driven anomaly (detector='model',
-// z_score stays NULL — rate anomalies carry no z-score) and, when the
-// ConsecutiveWindowsRequired hysteresis has been met, surfaces it on the
-// shared SSE/gRPC broadcaster. Every fired anomaly is persisted regardless of
-// Surfaced — the finding is durable; only the banner is gated.
 func (s *Service) persistModelAnomaly(ctx context.Context, anom *model.Anomaly) {
 	var out model.Anomaly
 	err := s.pool.QueryRow(ctx, `
-INSERT INTO gold.anomalies (metric, detector, bucket_start, observed, expected, z_score, severity, status, detected_at)
-VALUES ($1, 'model', $2, $3, $4, NULL, $5, 'open', now())
+INSERT INTO gold.anomalies (metric, detector, bucket_start, observed, expected, z_score, severity, status, detected_at, surfaced)
+VALUES ($1, 'model', $2, $3, $4, NULL, $5, 'open', now(), $6)
 RETURNING id, metric, detector,
   to_char(bucket_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
   observed, expected, COALESCE(z_score, 0)::float8, severity, status,
   to_char(detected_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
-		anom.Metric, anom.BucketStart, anom.Observed, anom.Expected, anom.Severity).
+		anom.Metric, anom.BucketStart, anom.Observed, anom.Expected, anom.Severity, anom.Surfaced).
 		Scan(&out.ID, &out.Metric, &out.Detector, &out.BucketStart, &out.Observed, &out.Expected,
 			&out.ZScore, &out.Severity, &out.Status, &out.DetectedAt)
 	if err != nil {
@@ -387,22 +418,11 @@ RETURNING id, metric, detector,
 	// Phase 4: the anomaly is also a domain fact for the playbook engine
 	// (published after the DB row so evidence is durable even if the bus drops).
 	if s.events != nil {
-		s.events.Publish(events.Event{
-			Type: events.TypeAnomalyDetected,
-			At:   time.Now().UTC(),
-			Payload: map[string]any{
-				"anomaly": map[string]any{
-					"metric":       out.Metric,
-					"detector":     out.Detector,
-					"bucket_start": out.BucketStart,
-					"observed":     out.Observed,
-					"expected":     out.Expected,
-					"severity":     out.Severity,
-					"status":       out.Status,
-					"surfaced":     out.Surfaced,
-				},
-			},
-		})
+		s.events.Publish(events.NewAnomalyDetected(events.Anomaly{
+			Metric: out.Metric, Detector: out.Detector, BucketStart: out.BucketStart,
+			Observed: out.Observed, Expected: out.Expected, Severity: out.Severity,
+			Status: out.Status, Surfaced: out.Surfaced,
+		}, time.Now().UTC()))
 	}
 
 	// Only a sustained (surfaced) breach alarms the room; a first-bucket blip

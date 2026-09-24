@@ -44,17 +44,23 @@ LIMIT $1`, n)
 	return desc, nil
 }
 
-// OpenAnomalies returns undismissed anomaly rows, newest first. An empty
+// OpenAnomalies returns undismissed, *surfaced* anomaly rows, newest first. A
+// model rate anomaly that has only breached one window is persisted but not
+// surfaced (ConsecutiveWindowsRequired), so it is excluded here exactly as it is
+// withheld from the SSE banner. An empty
 // `detector` returns anomalies from every writer kind; pass "statistical" or
 // "model" to narrow to one (Phase 3: the dashboard separates the two).
 func (s *PostgresStore) OpenAnomalies(ctx context.Context, detector string) ([]model.Anomaly, error) {
 	rows, err := s.pool.Query(ctx, `
 SELECT id, metric, detector,
        to_char(bucket_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-       observed, expected, z_score, severity, status,
+       observed, expected,
+       COALESCE(z_score, 0)::float8,  -- NULL for rate-based model anomalies
+       severity, status,
        to_char(detected_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 FROM gold.anomalies
 WHERE status = 'open'
+  AND surfaced  -- banner hysteresis: unsurfaced first-window blips stay off the REST path too
   AND ($1 = '' OR detector = $1)
 ORDER BY detected_at DESC`, detector)
 	if err != nil {

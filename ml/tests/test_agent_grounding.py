@@ -20,40 +20,89 @@ def test_literal_number_grounded() -> None:
 
 
 def test_sum_of_two_observed_grounded() -> None:
-    o = obs(rows=[{"a": 10, "b": 20, "c": 30}])
+    # R2 sums two values of the SAME column (two rows of `v`).
+    o = obs(rows=[{"v": 10}, {"v": 20}, {"v": 33}])
     r = grounding.ground_answer("Combined they total 30.", [o])
     assert r.grounded, r.reason
 
 
 def test_mean_of_two_observed_grounded() -> None:
-    o = obs(rows=[{"a": 10, "b": 30}])
+    o = obs(rows=[{"v": 10}, {"v": 30}])
     r = grounding.ground_answer("The midpoint is 20.", [o])
     assert r.grounded, r.reason
 
 
 def test_difference_of_two_observed_grounded() -> None:
     # R2 difference branch: the gap is NOT an observed value — it must be
-    # derived (q21 is the eval-level pin for this).
-    o = obs(rows=[{"top_revenue": 1711258.08, "second_revenue": 1653730.45}])
+    # derived from two rows of the same column (q21 is the eval-level pin).
+    o = obs(rows=[{"revenue": 1711258.08}, {"revenue": 1653730.45}])
     r = grounding.ground_answer("The gap between the two is 57527.63.", [o])
     assert r.grounded, r.reason
 
 
 def test_difference_signed_prose_grounded() -> None:
-    o = obs(rows=[{"this_week": 120.0, "last_week": 90.0}])
+    o = obs(rows=[{"revenue": 120.0}, {"revenue": 90.0}])
     r = grounding.ground_answer("Revenue rose from 90 to 120, an increase of 30.", [o])
     assert r.grounded, r.reason
 
 
-def test_difference_across_labels_not_grounded() -> None:
-    # Two single-valued observations, one batch one live_replay: no label holds
-    # the pair needed for a within-label derivation, and R3's additive phrasing
-    # is absent here (the review's cross-label trap), so 60 must stay unmatched.
-    b = obs(label=tools.BATCH, rows=[{"revenue": 100.0}])
-    lv = obs(label=tools.LIVE_REPLAY, rows=[{"revenue": 40.0}])
-    r = grounding.ground_answer("The gap between batch and live revenue was 60.", [b, lv])
+# --- audit C12: R2 must not "derive" arbitrary numbers or bless a wrong direction
+
+def test_derivation_across_different_columns_is_not_grounded() -> None:
+    # 10 and 20 are different fields of one row: their sum/difference/mean is not
+    # a meaningful quantity and used to ground an arbitrary claim.
+    o = obs(rows=[{"orders": 10, "revenue": 20}])
+    for claim in ("The two add up to 30.", "They differ by 15.", "The gap between them is 10."):
+        r = grounding.ground_answer(claim, [o])
+        assert not r.grounded or grounding.extract_numbers(claim)[0] in (10.0, 20.0), claim
+    assert not grounding.ground_answer("Together they total 30.", [o]).grounded
+    assert not grounding.ground_answer("The midpoint is 15.", [o]).grounded
+
+
+def test_wrong_direction_on_a_derived_difference_is_refused() -> None:
+    o = obs(rows=[{"revenue": 120.0}, {"revenue": 90.0}])  # newest first; 90 -> 120 is a rise
+    r = grounding.ground_answer("Revenue fell from 90 to 120, a drop of 30.", [o])
     assert not r.grounded
-    assert 60.0 in r.unmatched
+    assert "direction" in r.reason
+    assert grounding.ground_answer("Revenue rose from 90 to 120, an increase of 30.", [o]).grounded
+
+
+def test_directional_claim_must_cite_both_operands() -> None:
+    o = obs(rows=[{"revenue": 120.0}, {"revenue": 90.0}])
+    r = grounding.ground_answer("Revenue fell by 30 week over week.", [o])
+    assert not r.grounded, "a direction about a derived gap can't be verified without its operands"
+
+
+def test_neutral_gap_needs_no_direction() -> None:
+    o = obs(rows=[{"revenue": 120.0}, {"revenue": 90.0}])
+    assert grounding.ground_answer("The weekly change was 30.", [o]).grounded
+
+
+def test_random_integers_are_rarely_grounded_by_r2() -> None:
+    # Measured before the fix: ~7% of arbitrary integers in [1, 3000] grounded on a
+    # handful of observed values, because any two values of a result set combined.
+    import random
+
+    o = obs(rows=[{"orders": 512, "revenue": 87126.0}, {"orders": 498, "revenue": 80211.55},
+                  {"orders": 475, "revenue": 75002.4}, {"orders": 460, "revenue": 71234.1}])
+    rng = random.Random(7)
+    hits = sum(grounding.ground_answer(f"The change was {rng.randint(1, 3000)}.", [o]).grounded
+               for _ in range(2000))
+    assert hits / 2000 < 0.03, f"{hits}/2000 arbitrary integers grounded"
+
+
+def test_model_thresholds_are_not_free_prose_constants() -> None:
+    # The fraud threshold moved 0.795 -> 0.81 on retrain; quoting it from memory
+    # must not ground. It has to come from a registry observation.
+    assert not grounding.ground_answer("The fraud threshold is 0.795.", []).grounded
+    reg = obs(label=tools.REGISTRY, rows=[{"recommended_threshold": 0.81}])
+    assert grounding.ground_answer("The fraud threshold is 0.81.", [reg]).grounded
+
+
+def test_tool_parameter_echo_is_not_an_ungrounded_claim() -> None:
+    o = tools.ToolObservation(tool="batch_revenue_by_week", params={"weeks": 4},
+                              label=tools.BATCH, rows=[{"revenue": 87126.0}])
+    assert grounding.ground_answer("Over the last 4 weeks revenue was 87126.0.", [o]).grounded
 
 
 def test_invented_number_not_grounded() -> None:

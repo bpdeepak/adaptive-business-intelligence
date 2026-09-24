@@ -2,7 +2,13 @@
 
 Consumes gold.retrain_requests rows written by the `retrain_model` action
 (proposed when a drift event is critical, executed only after human approval).
-For each pending request it re-runs that model's trainer as a subprocess
+The worker is itself an action-executing path, so it enforces the governance
+invariant on its own: a request is honoured ONLY when its action_id is a
+`retrain_model` action with an `approved`/`auto_approved` audit transition and
+the request's model is the one that approved action targets. Anything else is
+refused (marked failed, with an audit `outcome` when the action exists) — a row
+inserted straight into gold.retrain_requests trains nothing.
+For each authorised pending request it re-runs that model's trainer as a subprocess
 (script mode, so the trainers' `import common` resolves), pinned to an
 auditable version tag ``<now_tag>.retrain<action_id>``, registered as a
 candidate — it NEVER supersedes the serving model; promotion to `active` is a
@@ -62,10 +68,102 @@ def refresh_sidecar_manifest() -> None:
         print(f"  (warn) sidecar manifest refresh failed: {exc}")
 
 
+def _approved_model(trigger: dict, params: dict) -> str:
+    """The model an approved retrain action targets — same precedence as the Go
+    `retrain_model` executor: event drift.model, event model, then params.model."""
+    payload = (trigger or {}).get("payload") or {}
+    drift = payload.get("drift") or {}
+    return drift.get("model") or payload.get("model") or (params or {}).get("model") or ""
+
+
+def authorise(c, request: dict) -> tuple[bool, str]:
+    """Governance check for one retrain request. Returns (ok, refusal reason).
+
+    Mirrors the Go execution guard (actions.Service.execute): the action must be
+    a retrain_model action and carry an approved/auto_approved audit row.
+    """
+    row = c.execute(
+        "select action, params, trigger from gold.action_queue where id = %s",
+        (request["action_id"],),
+    ).fetchone()
+    if row is None:
+        return False, f"action {request['action_id']} does not exist on gold.action_queue"
+    action, params, trigger = row
+    if action != "retrain_model":
+        return False, f"action {request['action_id']} is '{action}', not retrain_model"
+    approved = c.execute(
+        """
+        select 1 from gold.action_audit_log
+         where action_id = %s and transition in ('approved', 'auto_approved')
+         limit 1
+        """,
+        (request["action_id"],),
+    ).fetchone()
+    if approved is None:
+        return False, f"action {request['action_id']} has no approved/auto_approved audit row"
+    target = _approved_model(trigger, params)
+    if target != request["model"]:
+        return False, (f"request model '{request['model']}' is not the approved action's "
+                       f"target '{target}'")
+    return True, ""
+
+
+STALE_RUNNING = dt.timedelta(hours=2)
+
+
+def reap_stale_running(c, max_age: dt.timedelta = STALE_RUNNING) -> int:
+    """Fail requests a crashed worker left in 'running'.
+
+    The worker marks a request running before it launches the trainer; if the
+    process dies mid-training nothing ever finalises it, and the request sat
+    'running' forever with no audit outcome. A request running longer than
+    ``max_age`` is marked failed (with an audit ``outcome``) so a human sees it. It
+    is NOT silently re-queued: another training run is a governed effect, and the
+    approval that authorised the first attempt should be looked at before one more.
+    """
+    stale = c.execute(
+        """
+        select id, action_id from gold.retrain_requests
+         where status = 'running' and started_at is not null
+           and started_at < now() - %s
+        """,
+        (max_age,),
+    ).fetchall()
+    for rid, action_id in stale:
+        detail = {"error": f"worker interrupted: no completion within {max_age} of starting",
+                  "interrupted": True}
+        c.execute(
+            "update gold.retrain_requests set status = 'failed', finished_at = now(), detail = %s::jsonb where id = %s",
+            (json.dumps(detail), rid),
+        )
+        if c.execute("select 1 from gold.action_queue where id = %s", (action_id,)).fetchone():
+            audit(c, action_id, "outcome", {"status": "failed", **detail})
+    if stale:
+        c.commit()
+    return len(stale)
+
+
 def process_request(c, request: dict, dry_run: bool) -> None:
     rid = request["id"]
     action_id = request["action_id"]
     model = request["model"]
+
+    ok, refusal = authorise(c, request)
+    if not ok:
+        print(f"  REFUSED request {rid} (action {action_id}): {refusal}")
+        c.execute(
+            """
+            UPDATE gold.retrain_requests
+               SET status = 'failed', finished_at = now(), detail = %s::jsonb
+             WHERE id = %s
+            """,
+            (json.dumps({"error": f"refused: {refusal}", "refused": True}), rid),
+        )
+        # An audit outcome can only reference an action that exists (FK).
+        if c.execute("select 1 from gold.action_queue where id = %s", (action_id,)).fetchone():
+            audit(c, action_id, "outcome", {"status": "failed", "refused": True, "error": refusal})
+        c.commit()
+        return
 
     def finalize(status: str, detail: dict) -> None:
         c.execute(
@@ -91,7 +189,7 @@ def process_request(c, request: dict, dry_run: bool) -> None:
         print(f"  [dry-run] would run: {' '.join(cmd)}")
         return
 
-    c.execute("UPDATE gold.retrain_requests SET status = 'running' WHERE id = %s", (rid,))
+    c.execute("UPDATE gold.retrain_requests SET status = 'running', started_at = now() WHERE id = %s", (rid,))
     c.commit()
 
     try:
@@ -116,6 +214,9 @@ def main() -> int:
 
     while True:
         with common.conn() as c:
+            reaped = reap_stale_running(c)
+            if reaped:
+                print(f"marked {reaped} interrupted retrain request(s) failed")
             cur = c.cursor(row_factory=psycopg.rows.dict_row)
             cur.execute(
                 "select id, action_id, model from gold.retrain_requests where status = 'pending' order by id"

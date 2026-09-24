@@ -155,10 +155,11 @@ func (r *Rings) RecordOrder(od stream.OrderPlaced, ref *References, primaryCat s
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	cs := r.cust[od.CustomerID]
+	ck := ref.customerKey(od.CustomerID)
+	cs := r.cust[ck]
 	if cs == nil {
 		cs = &customerState{First: t}
-		r.cust[od.CustomerID] = cs
+		r.cust[ck] = cs
 	}
 	cs.Times = append(cs.Times, t)
 

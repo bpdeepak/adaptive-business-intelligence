@@ -1,0 +1,46 @@
+{
+  "model": "bot_score",
+  "version": 1,
+  "description": "Shared feature contract for the bot-vs-human session model. The Python trainer (ml/train_bot.py FEATURES, gold.session_features) and the Go stream score-writer (api/internal/scorewriter/features.go BotFeatures, a pure field mapping over the session.end event) must agree on exactly these names; the sidecar refuses a vector missing any of them. The file lives in the Go module because Go embeds it; both test suites assert against it.",
+  "features": [
+    {
+      "name": "is_converting"
+    },
+    {
+      "name": "click_count"
+    },
+    {
+      "name": "duration_seconds"
+    },
+    {
+      "name": "click_interval_cv"
+    },
+    {
+      "name": "has_search"
+    },
+    {
+      "name": "has_product_page"
+    },
+    {
+      "name": "has_cart_page"
+    },
+    {
+      "name": "has_checkout_page"
+    },
+    {
+      "name": "page_types_distinct"
+    },
+    {
+      "name": "cart_added"
+    },
+    {
+      "name": "cart_value"
+    },
+    {
+      "name": "hour_of_day"
+    },
+    {
+      "name": "is_weekend"
+    }
+  ]
+}

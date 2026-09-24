@@ -106,7 +106,8 @@ Note: the summary's revenue/orders pool is the "paying non-lost" population, so
 
 This dictionary is **served programmatically** as structured JSON at
 `GET /api/v1/metrics` (the machine-readable semantic layer, defined in
-`api/internal/metrics/catalog.go`, version `1.2.0`). Every metric carries a
+`api/internal/metrics/catalog.go`; version `1.2.0` when Phase 0/1 closed, **1.5.0** today —
+the version is bumped whenever a definition changes). Every metric carries a
 required `source` field — `batch` or `live_replay` — and Phase 1's realtime
 buckets live in `gold.realtime_metrics`, never additive with these batch
 totals. It is the object an agent should fetch before answering metric
@@ -140,7 +141,7 @@ binary (`api/internal/http/static/`).
 
 ## 6. Test evidence
 
-- `dbt build` — **PASS=95 WARN=0 ERROR=0**: 17 models (9 tables, 8 views) + 78 data
+- `dbt build` — **PASS=95 WARN=0 ERROR=0** *at Phase 0 (the project now builds 116: 20 models + 96 data tests)*: 17 models (9 tables, 8 views) + 78 data
   tests (uniqueness, not-null, FK `relationships`, `accepted_values`, custom
   singular tests: no future orders, non-negative payments/item counts/revenue,
   review scores 1–5).

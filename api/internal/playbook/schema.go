@@ -16,64 +16,15 @@ import (
 // then silently never fires — forever. The fix below makes the playbook
 // compiler cross-check every field path a condition references against a
 // declared schema per event type, so a wrong field name aborts startup the
-// same way a malformed expression does.
-
-// eventFields declares, per event type, the dotted payload paths a rule may
-// legitimately reference. It must stay in sync with the payloads the
-// producers publish (score-writer, anomaly aggregator, drift poller) and the
-// dormant Phase 5 producers' contract (churn_scored, forecast_updated).
-var eventFields = map[string]map[string]bool{
-	string(events.TypeOrderScored):   scoredFields,
-	string(events.TypeSessionScored): scoredFields,
-	string(events.TypeChurnScored):   scoredFields,
-	string(events.TypeDriftComputed): {
-		"drift.model":         true,
-		"drift.model_version": true,
-		"drift.status":        true,
-		"drift.psi":           true,
-		"drift.feature_count": true,
-		"drift.features":      true,
-		"drift.computed_at":   true,
-	},
-	string(events.TypeAnomalyDetected): {
-		"anomaly.metric":       true,
-		"anomaly.detector":     true,
-		"anomaly.bucket_start": true,
-		"anomaly.observed":     true,
-		"anomaly.expected":     true,
-		"anomaly.z_score":      true,
-		"anomaly.severity":     true,
-		"anomaly.status":       true,
-		"anomaly.surfaced":     true,
-	},
-	string(events.TypeForecastUpdated): {
-		"forecast.category":       true,
-		"forecast.week":           true,
-		"forecast.point_estimate": true,
-		"forecast.recent_avg":     true,
-	},
-}
-
-// scoredFields is shared by order_scored / session_scored / churn_scored: the
-// prediction + registry blocks the score-writer publishes (and the Phase 5
-// churn-scoring job will publish).
-var scoredFields = map[string]bool{
-	"prediction.model":               true,
-	"prediction.model_version":       true,
-	"prediction.entity_id":           true,
-	"prediction.score":               true,
-	"prediction.confidence":          true,
-	"prediction.threshold":           true,
-	"prediction.id":                  true,
-	"registry.recommended_threshold": true,
-	"registry.positive_rate":         true,
-}
+// same way a malformed expression does. The declared schema and the payload
+// constructors every producer uses live together in the events package
+// (payloads.go), and events/payloads_test.go pins the two to each other.
 
 // validateRuleFields rejects any field path a rule's compiled condition
 // references that is not declared in the event type's schema. A rule on an
 // undeclared event type is itself a policy bug and fails boot.
 func validateRuleFields(r Rule, n node) error {
-	schema, ok := eventFields[r.Trigger]
+	schema, ok := events.DeclaredFields(events.Type(r.Trigger))
 	if !ok {
 		return fmt.Errorf("playbook %q: unknown trigger %q (no payload schema declared)", r.Name, r.Trigger)
 	}

@@ -1,7 +1,7 @@
 {
   "model": "fraud_risk",
   "version": 1,
-  "description": "Shared feature contract for the transaction fraud-risk model. Both the Python training pipeline (ml/train_fraud.py, gold.feature_fraud_orders) and the Go stream-score feature assembler (api/internal/scorewriter/features.go) must agree on exactly these names, in this order — it is the model's manifest feature order, which ml/serve.py uses to build the scoring DataFrame (missing features become 0.0). The file lives in the Go module because the Go side embeds it; the Python side reads it from disk and both test suites assert against it.",
+  "description": "Shared feature contract for the transaction fraud-risk model. Both the Python training pipeline (ml/train_fraud.py, gold.feature_fraud_orders) and the Go stream-score feature assembler (api/internal/scorewriter/features.go) must agree on exactly these names, in this order — it is the model's manifest feature order, which ml/serve.py uses to build the scoring DataFrame (the sidecar refuses a vector with a missing or non-finite feature with a 400 — it no longer defaults to 0.0). The file lives in the Go module because the Go side embeds it; the Python side reads it from disk and both test suites assert against it.",
   "features": [
     { "name": "order_value",        "source": "event",     "transform": "payment_value_total from the order event", "units": "BRL" },
     { "name": "item_count",         "source": "event",     "transform": "count of order item rows (count(*), no quantity scaling)", "units": "count" },
