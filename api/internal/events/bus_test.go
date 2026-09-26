@@ -1,6 +1,7 @@
 package events
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -88,5 +89,47 @@ func TestDroppedDeliveriesAreCounted(t *testing.T) {
 	}
 	if b.Dropped() != 10 {
 		t.Errorf("dropped = %d, want 10 (silent drops were the audit's H1 finding)", b.Dropped())
+	}
+}
+
+func TestPublishWaitDeliversABurstWithoutDropping(t *testing.T) {
+	b := New()
+	ch, unsub := b.Subscribe()
+	defer unsub()
+	const burst = 5 * subBuffer
+	received := make(chan int)
+	go func() {
+		n := 0
+		for range ch {
+			n++
+			if n == burst {
+				break
+			}
+		}
+		received <- n
+	}()
+	for i := 0; i < burst; i++ {
+		if err := b.PublishWait(context.Background(), Event{Type: TypeChurnScored}, time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := <-received; n != burst || b.Dropped() != 0 {
+		t.Fatalf("received %d of %d, dropped %d", n, burst, b.Dropped())
+	}
+}
+
+func TestPublishWaitCountsADropWhenASubscriberIsStuck(t *testing.T) {
+	b := New()
+	_, unsub := b.Subscribe() // never read
+	defer unsub()
+	for i := 0; i < subBuffer; i++ {
+		b.Publish(Event{Type: TypeChurnScored}) // fill the buffer
+	}
+	start := time.Now()
+	if err := b.PublishWait(context.Background(), Event{Type: TypeChurnScored}, 20*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if b.Dropped() != 1 || time.Since(start) < 20*time.Millisecond {
+		t.Fatalf("dropped=%d after %v; want exactly 1 drop after waiting the timeout", b.Dropped(), time.Since(start))
 	}
 }

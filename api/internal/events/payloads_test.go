@@ -39,6 +39,8 @@ func sampleEvents() map[Type][]Event {
 		PredictionID: 7, Threshold: f64(.8), PositiveRate: f64(.02)}
 	rec := full
 	rec.Reconciled = true
+	ranked := full
+	ranked.Rank = 3
 
 	run := &DriftRun{Model: "m", Version: "v", ComputedAt: "2026-01-01T00:00:00Z"}
 	run.Add("f", 0.3, "critical", "psi")
@@ -51,9 +53,10 @@ func sampleEvents() map[Type][]Event {
 	return map[Type][]Event{
 		TypeOrderScored:     {NewScored(TypeOrderScored, full, now), NewScored(TypeOrderScored, rec, now)},
 		TypeSessionScored:   {NewScored(TypeSessionScored, full, now)},
-		TypeChurnScored:     {NewScored(TypeChurnScored, full, now)},
+		TypeChurnScored:     {NewScored(TypeChurnScored, ranked, now)},
 		TypeDriftComputed:   {run.Event(false, now), run.Event(true, now)},
 		TypeAnomalyDetected: {NewAnomalyDetected(anomStat, now), NewAnomalyDetected(anomModel, now)},
+		TypeForecastUpdated: {NewForecastUpdated(Forecast{Category: "c", Week: "2018-08-20", PointEstimate: 12, RecentAvg: 9}, now)},
 	}
 }
 
@@ -65,9 +68,6 @@ func sampleEvents() map[Type][]Event {
 func TestDeclaredFieldsMatchWhatProducersEmit(t *testing.T) {
 	samples := sampleEvents()
 	for _, typ := range DeclaredTypes() {
-		if typ == TypeForecastUpdated {
-			continue // dormant: no producer yet (Phase 5 forecast worker)
-		}
 		declaredSet, _ := DeclaredFields(typ)
 		evs, ok := samples[typ]
 		if !ok {

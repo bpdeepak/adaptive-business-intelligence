@@ -829,7 +829,7 @@ Parity against dev passes.
 * **Scope of past impact on dev:** one executed hold and 17 pending hold proposals, 8 of
   them duplicates (§11.4).
 
-### 11.21 Policy: `gold.predictions` retention (decided, not yet implemented)
+### 11.21 Policy: `gold.predictions` retention (implemented in Phase 5, docs/phase5.md §5A.4)
 
 `gold.predictions` has no retention: 131k+ rows and growing with every stream-scored
 order and session. It is model *evidence*: the Go API, the agent, the drift monitor and
@@ -857,5 +857,5 @@ Rules the job must follow when built:
 5. **Tell agent readers.** The agent's `model_scores` / `model_rate` tools read hot rows
    only, and their descriptions must say so once the job exists.
 
-Implementation is deferred. The numbers above are the decision, so the job can be built
-without re-deciding them under pressure.
+Implemented in Phase 5 exactly as specified (`api/internal/predict/retention.go`); see
+docs/phase5.md §5A.4 for the tests.

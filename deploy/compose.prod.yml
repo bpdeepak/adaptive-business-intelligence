@@ -1,0 +1,126 @@
+# ABI production stack (Phase 5): one private network, everything restart-safe.
+#
+#   docker compose -f deploy/compose.prod.yml build               # or pull from GHCR
+#   docker compose -f deploy/compose.prod.yml up -d postgres minio redpanda
+#   docker compose -f deploy/compose.prod.yml --profile bootstrap run --rm bootstrap
+#   docker compose -f deploy/compose.prod.yml up -d
+#
+# Only the server's HTTP port is published, and only on loopback: the public edge
+# (TLS, the /metrics block, Grafana) is Caddy's job (Stage 5B).
+name: abi
+
+x-env: &env
+  DATABASE_URL: postgres://abi:${ABI_PG_PASSWORD:-abi}@postgres:5432/abi?sslmode=disable
+  ABI_PG_HOST: postgres
+  ABI_PG_PASSWORD: ${ABI_PG_PASSWORD:-abi}
+  ABI_KAFKA_SEED_BROKERS: redpanda:9092
+  ABI_MINIO_ENDPOINT: http://minio:9000
+  ABI_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+  ABI_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  ABI_ARTIFACTS_DIR: artifacts
+
+x-python: &python
+  image: ${ABI_IMAGE_PREFIX:-abi}-python:${ABI_IMAGE_TAG:-dev}
+  build: { context: .., dockerfile: deploy/docker/python.Dockerfile }
+  environment: *env
+  volumes: [ "artifacts:/app/artifacts" ]
+  restart: unless-stopped
+  depends_on: { postgres: { condition: service_healthy } }
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: abi
+      POSTGRES_USER: abi
+      POSTGRES_PASSWORD: ${ABI_PG_PASSWORD:-abi}
+    volumes: [ "pgdata:/var/lib/postgresql/data" ]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U abi -d abi"], interval: 5s, timeout: 5s, retries: 20 }
+    restart: unless-stopped
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-05-24T17-08-30Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes: [ "minio-data:/data" ]
+    healthcheck: { test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"], interval: 5s, timeout: 5s, retries: 20 }
+    restart: unless-stopped
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.3
+    # Advertised as redpanda:9092 on the private network (the dev compose
+    # advertises localhost, which only works from the host).
+    command: [ redpanda, start, --overprovisioned, --smp, "1", --memory, 768M, --reserve-memory, 0M,
+               --node-id, "0", --kafka-addr, "PLAIN://0.0.0.0:9092", --advertise-kafka-addr, "PLAIN://redpanda:9092",
+               --rpc-addr, "0.0.0.0:33145", --advertise-rpc-addr, "redpanda:33145" ]
+    volumes: [ "redpanda-data:/var/lib/redpanda/data" ]
+    healthcheck: { test: ["CMD", "rpk", "cluster", "info"], interval: 10s, timeout: 15s, retries: 20 }
+    restart: unless-stopped
+
+  bootstrap:
+    <<: *python
+    profiles: [ bootstrap ]
+    restart: "no"
+    command: [ "sh", "deploy/bootstrap.sh" ]
+    depends_on:
+      postgres: { condition: service_healthy }
+      minio: { condition: service_healthy }
+
+  models:
+    <<: *python
+    command: [ "python", "ml/serve.py", "--addr", "0.0.0.0:8093" ]
+    # Healthy once the artifacts are warmed and /health answers; the server waits
+    # for it so the batch producers' first pass does not race the sidecar's boot.
+    healthcheck: { test: ["CMD", "curl", "-fsS", "http://localhost:8093/health"], interval: 5s, timeout: 5s, retries: 30, start_period: 20s }
+
+  agent:
+    <<: *python
+    # mock = deterministic harness; Stage 5B switches the public demo to Groq (live).
+    command: [ "python", "ml/agent/server.py", "--mode", "${ABI_AGENT_MODE:-mock}" ]
+    environment:
+      <<: *env
+      ABI_AGENT_ADDR: 0.0.0.0:8094
+
+  monitor:
+    <<: *python
+    # Drift/decay monitor every 6 h (writes gold.model_drift; the server's poller
+    # turns findings into governed proposals).
+    command: [ "sh", "-c", "while true; do python -m ml.monitor.drift_check || true; sleep 21600; done" ]
+
+  retrain-worker:
+    <<: *python
+    command: [ "python", "-m", "ml.monitor.retrain_worker", "--watch" ]
+
+  server:
+    image: ${ABI_IMAGE_PREFIX:-abi}-server:${ABI_IMAGE_TAG:-dev}
+    build: { context: .., dockerfile: deploy/docker/go.Dockerfile, args: { CMD: server } }
+    environment:
+      <<: *env
+      ABI_SCORE_URL: http://models:8093
+      ABI_AGENT_URL: http://agent:8094
+    ports: [ "127.0.0.1:${ABI_HTTP_PORT:-8080}:8080" ]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redpanda: { condition: service_healthy }
+      models: { condition: service_healthy }
+    restart: unless-stopped
+
+  producer:
+    image: ${ABI_IMAGE_PREFIX:-abi}-producer:${ABI_IMAGE_TAG:-dev}
+    build: { context: .., dockerfile: deploy/docker/go.Dockerfile, args: { CMD: producer } }
+    environment:
+      <<: *env
+      ABI_SPEED_MULTIPLIER: ${ABI_SPEED_MULTIPLIER:-2880}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redpanda: { condition: service_healthy }
+      server: { condition: service_started }
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  minio-data:
+  redpanda-data:
+  artifacts:

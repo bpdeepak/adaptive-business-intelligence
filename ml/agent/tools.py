@@ -427,7 +427,7 @@ TOOL_SPECS: list[ToolSpec] = [
     ),
     ToolSpec(
         name="model_scores",
-        description="Recent persisted scores ONE model has produced: fraud_risk, bot_score, or churn_risk. The only source of model scores.",
+        description="Recent persisted scores ONE model has produced: fraud_risk, bot_score, or churn_risk. The only source of model scores. Reads the hot table: stream scores older than 30 days (REST scores: 90 days) are archived to gold.predictions_archive and not included.",
         parameters={
             "model": {"type": "string", "enum": list(SCORE_MODELS)},
             "limit": {"type": "integer"},
@@ -437,7 +437,7 @@ TOOL_SPECS: list[ToolSpec] = [
     ),
     ToolSpec(
         name="model_rate",
-        description="At-risk rate of one model over its persisted scores (gold.predictions), using the model's own recommended_threshold from the registry.",
+        description="At-risk rate of one model over its persisted scores in the hot table (gold.predictions; aged stream/REST scores are archived and excluded), using the model's own recommended_threshold from the registry.",
         parameters={"model": {"type": "string", "enum": list(SCORE_MODELS)}},
         label=PREDICTIONS,
         run=_score_stats,

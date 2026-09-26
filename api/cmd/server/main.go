@@ -24,6 +24,7 @@ import (
 
 	"abi/internal/actions"
 	"abi/internal/agent"
+	"abi/internal/batchscore"
 	"abi/internal/config"
 	"abi/internal/events"
 	"abi/internal/govern"
@@ -199,6 +200,34 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	defer predictCancel()
 	go predictSvc.RunGaugeLoop(predictCtx, 30*time.Second)
 
+	// 5e. Phase 5 batch producers for the retention playbooks: the churn scorer
+	// scores the right-censored repeat customers once per active churn model
+	// version (idle unless a churn_scored rule is armed).
+	churnEvery, errChurn := time.ParseDuration(cfg.ChurnScoreEvery)
+	if errChurn != nil || churnEvery <= 0 {
+		churnEvery = time.Hour
+	}
+	churnScorer := batchscore.NewChurnScorer(pool, predictSvc, bus, rules, logger)
+	batchCtx, batchCancel := context.WithCancel(ctx)
+	defer batchCancel()
+	go func() { _ = churnScorer.Run(batchCtx, churnEvery) }()
+	// ...and the forecast worker forecasts next-week orders per category once
+	// per active orders-forecast version (idle unless forecast_updated is armed).
+	forecastEvery, errFc := time.ParseDuration(cfg.ForecastEvery)
+	if errFc != nil || forecastEvery <= 0 {
+		forecastEvery = time.Hour
+	}
+	forecastWorker := batchscore.NewForecastWorker(pool, predictSvc, bus, rules, logger)
+	go func() { _ = forecastWorker.Run(batchCtx, forecastEvery) }()
+
+	// 5f. Predictions retention: aged stream/REST scores move to
+	// gold.predictions_archive (never deleted, never above the reconcile cursor,
+	// never a row a pending/failed action cites).
+	retention := predict.NewRetention(pool, logger)
+	retention.StreamScoreKeep = durationOr(cfg.RetentionStreamScores, retention.StreamScoreKeep)
+	retention.LiveScoreKeep = durationOr(cfg.RetentionLiveScores, retention.LiveScoreKeep)
+	go retention.Run(batchCtx, durationOr(cfg.RetentionEvery, 6*time.Hour))
+
 	// 5d. Phase 3 NL→BI agent: proxies the Python agent sidecar (ml/agent/
 	// server.py). Optional; empty ABI_AGENT_URL disables /api/v1/agent/query.
 	agentSvc := agent.NewService(agent.NewAgentClient(cfg.AgentURL), logger)
@@ -322,6 +351,16 @@ func run(logger *slog.Logger, cfg config.Config) error {
 	grpcSrv.GracefulStop()
 	logger.Info("server stopped")
 	return nil
+}
+
+// durationOr parses a duration setting, falling back to def when it is empty,
+// malformed or non-positive.
+func durationOr(v string, def time.Duration) time.Duration {
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
 }
 
 // loadPlaybooks resolves + loads the governance policy file. The server runs

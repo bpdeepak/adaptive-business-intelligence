@@ -58,6 +58,7 @@ def load_data() -> pd.DataFrame:
         from gold.feature_customer_churn
         """
     )
+    df = common.canonical_order(df, ["customer_unique_id"])  # row order must not depend on the database
     for col in FEATURES + ["churned"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["as_of_date"] = pd.to_datetime(df["as_of_date"])

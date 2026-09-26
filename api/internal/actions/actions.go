@@ -2,6 +2,8 @@ package actions
 
 import (
 	"context"
+	"encoding/json"
+	"math"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -190,16 +192,32 @@ WHERE order_id = $1`, orderID)
 		if category == "" || week == "" {
 			return Result{}, fmt.Errorf("draft_purchase_order: forecast.category/week missing")
 		}
+		// Quantity: an explicit positive rule param wins; otherwise the forecast
+		// excess over the trailing 4-week realized mean, in ORDERS (Olist has no
+		// inventory or unit-cost data, so this is demand-cover, not a stock
+		// calculation; the draft says so in its reference).
 		qty := 0
-		if q, ok := numVal(ac.Params["quantity"]); ok {
+		if q, ok := numVal(ac.Params["quantity"]); ok && q > 0 {
 			qty = int(q)
+		} else {
+			pe, _ := numVal(fieldAny(ac.Event.Payload, "forecast.point_estimate"))
+			avg, _ := numVal(fieldAny(ac.Event.Payload, "forecast.recent_avg"))
+			if pe > avg {
+				qty = int(math.Ceil(pe - avg))
+			}
 		}
+		ref, _ := json.Marshal(map[string]any{
+			"basis":          "forecast excess over the trailing 4-week realized mean (orders)",
+			"point_estimate": fieldAny(ac.Event.Payload, "forecast.point_estimate"),
+			"recent_avg":     fieldAny(ac.Event.Payload, "forecast.recent_avg"),
+			"caveat":         "no inventory data: demand cover, not a stock calculation",
+		})
 		var id int64
 		err := ac.Pool.QueryRow(ctx, `
 INSERT INTO gold.purchase_orders (category, forecast_week, quantity, status, reference)
 VALUES ($1, $2, $3, 'draft', $4::jsonb)
 ON CONFLICT (category, forecast_week) DO NOTHING
-RETURNING id`, category, week, qty, `{}`).Scan(&id)
+RETURNING id`, category, week, qty, string(ref)).Scan(&id)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Result{OK: true, Detail: map[string]any{"idempotent": true, "category": category, "forecast_week": week}}, nil
 		}
@@ -294,6 +312,11 @@ RETURNING id`, cust, score, kind, status, msg).Scan(&id)
 		return Result{}, fmt.Errorf("insertRetention: %w", err)
 	}
 	return Result{OK: true, Detail: map[string]any{"id": id, "kind": kind, "customer_id": cust, "status": status}}, nil
+}
+
+func fieldAny(payload map[string]any, dotted string) any {
+	v, _ := Field(payload, dotted)
+	return v
 }
 
 func numVal(v any) (float64, bool) {

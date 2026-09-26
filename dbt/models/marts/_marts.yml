@@ -115,11 +115,13 @@ models:
 
   - name: feature_forecast_weekly
     description: >
-      Phase 2 feature store for the demand-forecast model. One row per
-      (category, ISO-week) over a dense, zero-filled weekly spine with
-      time-lags (1/2/4/8 weeks) and rolling 4-week aggregates. Revenue per
-      category is payment-value allocated across line items by price share,
-      so category revenue is mutually exclusive and additive.
+      Feature store for the demand-forecast model (Phase 2, corrected in Phase 5).
+      One row per (category, ISO-week) over a dense, zero-filled weekly spine that
+      ends at the last COMPLETE week (the extraction-cutoff tail is dropped).
+      Model features are lags (1/2/4/8 weeks, aov_lag1) and trailing 4-week
+      aggregates only; avg_order_value is the week's own AOV and is descriptive,
+      never a feature. Built by dbt/macros/forecast_features.sql, shared with
+      feature_forecast_next_week.
     columns:
       - name: category
         tests: [not_null]
@@ -148,4 +150,33 @@ models:
       - name: n_prior_orders
         tests: [not_null]
       - name: total_spend_prior
+        tests: [not_null]
+  - name: feature_customer_churn_current
+    description: >
+      Phase 5 scoring mart for the churn model. One row per repeat customer whose
+      latest order falls in the final 90 days of the dataset (outcome not yet
+      observable, exactly the rows the training mart excludes). As-of = the
+      latest order; features come from the SAME macro as feature_customer_churn
+      (dbt/macros/churn_features.sql), so there is no train/serve skew. No now():
+      the dataset's own end is the reference point.
+    columns:
+      - name: customer_unique_id
+        tests: [unique, not_null]
+      - name: as_of_date
+        tests: [not_null]
+      - name: n_prior_orders
+        tests: [not_null]
+
+  - name: feature_forecast_next_week
+    description: >
+      Phase 5 scoring mart for the demand forecast: one row per category for the
+      week after the last complete week (no outcome yet). Same macro as
+      feature_forecast_weekly, so every feature is a lag or trailing window of
+      real weeks. recent_*_avg are the trailing 4-week realized means.
+    columns:
+      - name: category
+        tests: [unique, not_null]
+      - name: week_start
+        tests: [not_null]
+      - name: orders_lag1
         tests: [not_null]

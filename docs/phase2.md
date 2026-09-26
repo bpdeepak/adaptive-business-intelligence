@@ -65,36 +65,63 @@ GET /api/v1/models/health  · POST /api/v1/score  (Go front door, optional sidec
 
 All metrics below are **out-of-sample on a strict time split** (oldest 80% →
 train, latest 20% → test), stored in `gold.model_registry.metrics`, and
-reproducible with `make dbt ml-features train`.
+reproducible with `make dbt ml-features train` **on Linux** (the deploy platform).
+Two caveats found in Phase 5 (docs/phase5.md §5A.5): the trainers used to depend on
+the database's physical row order (fixed: every training frame is now ordered by
+its key), and the Windows XGBoost build is not deterministic across thread counts.
+Linux gives an identical model at 1, 4 or 8 threads; Windows does not. A model
+trained on the Windows dev box can therefore differ slightly from the canonical
+Linux build, and the churn `recommended_threshold` is fragile enough to swing
+between 0.595 and 0.925 on such perturbations at virtually the same AUC.
 
 ### 4.1 Forecast — `forecast_category_weekly_revenue` / `..._orders`
+
+Corrected in Phase 5 (see the note below). Registered version **`20260926.093742`**
+(dev retrained 2026-09-26; the leaky `20260924.050026` is superseded).
 
 | | revenue | orders |
 |---|---|---|
 | Model | LightGBM regression, 67 categories × week | same |
-| Train rows | 7,102 category-weeks (2016-08-29 → 2018-09-03) | same |
-| **WMAPE** | **0.31** | **0.27** |
-| Per-category WMAPE range | 0.16 … 2.87 | 0.15 … 4.17 |
-| MAPE (non-zero weeks only) | 0.72 | 0.49 |
-| MAE / RMSE | 1,196 / 2,421 | 6.4 / 13.3 |
-| Top SHAP drivers | `orders_lag1`, `avg_order_value`, `revenue_lag1`, `category_code` | `orders_lag1`, `orders_roll4_mean`, `week_of_year`, `category_code` |
+| Train rows | 6,901 category-weeks (2016-08-29 → 2018-08-13, the last complete week) | same |
+| **WMAPE** | **0.336** | **0.281** |
+| Per-category WMAPE range | 0.16 … 3.79 | 0.14 … 6.25 |
+| MAPE (non-zero weeks only) | 0.83 | 0.49 |
+| MAE / RMSE | 1,281 / 2,489 | 6.6 / 13.8 |
+| Top SHAP drivers | `revenue_roll4_mean`, `revenue_lag1`, `orders_lag1`, `category_code` | `orders_lag1`, `orders_roll4_mean`, `category_code`, `orders_lag8` |
 
-Features: category (revenue-rank code), week-of-year, year, AOV, revenue/orders
-lags `1/2/4/8`, rolling-4 mean/std, `has_prior_week`. The week-ahead horizon at
-the time of writing shows WMAPE in the 27–31 % band — the dominant signal is
-last week's own level (lag-1), which is exactly what a demand forecaster should
-learn from this dataset.
+Features: category (revenue-rank code), week-of-year, year, **last week's AOV
+(`aov_lag1`)**, revenue/orders lags `1/2/4/8`, rolling-4 mean/std, `has_prior_week`.
+Every feature is a lag or a trailing window of prior weeks. They are built by one dbt
+macro (`dbt/macros/forecast_features.sql`) shared by the training mart and the Phase 5
+next-week scoring mart.
+
+**What was wrong before (Phase 5 audit), and what it cost.**
+1. **Target leakage.** The feature `avg_order_value` was the *target week's own* AOV:
+   that week's revenue divided by its orders, and exactly 0 whenever revenue was 0. It
+   was the revenue model's second-strongest driver and is unknowable for a future
+   week. It is replaced by `aov_lag1`. Measured on the same corrected mart, the leak
+   was worth about **2.3 WMAPE points on revenue** (0.312 → 0.336) and 0.4 on orders
+   (0.277 → 0.281).
+2. **Extraction-cutoff tail.** Olist's last weeks taper off (weekly orders about
+   1,900 → 1,072 → 117 → 1). That's a collection cutoff, not a demand collapse, but
+   the model trained on those weeks and the backtest scored against them. The spine now
+   ends at the last complete week, defined as at least 75 % of the median of the 8
+   prior weeks (2018-08-13).
+3. **"4-week horizon" is really one step ahead.** The backtest refits every 4 weeks,
+   but each prediction uses the actual previous week's lags. So the reported WMAPE is
+   a one-week-ahead error, and the registry's `horizon_weeks: 4` overstates it. The
+   Phase 5 forecast worker forecasts exactly one week ahead, which matches what was
+   validated.
+
+The previous card (WMAPE 0.31 / 0.27, `avg_order_value` as a top driver, and the claim
+that it "is exactly what a demand forecaster should learn") described the leaky build.
 
 **Confidence is per-category, not one global number.** `1 − wmape` is keyed by
-category from the backtest records: the 67 categories span 0.16 … 2.87 (revenue)
-and 0.15 … 4.17 (orders). Several rare categories sit above 1.0 WMAPE, so their
-forecasts report a visibly lower confidence (clamped ≥ 0.05) than
-`bed_bath_table`-type series — a single global number would have overstated
-them. The map is stored in `gold.model_registry.metrics.wmape_by_category_code`
-and served via the manifest's `baseline_wmape_by_code`, keyed by the same
-`category_code` feature `/score` receives; unknown codes fall back to the global
-WMAPE. Registered `20260922.160716` after the per-category retrain (global
-metrics reproduced exactly; superseded prior versions stay queryable).
+category from the backtest records, clamped at ≥ 0.05. Rare categories sit well
+above 1.0 WMAPE and report a visibly lower confidence than `bed_bath_table`-type
+series. The map is stored in `gold.model_registry.metrics.wmape_by_category_code` and
+served via the manifest's `baseline_wmape_by_code`, keyed by the same `category_code`
+feature `/score` receives; unknown codes fall back to the global WMAPE.
 
 ### 4.2 Churn — `churn_risk`
 

@@ -115,8 +115,11 @@ def category_rank_from(df: pd.DataFrame, key_col: str, value_col: str) -> dict[s
     ``category_rank`` so the serving layer (Go score-writer, forecast endpoint)
     resolves names to codes exactly as the model saw them at train time — it is
     a training-time artifact, never re-derived downstream."""
-    by_cat = df.groupby(key_col)[value_col].sum().sort_values(ascending=False)
-    return {c: i for i, c in enumerate(by_cat.index)}
+    # Ties on the total break by category name: pandas' default sort is not
+    # stable, so without an explicit tie-break equal totals could rank either way.
+    by_cat = (df.groupby(key_col)[value_col].sum().reset_index()
+                .sort_values([value_col, key_col], ascending=[False, True], kind="mergesort"))
+    return {c: i for i, c in enumerate(by_cat[key_col])}
 
 
 def register_model(
@@ -181,7 +184,7 @@ def register_model(
                 framework,
                 task,
                 grain,
-                str(artifact_path),
+                portable_path(artifact_path),
                 json.dumps(params, default=_json_default),
                 json.dumps(metrics, default=_json_default),
                 json.dumps(features),
@@ -239,6 +242,28 @@ def _json_default(o: Any) -> Any:
 # ---------------------------------------------------------------------------
 # Artifacts
 # ---------------------------------------------------------------------------
+
+def canonical_order(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    """Sort a training frame by its unique key.
+
+    Postgres returns rows in PHYSICAL order when a query has no ORDER BY, and that
+    differs between a long-lived database and a freshly loaded one. The trainers'
+    row order feeds the stable time split (ties keep input order) and XGBoost's
+    row subsampling, so the same data in a different order trained a different
+    model: a fresh bootstrap gave churn threshold 0.905 where dev had 0.595, and
+    fraud AUC 0.828 vs 0.817. Every trainer orders its frame here, so a model is a
+    function of the data only.
+    """
+    return df.sort_values(keys, kind="mergesort").reset_index(drop=True)
+
+
+def portable_path(p: str | pathlib.Path) -> str:
+    """A repo-relative path in POSIX form. The registry and the serving manifest
+    are read on other machines (a Linux container, the deploy VM): a path
+    recorded with Windows backslash separators does not resolve there, so every
+    stored artifact path uses forward slashes."""
+    return str(p).replace("\\", "/")
+
 
 def save_artifact(model_name: str, version: str, model_obj: Any, meta: dict[str, Any]) -> pathlib.Path:
     """Persist the model (joblib) and a human-readable metadata JSON inside

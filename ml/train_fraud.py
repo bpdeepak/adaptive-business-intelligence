@@ -45,6 +45,7 @@ def load_data() -> tuple[pd.DataFrame, list[str]]:
         from gold.feature_fraud_orders
         """
     )
+    df = common.canonical_order(df, ["order_id"])  # row order must not depend on the database
     for col in BASE_FEATURES + ["is_fraud"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 

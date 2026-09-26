@@ -52,7 +52,7 @@ def write_sidecar_manifest() -> None:
             "version": r["model_version"],
             "task": r["task"],
             "grain": r["grain"],
-            "artifact_path": r["artifact_path"],
+            "artifact_path": common.portable_path(r["artifact_path"]),
             "features": r["features"] or [],
         }
         if r["task"] == "regression":

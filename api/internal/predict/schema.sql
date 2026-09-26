@@ -81,3 +81,14 @@ CREATE INDEX IF NOT EXISTS idx_model_drift_model_computed
     ON gold.model_drift (model_name, computed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_model_drift_status
     ON gold.model_drift (status, computed_at DESC);
+-- Phase 5 retention (policy: docs/phase4.md §11.21). Aged live-scored rows are
+-- MOVED here, never deleted: model evidence is archived, the same principle as
+-- the append-only audit log. Same columns as gold.predictions plus archived_at.
+-- The move names its columns explicitly (predict/retention.go), and a test
+-- compares both tables' column lists, so a column added to gold.predictions
+-- cannot be silently dropped on archive.
+CREATE TABLE IF NOT EXISTS gold.predictions_archive (LIKE gold.predictions);
+ALTER TABLE gold.predictions_archive
+    ADD COLUMN IF NOT EXISTS archived_at timestamptz NOT NULL DEFAULT now();
+CREATE INDEX IF NOT EXISTS idx_predictions_archive_model_entity
+    ON gold.predictions_archive (model_name, entity_id, predicted_at DESC);

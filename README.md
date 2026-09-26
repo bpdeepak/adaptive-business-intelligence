@@ -403,7 +403,9 @@ semantic layer that agents should fetch before answering metric questions.
   critical drift → proposal → approve → worker-trained candidate
   (reject path shown too), with the audit trail served by
   `/api/v1/actions/{id}/trace`.
-- **Phase 5** — Deployment: Docker image (already provided in `api/Dockerfile`),
+- **Phase 5** — in progress (`docs/phase5.md`): batch producers for the retention and
+  purchase-order playbooks, predictions retention, deployable images
+  (`deploy/docker/`, `deploy/compose.prod.yml`), then a free deploy;
   observability, horizontal scaling of consumers.
 
 See `docs/phase0.md`, `docs/phase1.md`, `docs/phase2.md`, `docs/phase3.md`, and

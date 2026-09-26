@@ -7,6 +7,7 @@
 package events
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -122,6 +123,42 @@ func (b *Bus) Publish(e Event) {
 			b.dropped.Add(1)
 		}
 	}
+}
+
+// PublishWait delivers the event to every subscriber, waiting up to `timeout`
+// per subscriber for buffer space instead of dropping immediately. It is for
+// BATCH producers (the churn scorer, the forecast worker): they are not on a
+// latency-sensitive path and emit bursts of hundreds of events, which the
+// drop-don't-block Publish would mostly shed (observed: 273 of 338). Waiting keeps
+// live delivery the normal case, so the reconciler's reconciled=true marker keeps
+// meaning "a genuine drop was recovered". A subscriber that still does not accept
+// within the timeout (stuck, or unsubscribed mid-publish) counts as a drop, and the
+// reconciler still covers it. Returns early with ctx's error if ctx ends.
+func (b *Bus) PublishWait(ctx context.Context, e Event, timeout time.Duration) error {
+	if e.At.IsZero() {
+		e.At = time.Now().UTC()
+	}
+	b.mu.Lock()
+	subs := make([]chan Event, 0, len(b.subs))
+	for _, ch := range b.subs {
+		subs = append(subs, ch)
+	}
+	b.mu.Unlock()
+	b.published.Add(1)
+	for _, ch := range subs {
+		timer := time.NewTimer(timeout)
+		select {
+		case ch <- e:
+			timer.Stop()
+		case <-timer.C:
+			b.dropped.Add(1)
+		case <-ctx.Done():
+			timer.Stop()
+			b.dropped.Add(1)
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 // SubscribeCount is the number of attached subscribers.

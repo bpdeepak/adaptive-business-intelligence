@@ -43,7 +43,11 @@ type Scored struct {
 	PredictionID int64
 	Threshold    *float64
 	PositiveRate *float64
-	Reconciled   bool // set only by the reconciler; rides in the trigger evidence
+	// Rank is the entity's position in a batch-scored population (1 = highest
+	// score). Only batch producers set it (churn); 0 means "not ranked" and the
+	// field is omitted, so a rule on it fails closed for unranked events.
+	Rank       int
+	Reconciled bool // set only by the reconciler; rides in the trigger evidence
 }
 
 // NewScored builds an order_scored / session_scored / churn_scored event.
@@ -57,6 +61,9 @@ func NewScored(t Type, s Scored, at time.Time) Event {
 		// The persisted prediction row id: the per-trigger-instance
 		// discriminator of the playbook dedup key.
 		"id": s.PredictionID,
+	}
+	if s.Rank > 0 {
+		pred["rank"] = s.Rank
 	}
 	payload := map[string]any{"prediction": pred}
 	reg := map[string]any{}
@@ -108,6 +115,33 @@ func NewAnomalyDetected(a Anomaly, at time.Time) Event {
 		an["z_score"] = a.ZScore
 	}
 	return Event{Type: TypeAnomalyDetected, At: at, Payload: map[string]any{"anomaly": an}}
+}
+
+// Forecast describes one persisted next-week demand forecast (orders) for a
+// category, with the trailing 4-week realized mean it is compared against.
+type Forecast struct {
+	Category      string
+	Week          string // the forecast week (YYYY-MM-DD, week start)
+	PointEstimate float64
+	RecentAvg     float64
+	Reconciled    bool
+}
+
+// NewForecastUpdated builds a forecast_updated event (producer: the Phase 5
+// forecast worker; rebuilt by the governance reconciler from the persisted row).
+func NewForecastUpdated(f Forecast, at time.Time) Event {
+	payload := map[string]any{
+		"forecast": map[string]any{
+			"category":       f.Category,
+			"week":           f.Week,
+			"point_estimate": f.PointEstimate,
+			"recent_avg":     f.RecentAvg,
+		},
+	}
+	if f.Reconciled {
+		payload["reconciled"] = true
+	}
+	return Event{Type: TypeForecastUpdated, At: at, Payload: payload}
 }
 
 // DriftRun accumulates the gold.model_drift rows of one (model, computed_at)
@@ -213,10 +247,20 @@ var scoredFields = map[string]bool{
 	"registry.positive_rate":         true,
 }
 
+// churnFields adds the batch rank (1 = highest risk in the scored population), so
+// retention policy can work down from the top instead of a hard cutoff alone.
+var churnFields = func() map[string]bool {
+	m := map[string]bool{"prediction.rank": true}
+	for k := range scoredFields {
+		m[k] = true
+	}
+	return m
+}()
+
 var declared = map[Type]map[string]bool{
 	TypeOrderScored:   scoredFields,
 	TypeSessionScored: scoredFields,
-	TypeChurnScored:   scoredFields, // producer: the Phase 5 churn job (uses NewScored)
+	TypeChurnScored:   churnFields, // producer: the Phase 5 churn scorer (uses NewScored)
 	TypeDriftComputed: {
 		"drift.model":         true,
 		"drift.model_version": true,
@@ -237,8 +281,7 @@ var declared = map[Type]map[string]bool{
 		"anomaly.status":       true,
 		"anomaly.surfaced":     true,
 	},
-	// Dormant: no producer yet (the Phase 5 forecast worker). Declared so the
-	// shipped dormant rule validates; exempt from the producer parity test.
+	// Producer: the Phase 5 forecast worker (NewForecastUpdated).
 	TypeForecastUpdated: {
 		"forecast.category":       true,
 		"forecast.week":           true,

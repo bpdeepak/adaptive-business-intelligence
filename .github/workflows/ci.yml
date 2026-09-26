@@ -93,7 +93,7 @@ jobs:
           cd api
           go vet ./...
           go test ./...
-          go test -p 1 -tags integration ./internal/store/ ./internal/realtime/ ./internal/predict/ ./internal/actions/ ./internal/govern/ ./internal/monitor/ ./internal/scorewriter/
+          go test -p 1 -tags integration ./internal/store/ ./internal/realtime/ ./internal/predict/ ./internal/actions/ ./internal/govern/ ./internal/monitor/ ./internal/scorewriter/ ./internal/batchscore/
 
       - name: Build binaries + end-to-end smoke test
         run: |

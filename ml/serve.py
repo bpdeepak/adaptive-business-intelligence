@@ -60,7 +60,9 @@ class ModelStore:
             # artifact_path is stored repo-root-relative (e.g.
             # artifacts/churn_risk/<version>.joblib), matching the directory
             # layout produced by ml/common.py save_artifact().
-            model = joblib.load(m["artifact_path"])
+            # Registry rows written on Windows carry backslash paths; normalise so
+            # the same manifest loads inside a Linux container or on the VM.
+            model = joblib.load(str(m["artifact_path"]).replace("\\", "/"))
             m["model"] = model
         return m
 

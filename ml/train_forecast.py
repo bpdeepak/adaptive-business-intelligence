@@ -33,7 +33,10 @@ FEATURES = [
     "category_code",
     "week_of_year",
     "year",
-    "avg_order_value",
+    # last week's AOV. The Phase 2 feature "avg_order_value" was the TARGET
+    # week's own AOV (revenue / orders of that week): target leakage, unknowable
+    # for a future week. See dbt/macros/forecast_features.sql.
+    "aov_lag1",
     "revenue_lag1",
     "revenue_lag2",
     "revenue_lag4",
@@ -52,14 +55,15 @@ FEATURES = [
 def load_data() -> tuple[pd.DataFrame, dict]:
     df = common.read_sql(
         """
-        select category, week_start, revenue, orders, avg_order_value,
-               year, week_of_year, revenue_lag1, revenue_lag2, revenue_lag4,
+        select category, week_start, revenue, orders,
+               year, week_of_year, aov_lag1, revenue_lag1, revenue_lag2, revenue_lag4,
                revenue_lag8, orders_lag1, orders_lag2, orders_lag4, orders_lag8,
                revenue_roll4_mean, revenue_roll4_std, orders_roll4_mean,
                series_weeks, has_prior_week
         from gold.feature_forecast_weekly
         """
     )
+    df = common.canonical_order(df, ["category", "week_start"])  # row order must not depend on the database
     # keep series with enough history AND enough actual nonzero demand
     presence = df.groupby("category")["revenue"].apply(lambda s: (s > 0).sum())
     keep = presence[presence >= 16].index

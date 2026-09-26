@@ -91,3 +91,9 @@ def test_audit_log_is_append_only_in_the_shared_ddl():
     assert "trg_action_audit_log_append_only" in sql and "BEFORE UPDATE OR DELETE" in sql
     assert "trg_action_audit_log_no_truncate" in sql and "BEFORE TRUNCATE" in sql
     assert "abi.audit_maintenance" in sql
+
+
+def test_serving_schema_declares_the_predictions_archive():
+    sql = common.SCHEMA_SQL
+    assert "CREATE TABLE IF NOT EXISTS gold.predictions_archive (LIKE gold.predictions)" in sql
+    assert "archived_at timestamptz NOT NULL DEFAULT now()" in sql

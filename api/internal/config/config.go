@@ -75,6 +75,26 @@ type Config struct {
 	// findings turn into DriftComputed events (and, via the playbook, retrain
 	// proposals). A DB watermark keeps it restart-safe.
 	DriftPollEvery time.Duration
+	// ChurnScoreEvery is how often the Phase 5 churn scorer looks for work
+	// (duration string, default "1h"). It is a POLL, not a re-scoring cadence:
+	// the scoring population (gold.feature_customer_churn_current) is fixed by the
+	// dataset, so each active churn model version is scored once, and a pass
+	// interrupted mid-way resumes. A newly promoted version gets a fresh pass. The
+	// scorer idles when no enabled playbook rule triggers on churn_scored.
+	ChurnScoreEvery string
+	// ForecastEvery is how often the Phase 5 forecast worker looks for work
+	// (duration string, default "1h"). Like the churn scorer it is a POLL: the
+	// forecast week (the week after the data's last complete week) is fixed, so
+	// each active orders-forecast version forecasts it once (resuming if
+	// interrupted), then publishes forecast_updated for the demand-surge
+	// purchase-order rule. Idle when no enabled rule triggers on forecast_updated.
+	ForecastEvery string
+	// Predictions retention (policy: docs/phase4.md §11.21): hot windows for the
+	// archived sources, and how often the archive job runs. Rows are MOVED to
+	// gold.predictions_archive, never deleted.
+	RetentionStreamScores string
+	RetentionLiveScores   string
+	RetentionEvery        string
 }
 
 // FromEnv builds a Config from environment variables with sane defaults.
@@ -103,6 +123,11 @@ func FromEnv() Config {
 		AgentURL:                 getenv("ABI_AGENT_URL", "http://127.0.0.1:8094"),
 		PlaybookPath:             getenv("ABI_PLAYBOOK_PATH", "config/playbooks.yml"),
 		DriftPollEvery:           surecenv("ABI_DRIFT_POLL_EVERY", 60),
+		ChurnScoreEvery:          getenv("ABI_CHURN_SCORE_EVERY", "1h"),
+		ForecastEvery:            getenv("ABI_FORECAST_EVERY", "1h"),
+		RetentionStreamScores:    getenv("ABI_RETENTION_STREAM_SCORES", "720h"),
+		RetentionLiveScores:      getenv("ABI_RETENTION_LIVE_SCORES", "2160h"),
+		RetentionEvery:           getenv("ABI_RETENTION_PREDICTIONS_EVERY", "6h"),
 	}
 }
 

@@ -39,6 +39,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"abi/internal/batchscore"
 	"abi/internal/events"
 	"abi/internal/playbook"
 )
@@ -125,7 +126,7 @@ func (r *Reconciler) Once(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if r.armed[events.TypeOrderScored] || r.armed[events.TypeSessionScored] {
+	if len(r.scoredSources()) > 0 {
 		evs, maxID, err := r.scanPredictions(ctx, wm.Predictions)
 		if err != nil {
 			return err
@@ -159,6 +160,35 @@ func (r *Reconciler) Once(ctx context.Context) error {
 		}
 	}
 	return r.writeWatermark(ctx, wm)
+}
+
+// scoredSources lists the gold.predictions sources whose scored events have an
+// armed rule: 'stream_score' (order/session, the Phase 3 score-writer) and
+// 'churn_score' (the Phase 5 churn scorer). Only armed sources are scanned.
+func (r *Reconciler) scoredSources() []string {
+	var out []string
+	if r.armed[events.TypeOrderScored] || r.armed[events.TypeSessionScored] {
+		out = append(out, "stream_score")
+	}
+	if r.armed[events.TypeChurnScored] {
+		out = append(out, "churn_score")
+	}
+	if r.armed[events.TypeForecastUpdated] {
+		out = append(out, "forecast_score")
+	}
+	return out
+}
+
+// scoredType maps a persisted prediction back to the event its producer published.
+func scoredType(source, grain string) events.Type {
+	switch {
+	case source == "churn_score":
+		return events.TypeChurnScored
+	case grain == "order":
+		return events.TypeOrderScored
+	default:
+		return events.TypeSessionScored
+	}
 }
 
 // scanPredictions reconstructs order/session scored events from stream_score
@@ -212,32 +242,45 @@ FROM gold.model_registry`)
 	}
 
 	pr, err := r.pool.Query(ctx, `
-SELECT id, model_name, model_version, grain, entity_id, prediction, confidence, predicted_at
+SELECT id, model_name, model_version, grain, entity_id, prediction, confidence, predicted_at,
+       metadata->>'source',
+       COALESCE(metadata->>'category', ''), COALESCE(metadata->>'week', ''),
+       COALESCE((metadata->>'recent_avg')::float8, 0)
 FROM gold.predictions
-WHERE id > $1 AND metadata->>'source' = 'stream_score'
+WHERE id > $1 AND metadata->>'source' = ANY($3)
 ORDER BY id
-LIMIT $2`, cursor, predictionBatch)
+LIMIT $2`, cursor, predictionBatch, r.scoredSources())
 	if err != nil {
 		return nil, cursor, fmt.Errorf("query predictions: %w", err)
 	}
 	defer pr.Close()
 
 	var out []events.Event
+	churnByVersion := map[string][]int64{}
 	maxID := cursor
 	for pr.Next() {
 		var id int64
-		var model, version, grain, entity string
-		var score, conf float64
+		var model, version, grain, entity, source, fcCategory, fcWeek string
+		var score, conf, fcRecent float64
 		var at time.Time
-		if err := pr.Scan(&id, &model, &version, &grain, &entity, &score, &conf, &at); err != nil {
+		if err := pr.Scan(&id, &model, &version, &grain, &entity, &score, &conf, &at, &source,
+			&fcCategory, &fcWeek, &fcRecent); err != nil {
 			return nil, cursor, fmt.Errorf("scan prediction: %w", err)
 		}
 		if id > maxID {
 			maxID = id
 		}
-		evType := events.TypeSessionScored
-		if grain == "order" {
-			evType = events.TypeOrderScored
+		if source == "forecast_score" {
+			// The forecast worker's event, rebuilt from what it persisted.
+			out = append(out, events.NewForecastUpdated(events.Forecast{
+				Category: fcCategory, Week: fcWeek, PointEstimate: score, RecentAvg: fcRecent,
+				Reconciled: true,
+			}, at.UTC()))
+			continue
+		}
+		evType := scoredType(source, grain)
+		if evType == events.TypeChurnScored {
+			churnByVersion[version] = append(churnByVersion[version], id)
 		}
 		cfg := cfgs[threshKey{model, version}]
 		// Built by the same constructor the live score-writer uses, so the two
@@ -253,6 +296,30 @@ LIMIT $2`, cursor, predictionBatch)
 	}
 	if err := pr.Err(); err != nil {
 		return nil, cursor, err
+	}
+	pr.Close()
+	// Churn events carry the batch rank; rebuild it with the scorer's own
+	// definition so a reconciled event matches the dropped live one.
+	if len(churnByVersion) > 0 {
+		rank := map[int64]int{}
+		for version, ids := range churnByVersion {
+			ranked, err := batchscore.RankedChurnScores(ctx, r.pool, version, ids)
+			if err != nil {
+				return nil, cursor, err
+			}
+			for _, rs := range ranked {
+				rank[rs.ID] = rs.Rank
+			}
+		}
+		for i := range out {
+			if out[i].Type != events.TypeChurnScored {
+				continue
+			}
+			pred, _ := out[i].Payload["prediction"].(map[string]any)
+			if id, ok := pred["id"].(int64); ok && rank[id] > 0 {
+				pred["rank"] = rank[id]
+			}
+		}
 	}
 	return out, maxID, nil
 }

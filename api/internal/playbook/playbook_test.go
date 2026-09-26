@@ -41,7 +41,9 @@ func TestLoadShippedPlaybooks(t *testing.T) {
 	for _, r := range rules {
 		byName[r.Name] = r
 	}
-	for _, live := range []string{"hold-high-fraud-order", "log-midband-bot-session", "retrain-on-critical-drift"} {
+	for _, live := range []string{"hold-high-fraud-order", "log-midband-bot-session", "retrain-on-critical-drift",
+		// Phase 5: armed together with their producer, the churn scorer.
+		"propose-retention-offer-high-churn", "nudge-low-risk-churn", "draft-po-on-demand-surge"} {
 		r, ok := byName[live]
 		if !ok {
 			t.Fatalf("live rule %q missing from %s", live, path)
@@ -50,7 +52,7 @@ func TestLoadShippedPlaybooks(t *testing.T) {
 			t.Errorf("live rule %q must be enabled", live)
 		}
 	}
-	for _, dormant := range []string{"propose-retention-offer-high-churn", "nudge-low-risk-churn", "draft-po-on-weak-forecast"} {
+	for _, dormant := range []string{} {
 		r, ok := byName[dormant]
 		if !ok {
 			t.Fatalf("dormant rule %q missing from %s", dormant, path)
@@ -60,6 +62,7 @@ func TestLoadShippedPlaybooks(t *testing.T) {
 		}
 	}
 }
+
 // TestShippedPlaybooksBootTheEngine runs the real policy file through the same
 // NewEngine the server uses, so the boot-time checks (condition fields against
 // the payload schema, unknown actions, the auto-tier allow-list) are exercised

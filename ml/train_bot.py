@@ -43,6 +43,7 @@ def load_data() -> pd.DataFrame:
         from gold.session_features
         """
     )
+    df = common.canonical_order(df, ["session_id"])  # row order must not depend on the database
     for col in FEATURES + ["is_synthetic_bot", "session_date"]:
         if col == "session_date":
             df[col] = pd.to_datetime(df[col])

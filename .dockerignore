@@ -1,0 +1,12 @@
+# Build context hygiene for deploy/docker/*.Dockerfile (context = repo root).
+.git
+.venv
+**/__pycache__
+data/
+artifacts/
+api/bin/
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+*.pyc
+.env

@@ -38,7 +38,7 @@ test:
 # a scratch database and broker (the realtime test skips unless both are set).
 # -p 1: the suites share one database, so packages run one at a time.
 integration-test:
-	cd api && go test -p 1 -tags integration -v ./internal/store/ ./internal/realtime/ ./internal/predict/ ./internal/actions/ ./internal/govern/ ./internal/monitor/ ./internal/scorewriter/
+	cd api && go test -p 1 -tags integration -v ./internal/store/ ./internal/realtime/ ./internal/predict/ ./internal/actions/ ./internal/govern/ ./internal/monitor/ ./internal/scorewriter/ ./internal/batchscore/
 
 # Full Phase 1 pipeline in one shot (Linux/macOS/CI).
 bootstrap:

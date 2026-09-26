@@ -18,10 +18,10 @@
 #   * log-midband-bot-session      session_scored → auto informational note
 #   * retrain-on-critical-drift    drift_computed → approval_required retrain
 #
-# Dormant (`enabled: false`, kept parseable + validated on purpose): the
-# churn retention + stockout rules wait for Phase 5 producers — a scheduled
-# churn-scoring job (`churn_scored`) and a forecast worker (`forecast_updated`).
-# Flipping one `enabled` value is the whole activation; no code changes.
+# Phase 5 armed the churn retention rules (producer: the churn scorer) and the
+# demand-surge purchase-order rule (producer: the forecast worker). Every rule
+# is armed together with its producer; each producer idles when its rules are
+# disabled.
 version: 1
 rules:
   - name: hold-high-fraud-order
@@ -63,36 +63,43 @@ rules:
     risk_tier: approval_required
     enabled: true
 
-  # --- Dormant Phase 5 rules (producers pending; see header) ---------------
+  # --- Phase 5 rules ---------------------------------------------------------
   - name: propose-retention-offer-high-churn
     trigger: churn_scored
     description: >-
-      DORMANT (needs a scheduled churn-scoring job). A customer whose churn
-      score crosses the retention bar is proposed a retention offer.
-    condition: "prediction.model == 'churn_risk' && prediction.score >= 0.70"
+      Producer: the Phase 5 churn scorer (right-censored repeat customers, scored
+      once per active churn model version). Proposes a retention offer to the 20
+      highest-risk customers that also clear the 0.70 bar; a human decides. The
+      rank cap follows the Phase 2 card: the threshold statistics are noisy, so
+      reviewers work down from the top rather than trusting a hard cutoff alone.
+    condition: "prediction.model == 'churn_risk' && prediction.score >= 0.70 && prediction.rank <= 20"
     action: propose_retention_offer
     risk_tier: approval_required
-    enabled: false
+    enabled: true
 
   - name: nudge-low-risk-churn
     trigger: churn_scored
     description: >-
-      DORMANT (needs a scheduled churn-scoring job). Low churn risk gets an
-      automated nudge from the auto allow-list.
+      Producer: the Phase 5 churn scorer. Low churn risk gets an informational
+      nudge log from the auto allow-list (nothing is sent). Volume is bounded:
+      one score per customer per model version, and a 24h guard per customer.
     condition: "prediction.model == 'churn_risk' && prediction.score < 0.30"
     action: log_retention_email
     risk_tier: auto
-    enabled: false
+    enabled: true
 
-  - name: draft-po-on-weak-forecast
+  - name: draft-po-on-demand-surge
     trigger: forecast_updated
     description: >-
-      DORMANT (needs a forecast worker). When a weekly forecast point estimate
-      falls below the category's 4-week realized average, propose a restock
-      purchase order for the week ahead.
-    condition: "forecast.point_estimate < forecast.recent_avg * 1.1"
+      Producer: the Phase 5 forecast worker (next-week ORDERS per category, from
+      the week after the data's last complete week). When the forecast exceeds
+      the trailing 4-week realized mean by 20% AND by at least 5 orders, propose a
+      draft purchase order covering the excess (quantity derived from the
+      forecast; Olist has no inventory data, so this is demand cover, not a stock
+      calculation). Replaces the Phase 4 dormant rule, which proposed a PO when
+      demand was WEAK and would have fired for 41 of 67 categories; the absolute
+      floor keeps one-or-two-order noise in tiny categories out of the queue.
+    condition: "forecast.point_estimate > forecast.recent_avg * 1.2 && forecast.point_estimate - forecast.recent_avg >= 5"
     action: draft_purchase_order
-    params:
-      quantity: 0
     risk_tier: approval_required
-    enabled: false
+    enabled: true

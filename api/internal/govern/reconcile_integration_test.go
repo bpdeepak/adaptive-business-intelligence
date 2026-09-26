@@ -481,3 +481,151 @@ VALUES ('fraud_risk', $1, 'order', $2, 0.95, 0.9, '{"source":"stream_score","gra
 		t.Fatalf("after draining: %d proposals, want all 5", got)
 	}
 }
+
+// TestReconcileRecoversChurnProposals: the Phase 5 churn scorer persists
+// churn_score rows and publishes churn_scored on the bus. A dropped event must be
+// rebuilt from the row (the draft scorer claimed this coverage; the reconciler
+// did not scan churn at all). Unarmed triggers are not scanned.
+func TestReconcileRecoversChurnProposals(t *testing.T) {
+	pool := governTestPool(t)
+	ctx := context.Background()
+	uniq := fmt.Sprintf("%d", time.Now().UnixNano())
+	cust := "tgchurn" + uniq
+	ver := "it_gov_churn_" + uniq
+	rule := playbook.Rule{Name: "propose-retention-offer-high-churn", Trigger: "churn_scored",
+		Condition: "prediction.model == 'churn_risk' && prediction.score >= 0.70",
+		Action:    "propose_retention_offer", RiskTier: "approval_required", Enabled: true}
+
+	saveWatermark(t, pool)
+	if _, err := pool.Exec(ctx, `
+INSERT INTO gold.model_registry (model_name, model_version, status, framework, task, grain, artifact_path, metrics)
+VALUES ('churn_risk', $1, 'superseded', 'fake', 'binary_classification', 'customer', '/tmp/x', '{"recommended_threshold":0.595}'::jsonb)`, ver); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM gold.model_registry WHERE model_name='churn_risk' AND model_version=$1`, ver)
+		_, _ = pool.Exec(ctx, `DELETE FROM gold.predictions WHERE entity_id LIKE $1`, cust+"%")
+		_ = auditMaintenance(ctx, pool, `DELETE FROM gold.action_audit_log WHERE action_id IN (
+			SELECT id FROM gold.action_queue WHERE dedup_key LIKE $1)`, rule.Name+"|"+cust+"%")
+		_, _ = pool.Exec(ctx, `DELETE FROM gold.action_queue WHERE dedup_key LIKE $1`, rule.Name+"|"+cust+"%")
+	})
+	startCursor(t, pool)
+	if _, err := pool.Exec(ctx, `
+INSERT INTO gold.predictions (model_name, model_version, grain, entity_id, prediction, confidence, metadata)
+VALUES ('churn_risk', $1, 'customer', $2, 0.91, 0.91, '{"source":"churn_score","grain":"customer"}'::jsonb),
+       ('churn_risk', $1, 'customer', $3, 0.10, 0.90, '{"source":"churn_score","grain":"customer"}'::jsonb)`,
+		ver, cust+"-high", cust+"-low"); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.DiscardHandler)
+	count := func() int {
+		var n int
+		_ = pool.QueryRow(ctx, `SELECT count(*) FROM gold.action_queue WHERE dedup_key LIKE $1`, rule.Name+"|"+cust+"%").Scan(&n)
+		return n
+	}
+
+	// Not armed for churn: the stream rules alone must not scan churn rows.
+	eng, err := playbook.NewEngine(events.New(), actions.New(pool, logger), governRules(), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := NewReconciler(pool, eng, governRules(), logger).Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if count() != 0 {
+		t.Fatal("churn rows were reconciled although no churn_scored rule is armed")
+	}
+
+	// Armed: the high-risk customer gets exactly one proposal, marked reconciled.
+	startCursor(t, pool) // rewind past nothing: re-seed so the churn rows are above the cursor again
+	if _, err := pool.Exec(ctx, `
+UPDATE gold.governance_state SET value = jsonb_set(value, '{predictions}',
+  to_jsonb((SELECT min(id) - 1 FROM gold.predictions WHERE entity_id LIKE $1)))
+WHERE key = 'reconcile'`, cust+"%"); err != nil {
+		t.Fatal(err)
+	}
+	rules := []playbook.Rule{rule}
+	eng, err = playbook.NewEngine(events.New(), actions.New(pool, logger), rules, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := NewReconciler(pool, eng, rules, logger).Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var entity string
+	var reconciled bool
+	if err := pool.QueryRow(ctx, `
+SELECT entity, (trigger->'payload'->>'reconciled')::bool FROM gold.action_queue WHERE dedup_key LIKE $1`,
+		rule.Name+"|"+cust+"%").Scan(&entity, &reconciled); err != nil {
+		t.Fatalf("expected exactly one reconciled retention proposal: %v", err)
+	}
+	if entity != cust+"-high" || !reconciled {
+		t.Fatalf("proposal for %q reconciled=%v, want the high-risk customer, reconciled", entity, reconciled)
+	}
+	// The rebuilt event carries the batch rank, computed with the scorer's own
+	// definition (the high-risk customer is rank 1 of this test version's rows).
+	var rank int
+	if err := pool.QueryRow(ctx, `SELECT (trigger->'payload'->'prediction'->>'rank')::int FROM gold.action_queue WHERE dedup_key LIKE $1`,
+		rule.Name+"|"+cust+"%").Scan(&rank); err != nil || rank != 1 {
+		t.Fatalf("reconciled churn event rank = %d (err %v), want 1", rank, err)
+	}
+}
+
+// TestReconcileRecoversForecastProposals: a forecast_updated event the bus
+// dropped is rebuilt from the forecast_score row (category, week, recent_avg from
+// its metadata; point_estimate = the prediction), so the purchase-order proposal
+// still happens, marked reconciled.
+func TestReconcileRecoversForecastProposals(t *testing.T) {
+	pool := governTestPool(t)
+	ctx := context.Background()
+	uniq := fmt.Sprintf("%d", time.Now().UnixNano())
+	cat := "tgfc" + uniq
+	ver := "it_gov_fc_" + uniq
+	rule := playbook.Rule{Name: "draft-po-on-demand-surge", Trigger: "forecast_updated",
+		Condition: "forecast.point_estimate > forecast.recent_avg * 1.2 && forecast.point_estimate - forecast.recent_avg >= 5",
+		Action:    "draft_purchase_order", RiskTier: "approval_required", Enabled: true}
+
+	saveWatermark(t, pool)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM gold.predictions WHERE entity_id LIKE $1`, cat+"%")
+		_ = auditMaintenance(ctx, pool, `DELETE FROM gold.action_audit_log WHERE action_id IN (
+			SELECT id FROM gold.action_queue WHERE dedup_key LIKE $1)`, rule.Name+"|"+cat+"%")
+		_, _ = pool.Exec(ctx, `DELETE FROM gold.action_queue WHERE dedup_key LIKE $1`, rule.Name+"|"+cat+"%")
+	})
+	startCursor(t, pool)
+	for _, r := range []struct {
+		suffix string
+		pe     float64
+	}{{"-surge", 40}, {"-flat", 21}} {
+		md := fmt.Sprintf(`{"source":"forecast_score","grain":"category_week","category":%q,"week":"2018-08-20","recent_avg":20}`, cat+r.suffix)
+		if _, err := pool.Exec(ctx, `
+INSERT INTO gold.predictions (model_name, model_version, grain, entity_id, prediction, confidence, metadata)
+VALUES ('forecast_category_weekly_orders', $1, 'category_week', $2, $3, 0.7, $4::jsonb)`,
+			ver, cat+r.suffix+"@2018-08-20", r.pe, md); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logger := slog.New(slog.DiscardHandler)
+	rules := []playbook.Rule{rule}
+	eng, err := playbook.NewEngine(events.New(), actions.New(pool, logger), rules, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := NewReconciler(pool, eng, rules, logger).Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var entity string
+	var reconciled bool
+	var pe, recent float64
+	if err := pool.QueryRow(ctx, `
+SELECT entity, (trigger->'payload'->>'reconciled')::bool,
+       (trigger->'payload'->'forecast'->>'point_estimate')::float8,
+       (trigger->'payload'->'forecast'->>'recent_avg')::float8
+FROM gold.action_queue WHERE dedup_key LIKE $1`, rule.Name+"|"+cat+"%").Scan(&entity, &reconciled, &pe, &recent); err != nil {
+		t.Fatalf("expected exactly one reconciled PO proposal (the surging category): %v", err)
+	}
+	if entity != cat+"-surge" || !reconciled || pe != 40 || recent != 20 {
+		t.Fatalf("proposal entity=%q reconciled=%v point_estimate=%v recent_avg=%v", entity, reconciled, pe, recent)
+	}
+}
